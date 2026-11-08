@@ -35,10 +35,12 @@ Implemented and verified **here**, against a reference phone implementation:
 - [x] Gradle wrapper committed (fresh clone builds; `.gitattributes` pins line endings)
 - [x] `python tools/verify.py` — tests, lint, vector drift, wrapper and a live CLI
       handshake in one command
-- [x] 184 automated tests: framing, crypto, replay/tamper rejection, end-to-end,
-      **11 regression tests** (each verified to fail against the pre-fix code) and
+- [x] 210 automated tests: framing, crypto, replay/tamper rejection, end-to-end,
+      **11 regression tests** (each verified to fail against the pre-fix code),
       **39 conformance tests** that parse the Kotlin sources and compare their
-      constants, vectors and message set to the Python reference
+      constants, vectors and message set to the Python reference, and
+      **26 Kotlin-source tests** for the two `assembleDebug` errors of Phase 1
+      (an enum inside an `inner class`, `PackageManager.applicationInfo`)
 - [x] Kotlin implementation of the identical protocol + on-device self-test with
       Python-generated known-answer vectors (`tools/vectorgen/gen_vectors.py`
       writes `vectors.json` **and** `ProtocolVectors.kt`, so they cannot drift)
