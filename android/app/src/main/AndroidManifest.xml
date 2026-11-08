@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Local network only: no internet permission is used to reach any server. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Keep the bridge alive with the screen off. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      Phase 2 will add:
+        android.permission.MODIFY_AUDIO_SETTINGS   (SCO routing)
+        android.permission.RECORD_AUDIO            (headset microphone)
+        android.permission.BLUETOOTH_CONNECT       (headset names/state)
+      They are deliberately NOT declared yet so Phase 1 asks for nothing it does
+      not use.
+    -->
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_phonebridge"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PhoneBridge"
+        android:usesCleartextTraffic="true">
+
+        <!--
+          usesCleartextTraffic is required because the control channel is a
+          plain WebSocket that PhoneBridge encrypts itself (P-256 ECDH +
+          AES-256-GCM). Running TLS on top would add a second, unpinned layer
+          with certificates we would have to manage on both ends.
+        -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".service.BridgeService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+    </application>
+</manifest>

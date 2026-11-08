@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local tool state / credentials-ish
+.phone-sim/
+phonebridge-log-*.txt
+*.log
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/captures/
+*.apk
+*.aab
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Diagnostics output
+audit.txt
