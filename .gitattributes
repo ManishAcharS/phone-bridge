@@ -1,0 +1,19 @@
+# Keep line endings deterministic across Windows/Linux clones.
+# `gradlew` must stay LF (it is a POSIX shell script); the batch file must be
+# CRLF for cmd.exe. Both are enforced on checkout regardless of autocrlf.
+* text=auto
+
+gradlew      text eol=lf
+*.sh         text eol=lf
+*.bat        text eol=crlf
+*.cmd        text eol=crlf
+*.ps1        text eol=crlf
+
+# Binaries: never translate, never diff.
+*.jar        binary
+*.apk        binary
+*.aab        binary
+*.keystore   binary
+*.jks        binary
+*.p12        binary
+*.so         binary

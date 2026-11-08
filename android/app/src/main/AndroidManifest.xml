@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Local network only: no internet permission is used to reach any server. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Keep the bridge alive with the screen off. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      Required by the platform for a `connectedDevice` foreground service on
+      Android 14+. startForeground() throws SecurityException unless the app
+      holds FOREGROUND_SERVICE_CONNECTED_DEVICE *and* at least one of a fixed
+      list (BLUETOOTH_*, CHANGE_NETWORK_STATE, CHANGE_WIFI_STATE, NFC, ...).
+      CHANGE_NETWORK_STATE is the honest member of that list for this app: the
+      service exists to maintain a network connection to the phone-as-server.
+      Both are "normal" permissions - granted at install, no runtime prompt, and
+      they grant no capability this app actually exercises.
+    -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+
+    <!--
+      Capability measurement (Phase 2 preparation). These are used by the
+      read-only CapabilityProbe and by nothing else yet - the audio relay itself
+      is not implemented. Each one is requested at the moment it is needed:
+
+        MODIFY_AUDIO_SETTINGS  normal; routing audio to a SCO device
+        RECORD_AUDIO           runtime; the microphone test (only when run)
+        BLUETOOTH_CONNECT      runtime (API 31+); adapter and headset state
+        BLUETOOTH              normal, API <= 30 only; profile queries there
+    -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_phonebridge"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PhoneBridge"
+        android:usesCleartextTraffic="true">
+
+        <!--
+          usesCleartextTraffic is required because the control channel is a
+          plain WebSocket that PhoneBridge encrypts itself (P-256 ECDH +
+          AES-256-GCM). Running TLS on top would add a second, unpinned layer
+          with certificates we would have to manage on both ends.
+        -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".service.BridgeService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+    </application>
+</manifest>

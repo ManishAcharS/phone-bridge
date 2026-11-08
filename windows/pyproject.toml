@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phonebridge"
+version = "0.1.0"
+description = "PhoneBridge: use an Android phone as an external hardware hub for a Windows PC"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# Phase 1 only needs the protocol + transport stack.  Audio, camera, GUI and
+# virtual-device dependencies are listed in requirements-phase2plus.txt so a
+# Phase-1 install stays fast and dependency-light.
+dependencies = [
+    "websockets>=13.0",
+    "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5"]
+
+[project.scripts]
+phonebridge = "phonebridge.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["phonebridge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+# Ruff is configured once for the whole repo in ../ruff.toml.
