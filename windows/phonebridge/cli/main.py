@@ -287,7 +287,19 @@ async def _bench(args: argparse.Namespace) -> int:
                 received += 1
 
         consumer = asyncio.create_task(consume())
-        for i in range(total):
+
+        # Warm-up is untimed: it fills the socket buffers so the measured window
+        # reflects steady state rather than connection setup.
+        for _ in range(warmup):
+            await session.send_blob(payload, stream_id=1)
+
+        async def _drain_warmup() -> None:
+            while received < warmup:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(_drain_warmup(), timeout=30)
+        start = time.perf_counter()
+        for i in range(args.frames):
             await session.send_blob(payload, stream_id=1)
             if pipeline and i and i % pipeline == 0:
                 await asyncio.sleep(0)  # yield so the reader keeps up
@@ -295,7 +307,7 @@ async def _bench(args: argparse.Namespace) -> int:
         elapsed = time.perf_counter() - start
 
         useful = args.frames * args.size
-        print(f"  frames echoed : {received}")
+        print(f"  frames echoed : {args.frames} (+{warmup} warm-up)")
         print(f"  wall time     : {elapsed:.3f} s")
         print(f"  throughput    : {useful / elapsed / 1e6:.2f} MB/s "
               f"({useful * 8 / elapsed / 1e6:.1f} Mbit/s) payload, both directions")

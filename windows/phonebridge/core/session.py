@@ -136,6 +136,9 @@ class BridgeSession:
         self._peer_static_bytes: bytes | None = None
         self._read_task: asyncio.Task[None] | None = None
         self._pending: dict[int, asyncio.Future[Any]] = {}
+        # PING/PONG waiters keyed by the timestamp we sent, so concurrent pings
+        # cannot clobber each other (they used to share a single dict slot).
+        self._pong_waiters: dict[int, asyncio.Future[Any]] = {}
         self._blob_waiters: dict[int, asyncio.Queue[bytes]] = {}
         self._rpc_ids = RpcIdSource()
         self._closed = asyncio.Event()
@@ -354,14 +357,17 @@ class BridgeSession:
                 self._safe_send(MSG_PONG, STREAM_CONTROL, pong_payload(parse_ping(payload)))
             )
         elif msg_type == MSG_PONG:
-            pending = self._pending.pop(-2, None)
-            if pending is not None and not pending.done():
-                import struct
+            import struct
 
-                echoed, _remote = struct.unpack(">QQ", payload) if len(payload) == 16 else (0, 0)
+            if len(payload) != 16:
+                log.warning("ignoring malformed PONG (%d bytes)", len(payload))
+                return
+            echoed, _remote = struct.unpack(">QQ", payload)
+            waiter = self._pong_waiters.pop(echoed, None)
+            if waiter is not None and not waiter.done():
                 rtt = (time.time_ns() - echoed) / 1e6
                 self.stats.record_rtt(rtt)
-                pending.set_result(rtt)
+                waiter.set_result(rtt)
         elif msg_type in (MSG_BLOB, 0x30, 0x40, 0x50, 0x60):
             if self.on_blob is not None:
                 self.on_blob(stream_id, payload)
@@ -430,19 +436,25 @@ class BridgeSession:
             self._pending.pop(rpc_id, None)
 
     async def ping(self, timeout: float = 5.0) -> float:
-        """Application-level round-trip time in milliseconds."""
+        """Application-level round-trip time in milliseconds.
+
+        Safe to call concurrently: each in-flight ping waits on its own future
+        keyed by the timestamp embedded in the frame.
+        """
         import struct
 
+        if not self.is_open:
+            raise SessionError("session is not open")
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        self._pending[-2] = fut
         sent = time.time_ns()
-        await self._safe_send(MSG_PING, STREAM_CONTROL, struct.pack(">Q", sent))
+        self._pong_waiters[sent] = fut
         try:
+            await self._safe_send(MSG_PING, STREAM_CONTROL, struct.pack(">Q", sent))
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError as exc:
             raise SessionError("phone did not answer PING") from exc
         finally:
-            self._pending.pop(-2, None)
+            self._pong_waiters.pop(sent, None)
 
     async def send_blob(self, data: bytes, stream_id: int = 1) -> None:
         await self._safe_send(MSG_BLOB, stream_id, data)
@@ -477,6 +489,10 @@ class BridgeSession:
             if not fut.done():
                 fut.set_exception(exc)
         self._pending.clear()
+        for fut in list(self._pong_waiters.values()):
+            if not fut.done():
+                fut.set_exception(exc)
+        self._pong_waiters.clear()
 
     # ------------------------------------------------------------------ #
     # factory helpers
@@ -535,11 +551,13 @@ class ReconnectingSession:
 
     States reported through ``on_state``::
 
-        connecting | handshaking | connected | reconnecting | failed | closed
+        connecting | connected | reconnecting | closed
 
-    ``failed`` is terminal only when ``max_attempts`` is exhausted; otherwise a
-    transient failure is reported as ``reconnecting``.  Audio/UI layers read
-    ``current`` and ignore ``None``.
+    ``reconnecting`` always carries a ``reason`` and usually a ``retry_in_s``.
+    A single failed *attempt* is not a state of its own: it is folded into
+    ``reconnecting`` so the UI never flickers to a scary terminal state while
+    the supervisor is still working.  ``closed`` is the terminal state and is
+    emitted when ``max_attempts`` is exhausted or ``stop()`` is called.
     """
 
     def __init__(
@@ -587,6 +605,10 @@ class ReconnectingSession:
                 await session.open()
                 self.current = session
                 self.attempts = 1
+                # A healthy session resets the backoff ladder. Without this the
+                # delay kept growing across sessions, so a drop after an hour of
+                # use could wait the full 15 s instead of restarting at 0.5 s.
+                delays = self.policy.delays()
                 self._emit("connected", phone=session.phone.name if session.phone else "?",
                            device_id=session.phone.device_id if session.phone else None)
                 reason = await session.wait_closed()
@@ -596,7 +618,9 @@ class ReconnectingSession:
                 raise
             except Exception as exc:  # noqa: BLE001 - never let a drop kill us
                 last_error = f"{type(exc).__name__}: {exc}"
-                self._emit("failed", error=last_error, attempt=self.attempts)
+                # "failed" is reserved for a terminal give-up (max_attempts
+                # exhausted). A transient error while retrying is "reconnecting".
+                log.info("connection attempt %d failed: %s", self.attempts, last_error)
             finally:
                 self.current = None
 

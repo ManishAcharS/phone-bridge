@@ -146,7 +146,7 @@ plaintext = msg_type(1) ‖ stream_id(4, BE) ‖ payload
 | --- | --- | --- |
 | `0x10` | CONTROL | JSON, see §6 |
 | `0x11` | PING | `u64` sender clock (ns) |
-| `0x12` | PONG | `u64` echoed value ‖ `u64` responder clock (ns) |
+| `0x12` | PONG | `u64` echoed value ‖ `u64` responder monotonic clock (ns, informational) |
 | `0x21` | BLOB | opaque bytes (throughput test; echo stream) |
 | `0x30` | AUDIO | `u8 codec ‖ u8 flags ‖ u16 seq ‖ frame` (Phase 2) |
 | `0x40` | VIDEO | Phase 4 |
@@ -157,6 +157,13 @@ plaintext = msg_type(1) ‖ stream_id(4, BE) ‖ payload
 `stream_id` multiplexes independent flows; control always uses `0`. RTT is
 computed application-side from PING/PONG because that is the number that matters
 for audio latency, not TCP's estimate.
+
+The second PONG field is **informational only** and is never used for timing: the
+receiver computes RTT solely from the echoed value, so the two devices' clocks
+never need to agree. Both implementations use a monotonic clock
+(`time.monotonic_ns()` / `System.nanoTime()`) so the field means the same thing
+on each side, but its epoch is arbitrary and device-local. A PONG that is not
+exactly 16 bytes is dropped rather than treated as an error.
 
 ## 6. Control JSON
 

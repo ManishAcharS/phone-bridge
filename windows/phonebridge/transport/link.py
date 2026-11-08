@@ -20,6 +20,7 @@ from typing import Any
 
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidURI
+from websockets.protocol import State
 
 from ..protocol.framing import MAX_ENVELOPE_BODY
 
@@ -110,4 +111,9 @@ class WebSocketLink:
 
     @property
     def is_open(self) -> bool:
-        return self._ws is not None and getattr(self._ws, "state", None) is not None
+        """True only while the WebSocket is actually in the OPEN state.
+
+        The previous version tested ``state is not None``, which is always true
+        on a live object, so a closed link still reported itself as open.
+        """
+        return self._ws is not None and self._ws.state is State.OPEN

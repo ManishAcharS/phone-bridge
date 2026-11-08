@@ -13,6 +13,19 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!--
+      Required by the platform for a `connectedDevice` foreground service on
+      Android 14+. startForeground() throws SecurityException unless the app
+      holds FOREGROUND_SERVICE_CONNECTED_DEVICE *and* at least one of a fixed
+      list (BLUETOOTH_*, CHANGE_NETWORK_STATE, CHANGE_WIFI_STATE, NFC, ...).
+      CHANGE_NETWORK_STATE is the honest member of that list for this app: the
+      service exists to maintain a network connection to the phone-as-server.
+      Both are "normal" permissions - granted at install, no runtime prompt, and
+      they grant no capability this app actually exercises.
+    -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+
+    <!--
       Phase 2 will add:
         android.permission.MODIFY_AUDIO_SETTINGS   (SCO routing)
         android.permission.RECORD_AUDIO            (headset microphone)

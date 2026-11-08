@@ -41,7 +41,9 @@ android {
     }
 
     packaging {
-        resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}")
+        // Two explicit entries: the brace-shorthand string is not a glob and
+        // would silently fail to exclude anything.
+        resources.excludes += setOf("/META-INF/AL2.0", "/META-INF/LGPL2.1")
     }
 }
 
@@ -53,10 +55,13 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    implementation(platform("androidx.compose:compose-bom:2024.09.03"))
+    // Compose BOM 2024.06.00 -> compose-ui 1.6.8 / material3 1.2.1.
+    // Deliberately NOT a newer BOM: compose 1.7.x requires compileSdk 35, which
+    // in turn requires AGP 8.6+, and this project pins compileSdk 34 with AGP
+    // 8.5.2 so it builds on a wider range of installed SDKs. Do not bump the BOM
+    // without also bumping compileSdk and AGP together.
+    implementation(platform("androidx.compose:compose-bom:2024.06.00"))
     implementation("androidx.compose.ui:ui")
-    implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-core")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

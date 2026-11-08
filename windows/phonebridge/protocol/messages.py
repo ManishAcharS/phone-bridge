@@ -24,7 +24,7 @@ from typing import Any
 # --- control --------------------------------------------------------------- #
 MSG_CONTROL = 0x10  # JSON: RPC request / response / event
 MSG_PING = 0x11  # payload = u64 unix nanoseconds
-MSG_PONG = 0x12  # payload = u64 echoed nanos | u64 remote nanos
+MSG_PONG = 0x12  # payload = u64 echoed nanos | u64 responder monotonic nanos
 MSG_BYE = 0x7F  # payload = UTF-8 reason
 
 # --- media (Phase 2+) ------------------------------------------------------ #
@@ -109,9 +109,15 @@ def ping_payload(sent_ns: int | None = None) -> bytes:
 
 
 def pong_payload(echoed_ns: int) -> bytes:
+    """Echo the sender's timestamp plus our own monotonic clock.
+
+    The second field is informational only: RTT is computed from the echoed
+    value alone. It uses a monotonic clock (not wall time) to match Android's
+    ``System.nanoTime()``, so the two sides mean the same thing.
+    """
     import struct
 
-    return struct.pack(">QQ", echoed_ns, time.time_ns())
+    return struct.pack(">QQ", echoed_ns, time.monotonic_ns())
 
 
 def parse_ping(payload: bytes) -> int:

@@ -287,3 +287,37 @@ async def test_discovery_finds_beacon(sim_state, pc_config):
     assert found.device_id == phone.identity.device_id
     assert found.port == phone.port
     assert found.uri.startswith("ws://127.0.0.1:")
+
+
+async def test_bench_reports_the_requested_frame_count(sim_state, pc_config, capsys):
+    """Warm-up frames must not appear in the reported frame count.
+
+    The bench sends 20 untimed warm-up frames before the measured window; an
+    earlier version printed the total (frames + 20), which reads like a bug to
+    anyone comparing it with the command they typed. Throughput was also diluted
+    by the warm-up time, so the timer now starts after the warm-up is drained.
+    """
+    from types import SimpleNamespace
+
+    from phonebridge.cli.main import _bench
+
+    phone = await _start_phone(sim_state)
+    try:
+        args = SimpleNamespace(
+            host="127.0.0.1",
+            port=phone.port,
+            config_dir=str(pc_config),
+            auto_pair=True,
+            frames=100,
+            size=256,
+            pipeline=16,
+            expect_ms=None,
+        )
+        rc = await _bench(args)
+    finally:
+        await phone.stop()
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "frames echoed : 100 (+20 warm-up)" in out
+    assert "payload corruption detected" not in out

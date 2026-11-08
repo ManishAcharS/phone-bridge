@@ -4,9 +4,9 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SIM_DIR = REPO_ROOT / "tools" / "simulator"
-if str(SIM_DIR) not in sys.path:
-    sys.path.insert(0, str(SIM_DIR))
+for _extra in (REPO_ROOT / "tools" / "simulator", REPO_ROOT / "tools" / "vectorgen"):
+    if str(_extra) not in sys.path:
+        sys.path.insert(0, str(_extra))
 
 
 @pytest.fixture()

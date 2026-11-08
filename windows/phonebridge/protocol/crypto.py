@@ -164,6 +164,17 @@ class SessionKeys:
         return f"{self.sas[:3]} {self.sas[3:]}"
 
 
+def sas_from_key(client_to_server_key: bytes) -> str:
+    """Six-digit pairing code derived from the session key.
+
+    Mirrors ``Crypto.sasDigits`` on Android so both sides can be tested against
+    the same vector. Purely informational: the SAS is a value for a human to
+    compare, never key material.
+    """
+    digest = hmac.new(client_to_server_key, _INFO_SAS, hashlib.sha256).digest()
+    return f"{int.from_bytes(digest[:4], 'big') % 1_000_000:06d}"
+
+
 def _derive(
     *, static_shared: bytes, ephemeral_shared: bytes, cnonce: bytes, snonce: bytes
 ) -> SessionKeys:
@@ -171,11 +182,9 @@ def _derive(
     salt = cnonce + snonce
     c2s = hkdf_sha256(ikm, salt, _INFO_C2S)
     s2c = hkdf_sha256(ikm, salt, _INFO_S2C)
-    sas_raw = hmac.new(c2s, _INFO_SAS, hashlib.sha256).digest()
     # 24 bits of SAS: enough for a human comparison, and the 1-in-16M false
     # accept only matters if the attacker gets exactly one attempt.
-    sas = f"{int.from_bytes(sas_raw[:4], 'big') % 1_000_000:06d}"
-    return SessionKeys(client_to_server=c2s, server_to_client=s2c, sas=sas)
+    return SessionKeys(client_to_server=c2s, server_to_client=s2c, sas=sas_from_key(c2s))
 
 
 class HandshakeInitiator:

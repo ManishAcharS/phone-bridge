@@ -19,6 +19,8 @@ import java.text.SimpleDateFormat
 import java.util.Collections
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -43,6 +45,7 @@ class BridgeServer(
         private const val TAG = "BridgeServer"
         const val DEFAULT_PORT = 8765
         private const val MAX_LOG_LINES = 200
+        private const val BIND_TIMEOUT_S = 5L
     }
 
     data class PeerInfo(
@@ -93,6 +96,15 @@ class BridgeServer(
 
     private var impl: ServerImpl? = null
 
+    // WebSocketServer.start() returns before the socket is bound, so the bind
+    // result arrives on the server thread via onStart()/onError(). These two
+    // fields let start() wait for the real answer instead of assuming success.
+    @Volatile
+    private var bindLatch: CountDownLatch? = null
+
+    @Volatile
+    private var bindError: Exception? = null
+
     @Volatile
     private var pendingPairing: MutableList<PendingPairing> =
         Collections.synchronizedList(mutableListOf())
@@ -112,9 +124,21 @@ class BridgeServer(
         return try {
             val server = ServerImpl(InetSocketAddress(port))
             server.isReuseAddr = true
-            server.start()
+            bindError = null
+            val latch = CountDownLatch(1)
+            bindLatch = latch
+            server.start() // returns immediately; binding happens on its own thread
+
+            val settled = latch.await(BIND_TIMEOUT_S, TimeUnit.SECONDS)
+            bindLatch = null
+            if (!settled) {
+                runCatching { server.stop(300) }
+                throw IllegalStateException(
+                    "timed out after ${BIND_TIMEOUT_S}s waiting for port $port to bind"
+                )
+            }
+            bindError?.let { throw it }
             impl = server
-            _running.value = true
             _lastError.value = null
             addLog("INFO", "listening on 0.0.0.0:$port (device ${identity.deviceId})")
             Result.success(Unit)
@@ -122,6 +146,7 @@ class BridgeServer(
             _lastError.value = "${e.javaClass.simpleName}: ${e.message}"
             addLog("ERROR", "cannot start server: ${e.message}")
             _running.value = false
+            impl = null
             Result.failure(e)
         }
     }
@@ -616,8 +641,9 @@ class BridgeServer(
         private val byConnection = Collections.synchronizedMap(mutableMapOf<WebSocket, PeerSession>())
 
         override fun onStart() {
-            addLog("INFO", "WebSocket server listening on $address")
             _running.value = true
+            addLog("INFO", "WebSocket server listening on $address")
+            bindLatch?.countDown()
         }
 
         override fun onOpen(conn: WebSocket, handshake: ClientHandshake) {
@@ -646,9 +672,13 @@ class BridgeServer(
 
         override fun onError(conn: WebSocket?, ex: Exception) {
             if (conn == null) {
+                // Server-level failure (typically "address already in use"):
+                // record it and release start() so it can report honestly.
+                bindError = ex
                 _lastError.value = "${ex.javaClass.simpleName}: ${ex.message}"
                 addLog("ERROR", "server error: ${ex.message}")
                 _running.value = false
+                bindLatch?.countDown()
             } else {
                 addLog("ERROR", "connection error: ${ex.message}")
             }

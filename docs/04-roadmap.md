@@ -16,6 +16,10 @@ Legend: `[x]` implemented and tested · `[~]` partially implemented ·
 
 ## Phase 1 — Communication foundation ✅ (PC ↔ reference phone)
 
+Status detail: [`docs/06-phase1-audit.md`](06-phase1-audit.md) (audit findings and
+build readiness) and [`docs/05-connection-verification.md`](05-connection-verification.md)
+(the exact procedure and expected outputs for your hardware).
+
 Implemented and verified **here**, against a reference phone implementation:
 
 - [x] Envelope framing, both directions, with size limits
@@ -26,9 +30,16 @@ Implemented and verified **here**, against a reference phone implementation:
 - [x] Reconnection supervisor with jittered exponential backoff
 - [x] UDP discovery beacon (phone broadcasts, PC listens)
 - [x] CLI: `doctor`, `identity`, `discover`, `info`, `ping`, `bench`, `watch`, `forget`
-- [x] 45 automated tests (framing, crypto, replay/tamper rejection, end-to-end)
+- [x] 96 automated tests: framing, crypto, replay/tamper rejection, end-to-end,
+      **11 regression tests** (each verified to fail against the pre-fix code) and
+      **39 conformance tests** that parse the Kotlin sources and compare their
+      constants, vectors and message set to the Python reference
 - [x] Kotlin implementation of the identical protocol + on-device self-test with
-      Python-generated known-answer vectors
+      Python-generated known-answer vectors (`tools/vectorgen/gen_vectors.py`
+      writes `vectors.json` **and** `ProtocolVectors.kt`, so they cannot drift)
+- [x] Audit pass: 11 defects found and fixed — including a vector that would have
+      failed a *correct* Android build, an Android 14 foreground-service
+      `SecurityException`, and an unbuildable Compose/compileSdk pairing
 
 Still needs **your hardware** (I cannot compile or run Kotlin in this sandbox —
 no JDK, no Android SDK, no device):
@@ -43,7 +54,17 @@ no JDK, no Android SDK, no device):
 - [ ] Pairing SAS matches between the phone screen and the CLI prompt
 - [ ] Kill the app / toggle airplane mode → supervisor reconnects unattended
 
+Phase 1 is complete when the first three of those pass. Everything after that is
+a network check, and `docs/05-connection-verification.md` gives the exact
+commands and expected output for each.
+
 ## Phase 2 — Bluetooth audio proof of concept
+
+Phase 2 entry condition: `phonebridge info` reports
+`capabilities.audio.bluetooth_sco == true` while your headphones are connected to
+the phone. That flag is already implemented (a read-only probe) and is the
+cheapest way to find out whether this phone will do off-call SCO **before** any
+audio code is written.
 
 - [ ] `AudioRelay` on the phone: `setCommunicationDevice` + `MODE_IN_COMMUNICATION`,
       confirm route via `AudioDeviceCallback`, then open `AudioRecord(VOICE_COMMUNICATION)`
