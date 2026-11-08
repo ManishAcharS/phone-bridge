@@ -41,7 +41,6 @@ from phonebridge.protocol.framing import (
     KIND_HANDSHAKE,
     MAX_ENVELOPE_BODY,
     decode_envelope,
-    encode_json_envelope,
 )
 from phonebridge.protocol.messages import (
     MSG_BLOB,
@@ -55,7 +54,6 @@ from phonebridge.protocol.messages import (
     decode_control,
     handshake_msg,
     parse_ping,
-    ping_payload,
     pong_payload,
 )
 

@@ -35,7 +35,8 @@ object SelfTest {
             if (!condition) throw AssertionError(message)
         }
 
-        fun hex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
+        fun hex(bytes: ByteArray) =
+            bytes.joinToString("") { "%02x".format(java.util.Locale.ROOT, it) }
 
         record("identity key load + public encoding") {
             val pkcs8 = Base64.getDecoder().decode(ProtocolVectors.SCALAR_A_PKCS8_B64)

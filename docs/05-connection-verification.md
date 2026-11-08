@@ -28,7 +28,7 @@ later phases.
 
 ### 0.2 Phone side
 
-Build and install (see `docs/06-phase1-audit.md` §4 for the exact build steps),
+Build and install (exact steps: `docs/07-device-testing-guide.md` §3–§4),
 then in the app:
 
 1. Grant the notification permission when asked.

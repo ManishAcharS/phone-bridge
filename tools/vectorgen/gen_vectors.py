@@ -11,7 +11,8 @@ a PC attached.
 
 Run::
 
-    python tools/vectorgen/gen_vectors.py
+    python tools/vectorgen/gen_vectors.py            # write both files
+    python tools/vectorgen/gen_vectors.py --check    # verify, write nothing
 
 The vectors cover the four places where a Kotlin port can silently diverge:
 ECDH secret encoding, HKDF info/order, the SAS truncation, and the AES-GCM
@@ -175,14 +176,38 @@ def render_kotlin(vectors: dict[str, object]) -> str:
     return KOTLIN_TEMPLATE.replace("{constants}", body)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
     vectors = build_vectors()
-    JSON_PATH.write_text(json.dumps(vectors, indent=2) + "\n", "utf-8")
-    KOTLIN_PATH.write_text(render_kotlin(vectors), "utf-8")
+    rendered_json = json.dumps(vectors, indent=2) + "\n"
+    rendered_kotlin = render_kotlin(vectors)
+
+    if "--check" in argv:
+        drift = []
+        for path, rendered in ((JSON_PATH, rendered_json), (KOTLIN_PATH, rendered_kotlin)):
+            try:
+                current = path.read_text("utf-8")
+            except FileNotFoundError:
+                drift.append(f"missing: {path}")
+                continue
+            if current != rendered:
+                drift.append(f"out of date: {path}")
+        if drift:
+            print("vector drift detected:")
+            for line in drift:
+                print(f"  {line}")
+            print("run `python tools/vectorgen/gen_vectors.py` to regenerate")
+            return 1
+        print("vectors are up to date (vectors.json, ProtocolVectors.kt)")
+        return 0
+
+    JSON_PATH.write_text(rendered_json, "utf-8")
+    KOTLIN_PATH.write_text(rendered_kotlin, "utf-8")
     print(f"wrote {JSON_PATH}")
     print(f"wrote {KOTLIN_PATH}")
     print(json.dumps(vectors, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

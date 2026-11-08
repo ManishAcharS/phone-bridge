@@ -18,7 +18,9 @@ Legend: `[x]` implemented and tested · `[~]` partially implemented ·
 
 Status detail: [`docs/06-phase1-audit.md`](06-phase1-audit.md) (audit findings and
 build readiness) and [`docs/05-connection-verification.md`](05-connection-verification.md)
-(the exact procedure and expected outputs for your hardware).
+(the exact procedure and expected outputs for your hardware);
+[`docs/07-device-testing-guide.md`](07-device-testing-guide.md) is the same thing
+for getting the app installed and running in the first place.
 
 Implemented and verified **here**, against a reference phone implementation:
 
@@ -30,14 +32,17 @@ Implemented and verified **here**, against a reference phone implementation:
 - [x] Reconnection supervisor with jittered exponential backoff
 - [x] UDP discovery beacon (phone broadcasts, PC listens)
 - [x] CLI: `doctor`, `identity`, `discover`, `info`, `ping`, `bench`, `watch`, `forget`
-- [x] 96 automated tests: framing, crypto, replay/tamper rejection, end-to-end,
+- [x] Gradle wrapper committed (fresh clone builds; `.gitattributes` pins line endings)
+- [x] `python tools/verify.py` — tests, lint, vector drift, wrapper and a live CLI
+      handshake in one command
+- [x] 122 automated tests: framing, crypto, replay/tamper rejection, end-to-end,
       **11 regression tests** (each verified to fail against the pre-fix code) and
       **39 conformance tests** that parse the Kotlin sources and compare their
       constants, vectors and message set to the Python reference
 - [x] Kotlin implementation of the identical protocol + on-device self-test with
       Python-generated known-answer vectors (`tools/vectorgen/gen_vectors.py`
       writes `vectors.json` **and** `ProtocolVectors.kt`, so they cannot drift)
-- [x] Audit pass: 11 defects found and fixed — including a vector that would have
+- [x] Audit pass: 13 defects found and fixed — including a vector that would have
       failed a *correct* Android build, an Android 14 foreground-service
       `SecurityException`, and an unbuildable Compose/compileSdk pairing
 

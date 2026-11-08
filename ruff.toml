@@ -1,0 +1,27 @@
+# One lint configuration for the whole repository.
+#
+# It used to live in windows/pyproject.toml, which meant `tools/` (the phone
+# simulator and the vector generator - real code, not scratch files) was linted
+# with ruff's defaults instead. A root config makes `ruff check .` mean the same
+# thing everywhere.
+line-length = 100
+target-version = "py310"
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501", "SIM105"]
+
+[lint.per-file-ignores]
+# The simulator deliberately swallows errors while tearing down sockets and
+# server threads; logging them there would produce noise on every shutdown.
+"tools/simulator/phone_sim.py" = ["S110", "BLE001"]
+# Tests assert on purpose-built broken states.
+"windows/tests/*" = ["B017"]
+
+[lint.isort]
+# `phonebridge` lives in windows/ and is installed editable as a first-party
+# package; without this ruff (running from the repo root) treats it as
+# third-party and merges import blocks, which is churn, not a fix.
+# `phone_sim` and `gen_vectors` are path-injected helpers, not installed
+# packages, so they keep their existing third-party grouping.
+known-first-party = ["phonebridge"]

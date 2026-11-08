@@ -15,6 +15,7 @@ import java.security.spec.ECParameterSpec
 import java.security.spec.ECPoint
 import java.security.spec.ECPublicKeySpec
 import java.security.spec.PKCS8EncodedKeySpec
+import java.util.Locale
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
 import javax.crypto.Mac
@@ -128,12 +129,18 @@ object Crypto {
         return out
     }
 
+    /**
+     * Six ASCII digits. Locale.ROOT is not cosmetic: `String.format("%06d")`
+     * with the default locale renders Arabic-Indic or Persian digits on such
+     * devices, so the phone would show "٦٩٧٥٤٩" while the PC shows "697549" and
+     * the user would reasonably conclude the connection is being intercepted.
+     */
     fun sasDigits(clientToServerKey: ByteArray): String {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(clientToServerKey, "HmacSHA256"))
         val digest = mac.doFinal(INFO_SAS.toByteArray(Charsets.UTF_8))
         val value = ByteBuffer.wrap(digest, 0, 4).order(ByteOrder.BIG_ENDIAN).int.toLong() and 0xFFFFFFFFL
-        return "%06d".format(value % 1_000_000)
+        return "%06d".format(Locale.ROOT, value % 1_000_000)
     }
 
     fun formatSas(sas: String): String =
@@ -147,7 +154,7 @@ object Crypto {
         val publicRaw: ByteArray get() = Crypto.publicKeyToRaw(keyPair.public)
         val deviceId: String
             get() = MessageDigest.getInstance("SHA-256").digest(publicRaw)
-                .joinToString("") { "%02x".format(it) }
+                .joinToString("") { "%02x".format(Locale.ROOT, it) }
                 .substring(0, 16)
 
         fun toPkcs8(): ByteArray = keyPair.private.encoded

@@ -13,6 +13,8 @@ phonebridge-log-*.txt
 *.log
 
 # Android / Gradle
+# The wrapper jar is a checked-in build tool, not a build output: never ignore it.
+!android/gradle/wrapper/gradle-wrapper.jar
 android/.gradle/
 android/build/
 android/app/build/
@@ -21,6 +23,7 @@ android/.idea/
 android/captures/
 *.apk
 *.aab
+android/app/release/
 
 # OS
 .DS_Store

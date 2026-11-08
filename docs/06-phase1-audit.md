@@ -13,7 +13,7 @@ transfer, sensors) were started, and no existing working module was rewritten.
 | Python protocol | `protocol/framing.py`, `crypto.py`, `messages.py` |
 | Python transport | `transport/link.py`, `discovery.py` |
 | Python core | `core/session.py`, `core/device_store.py`, `cli/main.py` |
-| Python tests | `tests/test_framing.py` (10), `test_crypto.py` (21), `test_integration.py` (15) |
+| Python tests | `test_framing.py` (10), `test_crypto.py` (21), `test_integration.py` (15), `test_regressions.py` (11), `test_android_conformance.py` (39), `test_android_build.py` (26) |
 | Android build | `settings.gradle.kts`, `build.gradle.kts`, `app/build.gradle.kts`, `gradle.properties`, `gradle/wrapper/`, `AndroidManifest.xml`, resources |
 | Android source | `protocol/{Framing,Crypto,Json,Messages,ProtocolVectors,SelfTest}.kt`, `net/{BridgeServer,PairingStore,IdentityStore,DiscoveryBeacon,AudioProbe}.kt`, `service/{BridgeService,BridgeState}.kt`, `MainActivity.kt` |
 | Tooling | `tools/simulator/phone_sim.py`, `tools/vectorgen/gen_vectors.py`, `tools/diagnostics/env_report.ps1` |
@@ -156,7 +156,44 @@ asked for:
 Covered by `test_bench_reports_the_requested_frame_count`, verified to fail
 against the previous output.
 
-### 2.12 Test-coverage gap: none of the above was reachable by the old suite
+### 2.12 `[HIGH]` The Gradle wrapper was missing, so a fresh clone could not build
+
+`gradle/wrapper/gradle-wrapper.properties` was committed but
+`gradle-wrapper.jar`, `gradlew` and `gradlew.bat` were not, so
+`gradlew.bat assembleDebug` failed on any clean clone with
+`Could not find or load main class org.gradle.wrapper.GradleWrapperMain`.
+
+The three files are now committed, taken from the **official `gradle/gradle`
+repository at tag `v8.7.0`** (the same version the properties file pins):
+
+```
+gradle-wrapper.jar  43,453 bytes
+sha256              cb0da6751c2b753a16ac168bb354870ebb1e162e9083f116729cec9c781156b8
+verify              Implementation-Title: Gradle Wrapper
+                    org/gradle/wrapper/GradleWrapperMain.class present
+```
+
+You can re-check that independently:
+
+```powershell
+Get-FileHash android\gradle\wrapper\gradle-wrapper.jar -Algorithm SHA256
+python -c "import zipfile;print([n for n in zipfile.ZipFile(r'android\gradle\wrapper\gradle-wrapper.jar').namelist() if 'Main' in n])"
+```
+
+Also added so the wrapper survives a Windows/Linux clone: `.gitattributes`
+(`gradlew` → LF, `*.bat` → CRLF, `*.jar` → binary) and a `!` exception in
+`.gitignore` so the jar can never be ignored.
+
+### 2.13 `[MEDIUM]` The SAS could render as non-ASCII digits on some phones
+
+`"%06d".format(x)` uses the **default locale**. On a phone set to Arabic (or any
+locale with a non-ASCII zero digit) Android renders `٦٩٧٥٤٩` while the PC shows
+`697549`. The pairing codes would visibly disagree, and the security guidance is
+"if the codes differ, abort" — so a correct pairing would look like an attack.
+Fixed by formatting with `Locale.ROOT`, in the SAS and the hex helpers, and
+pinned by a test.
+
+### 2.14 Test-coverage gap: none of the above was reachable by the old suite
 
 The 45 pre-existing tests all passed while §2.1–§2.11 were present. That is why
 `tests/test_regressions.py` and `tests/test_android_conformance.py` were added —
@@ -223,33 +260,21 @@ cross-language verification available without a JVM:
 | minSdk | 26 | `availableCommunicationDevices` etc. are version-guarded above this |
 | SDK packages | `platforms;android-34`, `build-tools;34.0.0`, `platform-tools` | |
 
-### Known gap: the Gradle wrapper binary is absent
+### The Gradle wrapper is committed
 
-The repo contains `gradle/wrapper/gradle-wrapper.properties` but **not**
-`gradle-wrapper.jar` or `gradlew.bat`, because a Gradle distribution cannot be
-downloaded from the audit environment. `gradlew.bat assembleDebug` will therefore
-fail on a fresh clone. Two supported ways to build:
+`gradlew`, `gradlew.bat` and `gradle/wrapper/gradle-wrapper.jar` are in the
+repository (jar taken from the official `gradle/gradle` `v8.7.0` tag; see
+§2.12), so a fresh clone builds either way:
 
-**Option A — Android Studio (recommended, and it fills the gap for you)**
+**Option A — Android Studio:** **File → Open** → `phone-bridge\android` → let it
+sync → **Build → Build Bundle(s)/APK(s) → Build APK(s)**.
 
-1. **File → Open** → select the `phone-bridge\android` folder (not the repo root).
-2. Let Gradle sync. Android Studio generates `gradlew`, the wrapper jar and
-   `local.properties`, and downloads the SDK platform if missing.
-3. **Build → Build Bundle(s) / APK(s) → Build APK(s)**, or in the Studio terminal:
-
-   ```powershell
-   .\gradlew.bat assembleDebug
-   ```
-
-**Option B — command line, generating the wrapper once**
+**Option B — command line** (JDK 17 + SDK 34 installed, `local.properties` or
+`ANDROID_HOME` set):
 
 ```powershell
-winget install Microsoft.OpenJDK.17      # then reopen the shell
-winget install Gradle.Gradle             # provides the `gradle` command
 cd phone-bridge\android
-gradle wrapper --gradle-version 8.7      # creates gradlew.bat + wrapper jar
-"$env:JAVA_HOME"                         # must point at the JDK 17 install
-.\gradlew.bat assembleDebug
+.\gradlew.bat :app:assembleDebug
 ```
 
 If `ANDROID_HOME` is not set, create `android\local.properties`:
@@ -257,6 +282,9 @@ If `ANDROID_HOME` is not set, create `android\local.properties`:
 ```properties
 sdk.dir=C\:\\Users\\<you>\\AppData\\Local\\Android\\Sdk
 ```
+
+Step-by-step instructions, including SDK/JDK installation, phone installation,
+the self-test and connection troubleshooting: **`docs/07-device-testing-guide.md`**.
 
 ### Expected result
 
@@ -332,7 +360,7 @@ Run in the audit environment (Linux, no Android toolchain):
 
 ```
 $ cd windows && python -m pytest -q
-96 passed in 2.67s
+122 passed in 2.7s
 
 $ ruff check .
 All checks passed!
@@ -344,6 +372,7 @@ All checks passed!
 | `test_crypto.py` | 21 | ECDH/HKDF/AES-GCM, tamper + replay rejection, SAS, MITM mismatch | here |
 | `test_integration.py` | 15 | pairing, pinning, RPC, events, blob streams, bench reporting, reconnect, discovery over a real socket | here |
 | `test_regressions.py` | 11 | the defects in §2 that are reachable without hardware | here |
+| `test_android_build.py` | 26 | wrapper present/executable, AGP↔Gradle↔Kotlin↔Compose↔compileSdk coherence, manifest FGS prerequisites, component export flags, no dynamic versions, locale-safe SAS, `local.properties` ignored | here |
 | `test_android_conformance.py` | 39 | Kotlin↔Python constant/vector/message parity | here |
 | **Android self-test** | 8 checks | Kotlin crypto equals the Python vectors | **your phone** |
 | **Android build** | — | the app compiles | **your PC** |
@@ -370,9 +399,10 @@ Procedure and expected outputs: `docs/05-connection-verification.md`.
 
 **Not yet — it is complete on the PC side and unverified on the phone side.**
 
-* The Python implementation is finished, and now also hardened: eleven defects
-  were found and fixed, three of them blocking (a self-test that would have
-  false-alarmed, an Android 14 crash, and an unbuildable dependency set).
+* The Python implementation is finished, and now also hardened: thirteen defects
+  were found and fixed, four of them blocking (a self-test that would have
+  false-alarmed, an Android 14 crash, an unbuildable dependency set, and a
+  missing Gradle wrapper that made a fresh clone unbuildable).
 * The Android implementation is complete *as source*, consistent with the spec by
   automated check, but has **never been compiled or executed**. Reporting it as
   verified would be fabrication.
