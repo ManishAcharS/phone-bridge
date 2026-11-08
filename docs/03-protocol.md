@@ -154,6 +154,11 @@ plaintext = msg_type(1) ‖ stream_id(4, BE) ‖ payload
 | `0x60` | SENSOR | Phase 5 |
 | `0x7F` | BYE | UTF-8 reason |
 
+A request may be answered **later than the read loop**: `audio.capabilities.run`
+is dispatched to a worker thread and its `res` is sent from there, so the
+connection keeps answering heartbeats for the whole probe. Clients must not
+assume the reply arrives within a fixed short window.
+
 `stream_id` multiplexes independent flows; control always uses `0`. RTT is
 computed application-side from PING/PONG because that is the number that matters
 for audio latency, not TCP's estimate.
@@ -187,6 +192,8 @@ exactly 16 bytes is dropped rather than treated as an error.
 | `session.stats` | frames/bytes counters, active connections |
 | `bluetooth.headset.status` | headset connected?, profile name, communication devices |
 | `audio.route.bluetooth` | Phase 2 placeholder that reports support honestly |
+| `audio.capabilities.run` | run the capability probe on the phone; result is the report object itself (see `docs/08-multi-device-test-strategy.md` §2). Params: `seconds` (5-300, default 30), `acoustic` (bool). **Long-running:** the phone answers from a worker thread and never blocks its read loop, so keep the client timeout generous (the CLI uses 420 s) |
+| `audio.capabilities.last` | `{available: bool, report?: object}` — the last probe run, so a reconnecting PC need not re-measure |
 
 Adding a method is backwards compatible: unknown methods return
 `method_not_found` rather than killing the session, so a newer PC can talk to an

@@ -13,7 +13,7 @@ This is a personal-use project for one phone and one PC.
 | Phase | Scope | State |
 | --- | --- | --- |
 | 0 | Feasibility, architecture, protocol | **done** → [`docs/01-feasibility.md`](docs/01-feasibility.md) |
-| 1 | Encrypted bidirectional link PC ↔ phone | **PC side verified (122 tests); Android side compiled/run only on your machine** → [`docs/06-phase1-audit.md`](docs/06-phase1-audit.md) |
+| 1 | Encrypted bidirectional link PC ↔ phone | **PC side verified (184 tests); Android side compiled/run only on your machine** → [`docs/06-phase1-audit.md`](docs/06-phase1-audit.md) |
 | 2 | Bluetooth audio relay (the defining feature) | next |
 | 3 | Desktop + phone dashboards | planned |
 | 4 | Camera and microphone | planned |
@@ -51,7 +51,7 @@ A real, encrypted, bidirectional channel between the PC and the phone, with:
 * USB (adb forward *or* USB tethering), Wi-Fi and hotspot transports
 
 Measured on loopback with the reference phone implementation:
-application RTT **0.29–0.78 ms**, 30 MB/s encrypted payload, **122 tests passing**
+application RTT **0.29–0.78 ms**, 30 MB/s encrypted payload, **184 tests passing**
 (including 39 that check the Kotlin implementation's constants and known-answer
 vectors against the Python reference, so the two cannot silently drift).
 
@@ -143,7 +143,7 @@ pairing flow and reconnect logic can be exercised on one machine:
 python tools\simulator\phone_sim.py --port 8765 --pair-policy auto
 # in another terminal:
 cd windows
-python -m pytest -q                    # 122 tests
+python -m pytest -q                    # 184 tests
 ```
 
 ---
@@ -158,7 +158,7 @@ windows/phonebridge/
   transport/                WebSocket link, UDP discovery
   core/                     session, reconnection supervisor, device store
   cli/                      the `phonebridge` command
-windows/tests/              122 tests: framing, crypto, replay, end-to-end,
+windows/tests/              184 tests: framing, crypto, replay, end-to-end,
                             regressions, Kotlin<->Python conformance
 android/app/src/main/java/dev/phonebridge/
   protocol/                 byte-identical Kotlin port + self-test vectors
@@ -167,6 +167,7 @@ android/app/src/main/java/dev/phonebridge/
 tools/simulator/            phone reference implementation (testing)
 tools/vectorgen/            generates vectors.json AND ProtocolVectors.kt
 tools/verify.py             one command: tests + lint + vectors + wrapper + CLI smoke
+tools/simulator/            reference phone; can imitate any of the three devices
 tools/diagnostics/          Windows environment audit
 ```
 
@@ -202,6 +203,8 @@ on the phone.
 | implement against the wire format | [`docs/03-protocol.md`](docs/03-protocol.md) |
 | know what is next | [`docs/04-roadmap.md`](docs/04-roadmap.md) |
 | **install and test on my phone** | [`docs/07-device-testing-guide.md`](docs/07-device-testing-guide.md) |
+| **measure the three phones** | [`docs/08-multi-device-test-strategy.md`](docs/08-multi-device-test-strategy.md) |
+| **see the per-device results** | [`docs/09-compat-report.md`](docs/09-compat-report.md) |
 | **verify my own setup** | [`docs/05-connection-verification.md`](docs/05-connection-verification.md) |
 | see what was audited and what is still unproven | [`docs/06-phase1-audit.md`](docs/06-phase1-audit.md) |
 

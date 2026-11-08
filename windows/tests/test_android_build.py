@@ -31,6 +31,7 @@ ROOT_BUILD = ANDROID / "build.gradle.kts"
 PROPS = ANDROID / "gradle.properties"
 WRAPPER_PROPS = WRAPPER / "gradle-wrapper.properties"
 MANIFEST = ANDROID / "app" / "src" / "main" / "AndroidManifest.xml"
+KOTLIN_DIR = ANDROID / "app" / "src" / "main" / "java" / "dev" / "phonebridge"
 
 # --------------------------------------------------------------------------- #
 # known-compatible pairings (see docs/06-phase1-audit.md §4)
@@ -107,7 +108,9 @@ def app_config() -> dict[str, str]:
 
 
 def permissions() -> set[str]:
-    return set(re.findall(r'<uses-permission android:name="([^"]+)"', read(MANIFEST)))
+    # Tolerate the multi-line form used for permissions that carry attributes
+    # such as android:maxSdkVersion.
+    return set(re.findall(r'<uses-permission\s+android:name="([^"]+)"', read(MANIFEST)))
 
 
 # --------------------------------------------------------------------------- #
@@ -282,17 +285,76 @@ def test_backup_is_disabled_and_components_are_scoped():
     ), "the bridge service must not be exported to other apps"
 
 
-def test_phase1_declares_no_audio_or_camera_permissions():
-    forbidden = {
-        "android.permission.RECORD_AUDIO",
-        "android.permission.CAMERA",
-        "android.permission.BLUETOOTH_CONNECT",
+def test_declared_permissions_are_exactly_the_ones_the_code_uses():
+    """No silent permission creep.
+
+    Phase 1 needed none of these; the capability probe needs exactly these. The
+    test pins the set so adding a permission is a deliberate, reviewed change
+    rather than an accident, and so a permission the UI *requests* can never be
+    missing from the manifest (that fails silently on device).
+    """
+    expected = {
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
+        "android.permission.WAKE_LOCK",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.CHANGE_NETWORK_STATE",
+        "android.permission.CHANGE_WIFI_STATE",
         "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH",
+    }
+    declared = permissions()
+    assert declared == expected, (
+        f"unexpected: {sorted(declared - expected)}; "
+        f"missing: {sorted(expected - declared)}"
+    )
+
+
+def test_storage_and_camera_permissions_are_not_requested():
+    forbidden = {
+        "android.permission.CAMERA",
         "android.permission.MANAGE_EXTERNAL_STORAGE",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_SMS",
+        "android.permission.ACCESS_FINE_LOCATION",
     }
     declared = permissions() & forbidden
-    assert not declared, (
-        f"Phase 1 must not request permissions it does not use yet: {sorted(declared)}"
+    assert not declared, f"these are not needed for audio work: {sorted(declared)}"
+
+
+def test_legacy_bluetooth_permission_is_capped_at_api_30():
+    text = read(MANIFEST)
+    match = re.search(
+        r'<uses-permission\s+android:name="android.permission.BLUETOOTH"\s+'
+        r'android:maxSdkVersion="(\d+)"',
+        text,
+    )
+    assert match, (
+        "the legacy BLUETOOTH permission must be limited with maxSdkVersion; "
+        "unlimited it is a redundant install-time permission on API 31+"
+    )
+    assert match.group(1) == "30"
+
+
+def test_every_runtime_permission_requested_in_code_is_declared():
+    """A permission requested at runtime but absent from the manifest is denied
+    instantly and silently - a classic Android bug that is invisible until it
+    matters."""
+    declared = permissions()
+    requested: set[str] = set()
+    for kt in KOTLIN_DIR.rglob("*.kt"):
+        text = kt.read_text("utf-8")
+        for name in re.findall(r"Manifest\.permission\.([A-Z_0-9]+)", text):
+            requested.add(f"android.permission.{name}")
+    missing = requested - declared
+    assert not missing, (
+        f"code requests {sorted(missing)} but the manifest does not declare them"
     )
 
 

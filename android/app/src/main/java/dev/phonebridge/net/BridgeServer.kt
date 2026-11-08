@@ -20,6 +20,7 @@ import java.util.Collections
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
@@ -104,6 +105,54 @@ class BridgeServer(
 
     @Volatile
     private var bindError: Exception? = null
+
+    /** Last capability probe report, kept so a reconnect can fetch it. */
+    @Volatile
+    private var lastCapabilityReport: Map<String, Any?>? = null
+
+    private val probeLock = Any()
+
+    /** Store a report measured in the UI, so a later PC connection can read it. */
+    fun publishCapabilityReport(report: Map<String, Any?>) {
+        lastCapabilityReport = report
+        addLog("INFO", "capability probe report stored (${report["duration_ms"]} ms)")
+    }
+
+    // One probe at a time: the audio path is a shared resource.
+    private val probeExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "capability-probe").apply { isDaemon = true }
+    }
+
+    /**
+     * Run [CapabilityProbe] off the connection thread and answer when it is done.
+     *
+     * The reply goes out on the probe thread through the peer's normal send path,
+     * which is thread-safe; the connection keeps reading (and answering
+     * heartbeats) meanwhile.
+     */
+    private fun runCapabilityProbeAsync(
+        rpcId: Any?,
+        seconds: Int,
+        acoustic: Boolean,
+        peer: PeerSession,
+    ) {
+        addLog("INFO", "capability probe requested (soak ${seconds}s, acoustic=$acoustic)")
+        probeExecutor.execute {
+            val payload = try {
+                val report = synchronized(probeLock) {
+                    CapabilityProbe
+                        .run(context, CapabilityProbe.Config(seconds = seconds, acoustic = acoustic))
+                        .also { lastCapabilityReport = it }
+                }
+                addLog("INFO", "capability probe finished (${report["duration_ms"]} ms)")
+                Messages.responseOk(rpcId, report)
+            } catch (e: Exception) {
+                addLog("ERROR", "capability probe failed: ${e.message}")
+                Messages.responseErr(rpcId, "probe_failed", "${e.javaClass.simpleName}: ${e.message}")
+            }
+            peer.sendControl(payload)
+        }
+    }
 
     @Volatile
     private var pendingPairing: MutableList<PendingPairing> =
@@ -265,7 +314,16 @@ class BridgeServer(
         "protocol_version" to Framing.PROTOCOL_VERSION,
     )
 
-    internal fun dispatchRpc(msg: Map<String, Any?>): ByteArray {
+    /**
+     * Handle one control request.
+     *
+     * Returns the bytes to send back, or **null** when the answer will be sent
+     * later from another thread. That escape hatch exists for the capability
+     * probe, which can run for minutes: blocking the connection's read loop that
+     * long would starve the WebSocket heartbeats and drop the very link the
+     * probe is reporting on.
+     */
+    private fun dispatchRpc(msg: Map<String, Any?>, peer: PeerSession): ByteArray? {
         val id = msg["id"]
         val method = msg["method"] as? String
             ?: return Messages.responseErr(id, "bad_request", "missing method")
@@ -321,6 +379,20 @@ class BridgeServer(
                         "detail" to "Phase 2: SCO routing is exercised by the audio relay, " +
                             "not by this probe",
                     ),
+                )
+
+                "audio.capabilities.run" -> {
+                    val seconds = ((params["seconds"] as? Number)?.toInt() ?: 30)
+                        .coerceIn(5, 300)
+                    val acoustic = params["acoustic"] as? Boolean ?: false
+                    runCapabilityProbeAsync(id, seconds, acoustic, peer)
+                    null // answered from the probe thread when it finishes
+                }
+
+                "audio.capabilities.last" -> Messages.responseOk(
+                    id,
+                    lastCapabilityReport?.let { mapOf("available" to true, "report" to it) }
+                        ?: mapOf("available" to false, "reason" to "no probe has run yet"),
                 )
 
                 else -> Messages.responseErr(id, "method_not_found", "no handler for '$method'")
@@ -584,7 +656,7 @@ class BridgeServer(
         private fun onControl(payload: ByteArray) {
             val msg = Json.toMap(payload)
             when (msg["k"]) {
-                Messages.K_REQUEST -> sendControl(dispatchRpc(msg))
+                Messages.K_REQUEST -> dispatchRpc(msg, this)?.let { sendControl(it) }
                 Messages.K_EVENT -> addLog("DEBUG", "event from PC: ${msg["event"]}")
                 Messages.K_RESPONSE -> addLog("DEBUG", "unexpected response ${msg["id"]}")
                 else -> Unit

@@ -35,7 +35,7 @@ Implemented and verified **here**, against a reference phone implementation:
 - [x] Gradle wrapper committed (fresh clone builds; `.gitattributes` pins line endings)
 - [x] `python tools/verify.py` — tests, lint, vector drift, wrapper and a live CLI
       handshake in one command
-- [x] 122 automated tests: framing, crypto, replay/tamper rejection, end-to-end,
+- [x] 184 automated tests: framing, crypto, replay/tamper rejection, end-to-end,
       **11 regression tests** (each verified to fail against the pre-fix code) and
       **39 conformance tests** that parse the Kotlin sources and compare their
       constants, vectors and message set to the Python reference
@@ -65,9 +65,22 @@ commands and expected output for each.
 
 ## Phase 2 — Bluetooth audio proof of concept
 
-Phase 2 entry condition: `phonebridge info` reports
-`capabilities.audio.bluetooth_sco == true` while your headphones are connected to
-the phone. That flag is already implemented (a read-only probe) and is the
+**Pre-work done (measurement only, no relay):**
+
+- [x] `CapabilityProbe` on the phone: device/ROM facts, adapter and profile
+      state, declared off-call SCO, legacy (`startBluetoothSco`) and modern
+      (`setCommunicationDevice`) routing, playback route, microphone route with
+      a silence check, duplex soak, acoustic chirp latency, interruptions
+- [x] `audio.capabilities.run` / `.last` RPCs, answered off the read loop
+- [x] On-phone probe UI with per-run screen wake, JSON export
+- [x] `phonebridge compat run/show/compare/report` and the compatibility report
+      with per-device verdicts (`docs/08`, `docs/09`)
+- [ ] **Measure the three handsets** — primary first, twice, then the report
+      decides the relay design
+
+Phase 2 entry condition: a stored, real (non-simulated) probe record for the
+primary device showing duplex audio. `phonebridge info`'s
+`capabilities.audio.bluetooth_sco` flag is only a hint; the probe is the evidence. That flag is already implemented (a read-only probe) and is the
 cheapest way to find out whether this phone will do off-call SCO **before** any
 audio code is written.
 

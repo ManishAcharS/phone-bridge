@@ -308,6 +308,8 @@ private fun DashboardScreen() {
                 }
             }
 
+            item { CapabilityProbeCard() }
+
             item {
                 Section("Protocol self-test") {
                     Text(

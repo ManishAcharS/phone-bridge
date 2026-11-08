@@ -80,6 +80,15 @@ object BridgeState {
         mirrors = emptyList()
     }
 
+    /**
+     * Hand a probe report to the running server so the PC can fetch it later
+     * with `audio.capabilities.last`. With no server running there is no PC to
+     * fetch it, and the report stays in the UI (and on the clipboard).
+     */
+    fun publishProbe(report: Map<String, Any?>) {
+        server?.publishCapabilityReport(report)
+    }
+
     fun answerPairing(approve: Boolean) {
         server?.answerPairing(approve)
     }

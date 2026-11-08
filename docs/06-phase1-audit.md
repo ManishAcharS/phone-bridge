@@ -360,7 +360,7 @@ Run in the audit environment (Linux, no Android toolchain):
 
 ```
 $ cd windows && python -m pytest -q
-122 passed in 2.7s
+184 passed in 5.0s      # includes the Phase 2 preparation suites added later
 
 $ ruff check .
 All checks passed!
@@ -372,7 +372,8 @@ All checks passed!
 | `test_crypto.py` | 21 | ECDH/HKDF/AES-GCM, tamper + replay rejection, SAS, MITM mismatch | here |
 | `test_integration.py` | 15 | pairing, pinning, RPC, events, blob streams, bench reporting, reconnect, discovery over a real socket | here |
 | `test_regressions.py` | 11 | the defects in §2 that are reachable without hardware | here |
-| `test_android_build.py` | 26 | wrapper present/executable, AGP↔Gradle↔Kotlin↔Compose↔compileSdk coherence, manifest FGS prerequisites, component export flags, no dynamic versions, locale-safe SAS, `local.properties` ignored | here |
+| `test_compat.py` | 57 | Phase 2 preparation: probe-report schema, verdict rules, report rendering, and the "never infer from the Bluetooth version" rule (`docs/08`) | here |
+| `test_android_build.py` | 29 | wrapper present/executable, AGP↔Gradle↔Kotlin↔Compose↔compileSdk coherence, manifest FGS prerequisites, component export flags, no dynamic versions, locale-safe SAS, `local.properties` ignored | here |
 | `test_android_conformance.py` | 39 | Kotlin↔Python constant/vector/message parity | here |
 | **Android self-test** | 8 checks | Kotlin crypto equals the Python vectors | **your phone** |
 | **Android build** | — | the app compiles | **your PC** |

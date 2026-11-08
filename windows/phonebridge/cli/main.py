@@ -27,6 +27,7 @@ import sys
 import time
 from pathlib import Path
 
+from ..core import compat
 from ..core.device_store import DeviceStore
 from ..core.session import BridgeSession, ReconnectingSession, SessionError
 from ..transport.discovery import HELP as DISCOVERY_HELP
@@ -69,6 +70,89 @@ async def _connect(args: argparse.Namespace, store: DeviceStore) -> BridgeSessio
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     return session
+
+
+
+# --------------------------------------------------------------------------- #
+# compat - multi-device capability records
+# --------------------------------------------------------------------------- #
+async def _compat_run(args: argparse.Namespace) -> int:
+    """Ask the phone to measure itself, then store the report."""
+    store = _store(args)
+    session = await _connect(args, store)
+    try:
+        print(f"running capability probe on {session.uri} "
+              f"(duplex soak {args.seconds}s{', acoustic latency' if args.acoustic else ''}) ...")
+        params = {"seconds": args.seconds, "acoustic": args.acoustic}
+        report = await session.call("audio.capabilities.run", params, timeout=args.timeout)
+    finally:
+        await session.close()
+
+    if not isinstance(report, dict):
+        print("error: the phone returned no report", file=sys.stderr)
+        return 2
+    if args.label:
+        report["label"] = args.label
+    report.setdefault("captured_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+
+    problems = compat.validate_report(report)
+    if problems:
+        print("error: the phone returned a malformed report:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        print(json.dumps(report, indent=2), file=sys.stderr)
+        return 2
+
+    path = compat.save_report(store.dir, report)
+    print()
+    print(compat.compare_table([report]))
+    print()
+    for finding in compat.derive_findings(report):
+        print(f"  [{finding.level:8s}] {finding.code}: {finding.text}")
+    print()
+    print(f"stored: {path}")
+    print("regenerate the report with: phonebridge compat report")
+    return 0
+
+
+def _compat_show(args: argparse.Namespace) -> int:
+    store = _store(args)
+    reports = compat.load_reports(store.dir)
+    if not reports:
+        print(f"no compat records in {compat.compat_dir(store.dir)}")
+        print('run: phonebridge compat run --host <phone-ip> --label "<device name>"')
+        return 1
+    print(compat.compare_table(reports))
+    print()
+    for report in reports:
+        print(f"{compat._label(report)}: {compat.verdict(report)} "
+              f"({compat.VERDICT_LABELS[compat.verdict(report)]})")
+        for finding in compat.derive_findings(report):
+            if finding.level != "info":
+                print(f"    [{finding.level}] {finding.code}: {finding.text}")
+    return 0
+
+
+def _compat_compare(args: argparse.Namespace) -> int:
+    store = _store(args)
+    reports = compat.load_reports(store.dir)
+    if not reports:
+        print(f"no compat records in {compat.compat_dir(store.dir)}")
+        return 1
+    print(compat.compare_table(reports))
+    return 0
+
+
+def _compat_report(args: argparse.Namespace) -> int:
+    store = _store(args)
+    reports = compat.load_reports(store.dir)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(compat.render_markdown(reports), "utf-8")
+    print(f"wrote {out.resolve()} ({len(reports)} record(s) found)")
+    if not reports:
+        print("no records yet - the report lists every planned device as unmeasured")
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -414,6 +498,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     f = sub.add_parser("forget", help="unpin a phone")
     f.add_argument("device_id")
+
+    cp = sub.add_parser(
+        "compat",
+        help="multi-device audio capability records",
+        description=(
+            "Measure what each phone can actually do with a Bluetooth headset, "
+            "and render the comparison. Nothing is inferred from specs."
+        ),
+    )
+    csub = cp.add_subparsers(dest="compat_command", required=True)
+
+    cr = csub.add_parser("run", help="run the capability probe on a phone and store it")
+    cr.add_argument("--host", required=True, help="phone IP, or 127.0.0.1 with adb forward")
+    cr.add_argument("--port", type=int, default=DEFAULT_PORT)
+    cr.add_argument("--label", default=None,
+                    help='human name for the report, e.g. "Redmi Note 14 Pro+ 5G"')
+    cr.add_argument("--seconds", type=int, default=30,
+                    help="duplex soak length on the phone (5-300, default 30)")
+    cr.add_argument("--acoustic", action="store_true",
+                    help="also measure acoustic round-trip latency (chirp)")
+    cr.add_argument("--timeout", type=float, default=420.0,
+                    help="seconds to wait for the phone to finish probing")
+    cr.add_argument("--auto-pair", action="store_true")
+
+    csub.add_parser("show", help="print stored records with their findings")
+    csub.add_parser("compare", help="print the comparison table only")
+
+    crep = csub.add_parser("report", help="write the Markdown compatibility report")
+    crep.add_argument("--out", default=str(Path("docs") / "09-compat-report.md"),
+                      help="output path (default: docs/09-compat-report.md)")
     return p
 
 
@@ -430,6 +544,16 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_identity(args)
     if args.command == "forget":
         return cmd_forget(args)
+    if args.command == "compat":
+        if args.compat_command == "run":
+            return asyncio.run(_compat_run(args))
+        if args.compat_command == "show":
+            return _compat_show(args)
+        if args.compat_command == "compare":
+            return _compat_compare(args)
+        if args.compat_command == "report":
+            return _compat_report(args)
+        raise SystemExit(f"unknown compat command {args.compat_command!r}")
     try:
         if args.command == "discover":
             return asyncio.run(_discover(args))

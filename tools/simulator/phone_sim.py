@@ -86,6 +86,16 @@ class SimulatedPhone:
     state_file: Path | None = None
     name: str = "Pixel-sim"
     pair_policy: str = "auto"  # auto | prompt | deny
+    # Reported by the simulated capability probe so the multi-device report can
+    # be exercised end to end without hardware. Everything here is labelled
+    # source="simulator" and never counts as evidence about a real handset.
+    model: str = "PhoneBridge Simulator"
+    manufacturer: str = "PhoneBridge"
+    codename: str = "sim"
+    sdk_int: int = 34
+    android_release: str = "14"
+    headset_connected: bool = True
+    probe_profile: str = "duplex"  # duplex | output_only | no_headset | fail
     host: str = "127.0.0.1"
     port: int = 8765
     beacon: bool = False
@@ -98,6 +108,7 @@ class SimulatedPhone:
     _beacon_task: asyncio.Task[None] | None = None
     pairing_requests: int = 0
     handshakes: int = 0
+    last_capability_report: dict[str, Any] | None = None
     frames_in: int = 0
     bytes_in: int = 0
     blobs_echoed: int = 0
@@ -169,10 +180,114 @@ class SimulatedPhone:
                 "note": "on hardware this reports A2DP/HFP state from AudioManager",
             }
 
+        @r.register("audio.capabilities.run")
+        def _capabilities_run(params: dict[str, Any]) -> dict[str, Any]:
+            return self._simulated_capability_report(params)
+
+        @r.register("audio.capabilities.last")
+        def _capabilities_last(_params: dict[str, Any]) -> dict[str, Any]:
+            if self.last_capability_report is None:
+                return {"available": False, "reason": "no probe has run yet"}
+            return {"available": True, "report": self.last_capability_report}
+
         @r.register("system.shutdown")
         def _shutdown(_params: dict[str, Any]) -> dict[str, Any]:
             asyncio.get_running_loop().call_later(0.1, self.stop_soon)
             return {"ok": True}
+
+    # ------------------------------------------------------------------ #
+    # simulated capability probe
+    # ------------------------------------------------------------------ #
+    def _simulated_capability_report(self, params: dict[str, Any]) -> dict[str, Any]:
+        """A structurally valid probe report with no hardware behind it.
+
+        Deliberately mimics the Android payload field for field: if the two ever
+        drift, the report renderer and its tests catch it.
+        """
+        seconds = max(1.0, min(float(params.get("seconds") or 30), 300.0))
+        acoustic = bool(params.get("acoustic"))
+        profile = self.probe_profile
+        modern = self.sdk_int >= 31
+        headset = self.headset_connected and profile != "no_headset"
+
+        time.sleep(min(seconds, 0.5))  # keep tests fast; the phone really waits
+
+        def status(ok: bool) -> str:
+            return "pass" if ok else ("skipped" if not headset else "fail")
+
+        output_ok = headset and profile in ("duplex", "output_only")
+        input_ok = headset and profile == "duplex"
+        duplex_ok = headset and profile == "duplex"
+
+        report: dict[str, Any] = {
+            "schema_version": 1,
+            "source": "simulator",
+            "device_id": self.identity.device_id,
+            "label": self.name,
+            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "device": {
+                "manufacturer": self.manufacturer,
+                "model": self.model,
+                "codename": self.codename,
+                "android_release": self.android_release,
+                "sdk_int": self.sdk_int,
+                "rom": "unknown",
+                "rom_version": None,
+                "incremental": "sim",
+                "is_emulator": True,
+            },
+            "bluetooth": {
+                "supported": True,
+                "enabled": headset,
+                "adapter_name": "sim-adapter" if headset else None,
+                "version": None,
+                "hfp_connected": ["00:11:22:33:44:55"] if headset else [],
+                "a2dp_connected": ["00:11:22:33:44:55"] if headset else [],
+                "bonded_count": 1 if headset else 0,
+                "le_audio_supported": None,
+            },
+            "sco": {
+                "path": "modern" if modern else "legacy",
+                "declared_offcall_available": True,
+                "request_accepted": headset,
+                "route_observed_ms": 40 if headset else None,
+                "communication_device_after": "bluetooth_sco" if headset else None,
+            },
+            "route_output": {
+                "status": status(output_ok),
+                "routed_device": "bluetooth_sco" if output_ok else None,
+                "underruns": 0,
+                "track_rate_hz": 16000,
+            },
+            "route_input": {
+                "status": status(input_ok),
+                "routed_device": "bluetooth_sco" if input_ok else None,
+                "record_rate_hz": 16000,
+                "rms": 1450 if input_ok else 0,
+                "peak": 9120 if input_ok else 0,
+                "signal_detected": bool(input_ok),
+            },
+            "duplex": {
+                "status": status(duplex_ok),
+                "seconds": seconds,
+                "underruns": 0,
+                "read_timeouts": 0,
+                "route_changes": 0,
+            },
+            "latency": (
+                {"method": "acoustic_loopback", "round_trip_ms": 128.0, "confidence": 5.2}
+                if acoustic and duplex_ok
+                else {"method": "timestamp_estimate", "estimate_ms": 41.0}
+                if duplex_ok
+                else {"method": "none"}
+            ),
+            "interruptions": [],
+            "errors": [] if headset else ["no Bluetooth headset attached"],
+            "tests_run": ["device", "bluetooth", "sco", "route_output", "route_input",
+                          "duplex", "latency"],
+        }
+        self.last_capability_report = report
+        return report
 
     def stop_soon(self) -> None:
         if self._server is not None:
@@ -508,6 +623,13 @@ async def main_async(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         beacon=args.beacon,
+        model=args.model,
+        manufacturer=args.manufacturer,
+        codename=args.codename,
+        sdk_int=args.sdk_int,
+        android_release=args.android_release,
+        headset_connected=args.headset == "yes",
+        probe_profile=args.probe_profile,
     )
     await phone.start()
     print(f"Simulated phone '{args.name}' id={ident.device_id} on ws://{args.host}:{phone.port}")
@@ -528,6 +650,18 @@ def main() -> None:
     p.add_argument("--state-dir", default=".phone-sim")
     p.add_argument("--pair-policy", choices=["auto", "prompt", "deny"], default="prompt")
     p.add_argument("--beacon", action="store_true", help="broadcast a discovery beacon")
+    p.add_argument("--model", default="PhoneBridge Simulator",
+                   help="model name reported by the simulated capability probe")
+    p.add_argument("--manufacturer", default="PhoneBridge")
+    p.add_argument("--codename", default="sim")
+    p.add_argument("--sdk-int", type=int, default=34,
+                   help="reported SDK level; <31 exercises the legacy SCO path")
+    p.add_argument("--android-release", default="14")
+    p.add_argument("--headset", choices=["yes", "no"], default="yes",
+                   help="whether a headset is attached in the simulated probe")
+    p.add_argument("--probe-profile", default="duplex",
+                   choices=["duplex", "output_only", "no_headset", "fail"],
+                   help="simulated outcome of the capability probe")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
     logging.basicConfig(
