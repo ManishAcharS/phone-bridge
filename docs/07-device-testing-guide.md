@@ -204,6 +204,20 @@ start app\build\reports\lint-results-debug.html      # lint findings
 * `'Divider(...)' is deprecated` — material3 1.2.1, will move to `HorizontalDivider` when the BOM moves.
 * `getPackageInfo(String, Int)` deprecation — API 33 overload exists, current form still works on minSdk 26.
 * `InlinedApi` for `TYPE_BLE_HEADSET` / `VERSION_CODES.TIRAMISU` — deliberately guarded by `SDK_INT` checks; the constants are inlined at compile time.
+* `Warning: SDK processing. This version only understands SDK XML versions up to 3 but an SDK XML file of version 4 was encountered.`
+  This is a **tooling-date mismatch, not a build problem**. The SDK handler inside
+  AGP 8.5.2 understands `package.xml` schema up to **v3**; packages installed by a
+  newer `sdkmanager` or Android Studio (build-tools 35/36, platform 35/36, recent
+  cmdline-tools, newer NDK/CMake) write **v4**. It scans every installed package,
+  so one v4 package anywhere in `%LOCALAPPDATA%\Android\Sdk` prints this line,
+  then the build continues normally. Nothing in this project needs those
+  packages: it uses `platforms;android-34` and `build-tools;34.0.0`.
+  If you want it gone, the honest options are (a) leave it — it costs nothing;
+  (b) remove the too-new SDK packages if nothing else on the machine needs them;
+  (c) move AGP, Gradle and compileSdk forward together, which is a real migration
+  (see §2.3 of `docs/06-phase1-audit.md`) and not worth taking for a warning.
+  Do **not** silence it with `android.suppressUnsupportedCompileSdk` — that flag is
+  about a different warning and would hide a real one.
 
 ### Errors that are *not* environment problems
 
@@ -214,6 +228,8 @@ start app\build\reports\lint-results-debug.html      # lint findings
 | `error: cannot find symbol BuildConfig` | buildConfig disabled and code uses it | it is not used in Phase 1 |
 | `Execution failed for task ':app:processDebugManifest'` | manifest edited by hand | `git diff android/app/src/main/AndroidManifest.xml` |
 | `SDK location not found` | §2 | create `local.properties` |
+| `error: enum class is not allowed here` (or `object`/`interface`/`companion object`/`class` "is not allowed here") | a declaration was added inside an `inner class`; Kotlin permits only an `inner class` there | move it one level out (see `BridgeServer.Stage`), then `python -m pytest tests/test_kotlin_sources.py -q` |
+| `Unresolved reference: applicationInfo` | `PackageManager` was asked for `applicationInfo`; only `Context` has it | use `context.applicationInfo.<field>`; the same test suite pins this |
 
 Report the exact task name and the first `Caused by:` line if you hit anything
 else.

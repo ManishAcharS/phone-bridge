@@ -179,7 +179,6 @@ object CapabilityProbe {
     // ------------------------------------------------------------------ //
     private fun deviceFacts(context: Context): Map<String, Any?> {
         val power = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
-        val pm = context.packageManager
         val romProps = systemProperties(
             "ro.miui.ui.version.name",      // MIUI
             "ro.mi.os.version.name",        // HyperOS
@@ -208,7 +207,7 @@ object CapabilityProbe {
             "rom_version" to romVersion,
             "is_emulator" to isProbablyEmulator(),
             "package" to context.packageName,
-            "app_sdk_target" to pm.applicationInfo?.targetSdkVersion,
+            "app_sdk_target" to context.applicationInfo.targetSdkVersion,
             "power_save_mode" to power?.isPowerSaveMode,
             "ignoring_battery_optimizations" to
                 power?.isIgnoringBatteryOptimizations(context.packageName),

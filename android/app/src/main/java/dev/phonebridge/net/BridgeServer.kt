@@ -412,12 +412,28 @@ class BridgeServer(
     // ------------------------------------------------------------------ //
     // per-connection state machine
     // ------------------------------------------------------------------ //
+
+    /**
+     * Handshake state of one [PeerSession].
+     *
+     * Declared here, in [BridgeServer], rather than inside [PeerSession] because
+     * Kotlin forbids *any* nested class-like declaration (`enum class`, `object`,
+     * `interface`, `companion object`, even a plain `class`) inside an `inner
+     * class` — the compiler says `enum class is not allowed here`. An `inner`
+     * class only exists together with an instance of its enclosing class, while
+     * enum entries are static singletons, so the nesting has no valid meaning.
+     * [PeerSession] must stay `inner` (it reaches this instance's sockets, log,
+     * stats and pairing callbacks), so the enum moves out one level instead.
+     *
+     * `private` to this file's class and never used in a public signature, so it
+     * stays an implementation detail exactly as before.
+     */
+    private enum class Stage { AWAIT_HELLO, AWAIT_AUTH, AWAIT_PAIR_CONFIRM, READY, DEAD }
+
     internal inner class PeerSession(
         private val conn: WebSocket,
         private val remote: String,
     ) {
-        private enum class Stage { AWAIT_HELLO, AWAIT_AUTH, AWAIT_PAIR_CONFIRM, READY, DEAD }
-
         private val lock = Any()
         private var stage = Stage.AWAIT_HELLO
         private var responder: Crypto.HandshakeResponder? = null

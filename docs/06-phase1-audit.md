@@ -199,6 +199,27 @@ The 45 pre-existing tests all passed while §2.1–§2.11 were present. That is 
 `tests/test_regressions.py` and `tests/test_android_conformance.py` were added —
 see §3.
 
+### 2.15 `[HIGH]` The first real Gradle build surfaced two Kotlin compile errors
+
+Found on Windows (JDK 17, SDK 34) the first time `assembleDebug` reached the
+Kotlin compiler. Both were genuine source defects, not toolchain problems:
+
+| Line | Compiler said | Cause |
+| --- | --- | --- |
+| `BridgeServer.kt:419` | `enum class is not allowed here` | an `enum class` — actually *any* class-like declaration — cannot be nested inside an `inner class`. `PeerSession` must stay `inner`, so the enum moved one level out into `BridgeServer`. |
+| `CapabilityProbe.kt:211` | `Unresolved reference: applicationInfo` | `PackageManager` has no zero-arg `applicationInfo`; every accessor takes a package name. `Context.getApplicationInfo()` is the API that provides it. |
+
+Neither was reachable from this environment: nothing here compiles Kotlin, and
+`test_android_conformance.py` only parses constants, so a source file that is
+perfectly consistent and still does not compile looked fine. §3 adds
+`tests/test_kotlin_sources.py`, which encodes both rules; `kotlin_scan.py` was
+validated against **kotlinc 1.9.24** (the pinned version) on this tree — with the
+old `BridgeServer.kt` it reports exactly the one error the compiler reports, and
+with the fixed tree it reports none.
+
+The APK build itself still has not been run in this environment (no JDK, no SDK),
+so "compiles" remains a claim only your machine can settle.
+
 ---
 
 ## 3. Tests added (all runnable here)
@@ -241,6 +262,16 @@ cross-language verification available without a JVM:
 * Every RPC method the CLI calls has an Android handler.
 * Every `.kt` file has a package declaration matching its directory and balanced
   brackets (catches a truncated or mis-edited file).
+
+**`tests/test_kotlin_sources.py` — 26 tests.** The rules in §2.15, executable
+without a JVM. `tests/kotlin_scan.py` masks comments and string literals (Kotlin
+block comments nest, raw strings may contain braces), finds every `inner class`
+body by brace matching, and reports only declarations at the *member* level of
+that body — so a local class inside a method, or an anonymous `object : Runnable`
+initialiser, is correctly left alone. The suite covers all six rejected forms,
+ten legal ones, the exact historical shape with its line number, and re-injects
+the bug into the current `BridgeServer.kt` text so the tree-level scan cannot
+pass vacuously.
 
 ---
 
@@ -360,7 +391,7 @@ Run in the audit environment (Linux, no Android toolchain):
 
 ```
 $ cd windows && python -m pytest -q
-184 passed in 5.0s      # includes the Phase 2 preparation suites added later
+210 passed in 5.1s      # includes the Phase 2 preparation suites added later
 
 $ ruff check .
 All checks passed!
@@ -375,6 +406,7 @@ All checks passed!
 | `test_compat.py` | 57 | Phase 2 preparation: probe-report schema, verdict rules, report rendering, and the "never infer from the Bluetooth version" rule (`docs/08`) | here |
 | `test_android_build.py` | 29 | wrapper present/executable, AGP↔Gradle↔Kotlin↔Compose↔compileSdk coherence, manifest FGS prerequisites, component export flags, no dynamic versions, locale-safe SAS, `local.properties` ignored | here |
 | `test_android_conformance.py` | 39 | Kotlin↔Python constant/vector/message parity | here |
+| `test_kotlin_sources.py` | 26 | Kotlin declarations the compiler rejects (`enum class inside an inner class`) and `PackageManager`/`Context` API misuse — the two `assembleDebug` errors in §2.15 | here |
 | **Android self-test** | 8 checks | Kotlin crypto equals the Python vectors | **your phone** |
 | **Android build** | — | the app compiles | **your PC** |
 | **Four connection paths** | — | real links work | **your PC + phone** |
