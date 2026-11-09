@@ -1,14 +1,42 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+# setuptools 77 understands the SPDX `license` string below; older versions only
+# accept the deprecated `license = { text = ... }` table, which makes `pip
+# install` print a removal warning today and refuse the build in 2027.
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "phonebridge"
-version = "0.1.0"
+version = "1.0.0"
 description = "PhoneBridge: use an Android phone as an external hardware hub for a Windows PC"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+keywords = ["android", "bluetooth", "remote", "websocket", "audio", "windows"]
+authors = [{ name = "Manish Achar" }]
+
+# Beta, not Stable, on purpose: every automated test passes, but the Android app
+# has not been exercised on a physical handset by the maintainer's CI (there is
+# none). See docs/14-release-readiness.md for exactly what that means.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)", "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    # No "License :: OSI Approved :: MIT License" classifier: PEP 639 says the
+    # SPDX `license = "MIT"` string above supersedes it, and setuptools >= 77
+    # *refuses to build* when both are present. Verified by installing into a
+    # clean venv, which is the only way this shows up.
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: Utilities",
+    "Typing :: Typed",
+]
 
 # Phase 1 only needs the protocol + transport stack.  Audio, camera, GUI and
 # virtual-device dependencies are listed in requirements-phase2plus.txt so a
@@ -19,13 +47,40 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.5", "mypy>=1.11"]
 
 [project.scripts]
 phonebridge = "phonebridge.cli.main:main"
 
+[project.urls]
+Homepage = "https://github.com/ManishAcharS/phone-bridge"
+Documentation = "https://github.com/ManishAcharS/phone-bridge/blob/main/README.md"
+Protocol = "https://github.com/ManishAcharS/phone-bridge/blob/main/docs/03-protocol.md"
+Changelog = "https://github.com/ManishAcharS/phone-bridge/blob/main/docs/04-roadmap.md"
+Issues = "https://github.com/ManishAcharS/phone-bridge/issues"
+
 [tool.setuptools.packages.find]
 include = ["phonebridge*"]
+
+[tool.setuptools.package-data]
+# `py.typed` lets a downstream project type-check against this package.
+phonebridge = ["py.typed"]
+
+[tool.mypy]
+python_version = "3.10"
+# The package talks to JSON dictionaries all day (`dict[str, Any]`), so strict
+# mode would be noise rather than signal. What is checked is what breaks at
+# runtime: wrong argument counts, wrong types where they are annotated, missing
+# attributes, unreachable code, and forgetting to return.
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+no_implicit_optional = true
+strict_equality = true
+check_untyped_defs = true
+ignore_missing_imports = true
+files = ["phonebridge"]
+exclude = "(^|/)tests/"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

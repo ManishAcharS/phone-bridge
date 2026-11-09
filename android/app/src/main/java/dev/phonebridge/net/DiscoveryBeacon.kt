@@ -32,11 +32,28 @@ class DiscoveryBeacon(
     }
 
     private val running = AtomicBoolean(false)
+
+    /**
+     * Cancellation flag for the *current* worker.
+     *
+     * A shared [running] flag is not enough: `stop(); start()` used to flip it
+     * back to true before the old worker woke from its sleep, so the old thread
+     * never exited and the phone broadcast two beacons every interval (and leaked
+     * a thread per network change). Each run gets its own flag.
+     */
+    @Volatile
+    private var cancelled = AtomicBoolean(true)
+
+    @Volatile
     private var worker: Thread? = null
+
+    @Volatile
     private var socket: DatagramSocket? = null
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        val myCancel = AtomicBoolean(false)
+        cancelled = myCancel
         worker = thread(name = "phonebridge-beacon", isDaemon = true) {
             try {
                 val sock = DatagramSocket().apply { broadcast = true }
@@ -52,14 +69,18 @@ class DiscoveryBeacon(
                     )
                 ).toString().toByteArray(Charsets.UTF_8)
                 val target = InetAddress.getByName("255.255.255.255")
-                while (running.get()) {
+                while (!myCancel.get()) {
                     try {
                         sock.send(DatagramPacket(payload, payload.size, target, DISCOVERY_PORT))
                     } catch (e: Exception) {
+                        // Normal while the Wi-Fi interface is going away; the
+                        // beacon keeps running so it resumes when it returns.
                         Log.w(TAG, "beacon send failed: ${e.message}")
                     }
                     Thread.sleep(INTERVAL_MS)
                 }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
             } catch (e: Exception) {
                 Log.w(TAG, "beacon stopped: ${e.message}")
             } finally {
@@ -70,10 +91,24 @@ class DiscoveryBeacon(
     }
 
     fun stop() {
-        if (!running.compareAndSet(true, false)) return
+        running.set(false)
+        cancelled.set(true)
+        // Closing the socket unblocks a send() that is in flight; interrupt()
+        // unblocks the sleep between beacons.
         socket?.close()
         worker?.interrupt()
         worker = null
+    }
+
+    /**
+     * Rebind after the network changed (Wi-Fi rejoined, hotspot switched).
+     *
+     * The old datagram socket is bound to an interface that may no longer exist,
+     * and its broadcasts would silently go nowhere.
+     */
+    fun restart() {
+        stop()
+        start()
     }
 
     /** JSON the PC's discovery listener expects, exposed for tests/debugging. */

@@ -1,12 +1,9 @@
 package dev.phonebridge
 
-import android.Manifest
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.pm.PackageManager
-import android.os.Build
 import android.view.WindowManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -65,29 +62,44 @@ fun CapabilityProbeCard(modifier: Modifier = Modifier) {
     var acoustic by remember { mutableStateOf(true) }
     var report by remember { mutableStateOf<Map<String, Any?>?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
+    var permissionNote by remember { mutableStateOf<String?>(null) }
+    var pendingRun by remember { mutableStateOf(false) }
 
-    val micPermission = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { }
-    val bluetoothPermission = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { }
+    /**
+     * One launcher for the whole set.
+     *
+     * The old code launched two permission requests and then *immediately*
+     * started the probe, without waiting for either answer: with the microphone
+     * denied the probe ran anyway and reported capture failures the user could
+     * not explain. Now the probe only starts from the result callback.
+     */
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        result.keys.forEach { Permissions.markAsked(context, it) }
+        val missing = Permissions.missingProbePermissions(context)
+        permissionNote = if (missing.isEmpty()) {
+            null
+        } else {
+            missing.joinToString("\n") { permission ->
+                val item = Permissions.runtime.firstOrNull { it.permission == permission }
+                if (item == null) "$permission not granted"
+                else Permissions.explainDenial(item, Permissions.status(context, item))
+            }
+        }
+        if (pendingRun) {
+            pendingRun = false
+            // A denied microphone does not block the probe: it still measures
+            // routing and playback, and reports capture as skipped. Running it
+            // with the fact stated is more useful than refusing to run at all.
+            runProbe()
+        }
+    }
 
     // The probe records audio; a locked screen stops recording on Android 14+.
     KeepScreenOn(enabled = running)
 
-    fun startProbe() {
-        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            micPermission.launch(Manifest.permission.RECORD_AUDIO)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT)
-        }
+    fun runProbe() {
         running = true
         error = null
         scope.launch {
@@ -108,6 +120,18 @@ fun CapabilityProbeCard(modifier: Modifier = Modifier) {
             }
             running = false
         }
+    }
+
+    fun requestPermissionsThenRun() {
+        val missing = Permissions.missingProbePermissions(context)
+        if (missing.isEmpty()) {
+            permissionNote = null
+            runProbe()
+            return
+        }
+        pendingRun = true
+        missing.forEach { Permissions.markAsked(context, it) }
+        permissionLauncher.launch(missing.toTypedArray())
     }
 
     Card(modifier = modifier.fillMaxWidth()) {
@@ -132,7 +156,7 @@ fun CapabilityProbeCard(modifier: Modifier = Modifier) {
             }
             Spacer(Modifier.padding(top = 8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { startProbe() }, enabled = !running) {
+                Button(onClick = { requestPermissionsThenRun() }, enabled = !running) {
                     Text(if (running) "Probing…" else "Run probe (30 s)")
                 }
                 OutlinedButton(
@@ -145,6 +169,21 @@ fun CapabilityProbeCard(modifier: Modifier = Modifier) {
                     },
                     enabled = report != null && !running,
                 ) { Text("Copy JSON") }
+            }
+            permissionNote?.let { note ->
+                Spacer(Modifier.padding(top = 8.dp))
+                Text(
+                    note,
+                    color = MaterialTheme.colorScheme.error,
+                    fontSize = 12.sp,
+                )
+                Text(
+                    "The probe still runs; sections that need the missing " +
+                        "permission are reported as skipped, never as passing.",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
             }
             if (error != null) {
                 Spacer(Modifier.padding(top = 8.dp))

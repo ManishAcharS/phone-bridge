@@ -29,6 +29,7 @@ from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve
 
+from phonebridge.core.sanitize import device_label
 from phonebridge.protocol.crypto import (
     HandshakeError,
     HandshakeResponder,
@@ -49,6 +50,7 @@ from phonebridge.protocol.messages import (
     MSG_PONG,
     STREAM_CONTROL,
     ProtocolError,
+    RpcError,
     RpcRouter,
     control_event,
     decode_control,
@@ -59,16 +61,66 @@ from phonebridge.protocol.messages import (
 
 log = logging.getLogger("phonebridge.sim")
 
-CAPABILITIES = {
+# The protocol-v1 capability contract, as net/DeviceFacts.kt reports it: for each
+# feature there is a measured `hardware.<key>`, a `usable today` `<key>`, and a
+# `detail.<key>` explaining any gap.  A simulator has no hardware, so the values
+# below are declared synthetic (see `simulated` and the CLI's warning).
+#
+# `audio.bluetooth_sco` stays True on purpose: the simulator is the fixture that
+# exercises the "a capability can be usable" path end to end, and
+# windows/tests/test_integration.py pins that.  A real handset reports False
+# until the Phase 2 relay exists - the CLI prints `simulated` prominently so the
+# two are never confused.
+CAPABILITY_KEYS = (
+    "audio.playback",
+    "audio.capture",
+    "audio.bluetooth_sco",
+    "camera.back",
+    "camera.front",
+    "sensors",
+    "file_transfer",
+    "bluetooth_scan",
+)
+
+_HARDWARE = {
     "audio.playback": True,
     "audio.capture": True,
-    "audio.bluetooth_sco": True,  # the real phone decides this at runtime
+    "audio.bluetooth_sco": True,
     "camera.back": True,
     "camera.front": True,
     "sensors": True,
     "file_transfer": True,
     "bluetooth_scan": True,
-    "simulated": True,
+}
+
+_DETAIL = {
+    "audio.playback": "simulated: no audio device behind this value",
+    "audio.capture": "simulated: no microphone behind this value",
+    "audio.bluetooth_sco": "simulated: no Bluetooth radio",
+    "camera.back": "simulated: no camera",
+    "camera.front": "simulated: no camera",
+    "sensors": "simulated: no sensors",
+    "file_transfer": "no file method in protocol v1 (Phase 5)",
+    "bluetooth_scan": "no scan method in protocol v1 (Phase 5)",
+}
+
+# Which runtime permission gates each capability, mirroring DeviceFacts.kt.
+# A capability is usable only when it is implemented, the hardware is present
+# and the permission is granted - the same three-way rule the phone applies.
+_PERMISSION_FOR: dict[str, str] = {
+    "audio.capture": "RECORD_AUDIO",
+}
+
+# Implemented today: only the protocol-level pieces. Everything else is a
+# declared hardware row with `usable = false`, exactly like the real app. A test
+# may override this to model a phone that implements one more feature.
+_IMPLEMENTED: frozenset[str] = frozenset({"audio.bluetooth_sco"})
+
+# The runtime permission snapshot the app would report (docs/03 §6).
+DEFAULT_PERMISSIONS: dict[str, str] = {
+    "RECORD_AUDIO": "denied",
+    "POST_NOTIFICATIONS": "granted",
+    "BLUETOOTH_CONNECT": "not_applicable",
 }
 
 
@@ -85,7 +137,7 @@ class SimulatedPhone:
     identity: Identity
     state_file: Path | None = None
     name: str = "Pixel-sim"
-    pair_policy: str = "auto"  # auto | prompt | deny
+    pair_policy: str = "auto"  # auto | prompt | deny | wait (never decides)
     # Reported by the simulated capability probe so the multi-device report can
     # be exercised end to end without hardware. Everything here is labelled
     # source="simulator" and never counts as evidence about a real handset.
@@ -95,15 +147,46 @@ class SimulatedPhone:
     sdk_int: int = 34
     android_release: str = "14"
     headset_connected: bool = True
+    permissions: dict[str, str] = field(
+        default_factory=lambda: dict(DEFAULT_PERMISSIONS)
+    )
+    #: Capabilities this simulated phone claims to implement. The default is
+    #: "only what protocol v1 can actually do"; tests override it to model a
+    #: phone further along the roadmap.
+    implemented: frozenset[str] = _IMPLEMENTED
     probe_profile: str = "duplex"  # duplex | output_only | no_headset | fail
     host: str = "127.0.0.1"
     port: int = 8765
     beacon: bool = False
     advertise_host: str | None = None
 
+    # Reliability limits, mirroring BridgeServer.kt. They exist so the phone
+    # cannot be turned into an unbounded resource by whoever can reach the port.
+    setup_timeout_s: float = 20.0
+    max_sessions: int = 8
+    max_sessions_per_device: int = 4
+
+    # Security limits, mirroring BridgeServer.kt.
+    #: A pairing request must be answered by a human within this window, or it
+    #: expires. Without it a prompt nobody answered stayed valid forever, so a
+    #: stale screen (or a forgotten prompt) could still pair a device.
+    pairing_window_s: float = 90.0
+    #: How many un-answered pairing requests may exist at once. Each one holds a
+    #: session, and an attacker on the LAN can produce them faster than a human
+    #: can read them.
+    max_pending_pairings: int = 4
+    #: Reject handshakes that carry a browser ``Origin`` header. Native clients
+    #: send none; a browser always does, which is what stops a web page from
+    #: driving the bridge (WebSocket is exempt from CORS).
+    reject_browser_origins: bool = True
+    _pending_pairings: set[str] = field(default_factory=set)
+    _probe_in_flight: bool = False
+    rejected_origins: int = 0
+
     paired: dict[str, str] = field(default_factory=dict)  # peer_id -> static key b64
     router: RpcRouter = field(default_factory=RpcRouter)
     connections: list[tuple[ServerConnection, SecureCodec]] = field(default_factory=list)
+    _peer_by_connection: dict[ServerConnection, str] = field(default_factory=dict)
     _server: Any = None
     _beacon_task: asyncio.Task[None] | None = None
     pairing_requests: int = 0
@@ -111,6 +194,8 @@ class SimulatedPhone:
     last_capability_report: dict[str, Any] | None = None
     frames_in: int = 0
     bytes_in: int = 0
+    frames_out: int = 0
+    bytes_out: int = 0
     blobs_echoed: int = 0
     started_at: float = field(default_factory=time.time)
 
@@ -146,15 +231,40 @@ class SimulatedPhone:
 
         @r.register("system.info")
         def _system_info(_params: dict[str, Any]) -> dict[str, Any]:
+            # Field for field the same shape as DeviceFacts.deviceInfo() on the
+            # phone, so the CLI renders simulator and handset identically.
             return {
                 "device_id": self.identity.device_id,
                 "name": self.name,
-                "model": "PhoneBridge Simulator",
-                "android_version": "simulated",
+                "model": self.model,
+                "manufacturer": self.manufacturer,
+                "brand": self.manufacturer,
+                "hardware": self.codename,
+                "device": self.codename,
+                "product": self.codename,
+                "android_release": self.android_release,
+                "android_version": self.android_release,
+                "sdk_int": self.sdk_int,
+                "target_sdk": 34,
+                "app_version": "simulator",
+                "app_version_code": 0,
+                "package": "dev.phonebridge.simulator",
+                "rom": "none (simulator)",
+                "rom_version": "-",
+                "is_emulator": True,
                 "protocol_version": 1,
-                "capabilities": CAPABILITIES,
+                "permissions": dict(self.permissions),
+                "capabilities": self.capabilities(),
                 "uptime_s": round(time.time() - self.started_at, 1),
                 "platform": platform.platform(),
+            }
+
+        @r.register("audio.route.bluetooth")
+        def _audio_route(_params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "supported": self.headset_connected,
+                "detail": "Phase 2: SCO routing is exercised by the audio relay, "
+                          "not by this probe",
             }
 
         @r.register("system.echo")
@@ -163,9 +273,14 @@ class SimulatedPhone:
 
         @r.register("session.stats")
         def _stats(_params: dict[str, Any]) -> dict[str, Any]:
+            # Required keys first, in the order docs/03 lists them; the extra
+            # simulator-only counters follow and may be ignored by a client.
             return {
                 "frames_in": self.frames_in,
+                "frames_out": self.frames_out,
                 "bytes_in": self.bytes_in,
+                "bytes_out": self.bytes_out,
+                "connections": len(self.connections),
                 "blobs_echoed": self.blobs_echoed,
                 "handshakes": self.handshakes,
                 "paired_peers": len(self.paired),
@@ -173,16 +288,42 @@ class SimulatedPhone:
 
         @r.register("bluetooth.headset.status")
         def _bt_status(_params: dict[str, Any]) -> dict[str, Any]:
+            # Same three required keys as AudioProbe on the phone: connected,
+            # profile, devices (list of maps). `supported`/`detail` are extras.
+            devices = [] if not self.headset_connected else [
+                {
+                    "id": 1,
+                    "type": "TYPE_BLUETOOTH_SCO",
+                    "type_id": 7,
+                    "product": "simulated headset",
+                    "is_sink": True,
+                    "is_source": True,
+                    "sample_rates": [8000, 16000],
+                }
+            ]
             return {
+                "connected": bool(self.headset_connected),
+                "profile": "TYPE_BLUETOOTH_SCO" if self.headset_connected else "none",
+                "devices": devices,
                 "supported": True,
-                "connected": False,
                 "detail": "simulator has no real Bluetooth radio",
                 "note": "on hardware this reports A2DP/HFP state from AudioManager",
             }
 
         @r.register("audio.capabilities.run")
         def _capabilities_run(params: dict[str, Any]) -> dict[str, Any]:
-            return self._simulated_capability_report(params)
+            # One probe at a time: a probe can hold the microphone for minutes,
+            # and queueing them without a limit turns a paired PC (or a looping
+            # script) into an endless recording. The phone answers `busy`.
+            if self._probe_in_flight:
+                raise RpcError(
+                    "busy", "a capability probe is already running on this phone"
+                )
+            self._probe_in_flight = True
+            try:
+                return self._simulated_capability_report(params)
+            finally:
+                self._probe_in_flight = False
 
         @r.register("audio.capabilities.last")
         def _capabilities_last(_params: dict[str, Any]) -> dict[str, Any]:
@@ -354,9 +495,39 @@ class SimulatedPhone:
     # ------------------------------------------------------------------ #
     # per-connection handling
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _origin_of(ws: ServerConnection) -> str | None:
+        """The browser ``Origin`` header of a handshake, if the client sent one.
+
+        Only browsers send it, and browsers are exactly the clients that must
+        not be able to drive the bridge: a WebSocket handshake bypasses the
+        same-origin policy (no preflight, no CORS check), so any page the user
+        happens to visit can open ``ws://192.168.x.x:8765``. Rejecting the
+        header is the whole mitigation, and it costs native clients nothing.
+        """
+        request = getattr(ws, "request", None)
+        headers = getattr(request, "headers", None)
+        if headers is None:
+            return None
+        try:
+            value = headers.get("Origin")
+        except Exception:  # noqa: BLE001 - headers are optional
+            return None
+        return value or None
+
     async def _handle_connection(self, ws: ServerConnection) -> None:
         peer = getattr(ws, "remote_address", ("?", 0))
         log.info("connection from %s", peer)
+        origin = self._origin_of(ws)
+        if self.reject_browser_origins and origin:
+            self.rejected_origins += 1
+            log.warning(
+                "refusing connection from %s: browser Origin %r (only native clients may connect)",
+                peer[0] if isinstance(peer, tuple) else peer,
+                device_label(origin, limit=80),
+            )
+            await ws.close(code=1008, reason="browser origins are not accepted")
+            return
         try:
             await self._serve_connection(ws)
         except Exception as exc:  # noqa: BLE001
@@ -364,9 +535,33 @@ class SimulatedPhone:
         finally:
             log.info("connection from %s closed", peer)
 
+    async def _recv_setup(self, ws: ServerConnection):
+        """Read one setup frame, refusing peers that stall the handshake.
+
+        Without this, a half-open socket holds a session slot forever: the OS
+        will not necessarily reap it, and every such peer is free to keep
+        opening more.
+        """
+        try:
+            raw = await asyncio.wait_for(ws.recv(), self.setup_timeout_s)
+        except asyncio.TimeoutError:
+            log.warning("setup timeout after %.1fs; closing", self.setup_timeout_s)
+            await ws.close(code=1002, reason="setup timeout")
+            raise
+        return decode_envelope(raw)
+
+    def _session_refusal(self, peer_id: str) -> str | None:
+        """Why this peer may not have another session, or None if it may."""
+        per_peer = sum(1 for p in self._peer_by_connection.values() if p == peer_id)
+        if per_peer >= self.max_sessions_per_device:
+            return "too many connections from this device"
+        if len(self.connections) >= self.max_sessions:
+            return "server connection limit reached"
+        return None
+
     async def _serve_connection(self, ws: ServerConnection) -> None:
         responder = HandshakeResponder(self.identity)
-        env = decode_envelope(await ws.recv())
+        env = await self._recv_setup(ws)
         if env.kind != KIND_HANDSHAKE:
             await ws.close(code=1002, reason="expected handshake")
             return
@@ -384,19 +579,42 @@ class SimulatedPhone:
         assert responder.keys is not None
         codec = SecureCodec.for_server(responder.keys)
         self.handshakes += 1
+        peer_id = str(hello.get("id", ""))
+        # The name is attacker-chosen text that lands in a log: strip controls
+        # and escapes, and never write the pairing code.
         log.info(
-            "handshake with %s (%s), known=%s, SAS=%s",
-            hello.get("name"), hello.get("id"), known, responder.keys.sas_digits,
+            "handshake with %s (%s), known=%s",
+            device_label(hello.get("name"), limit=64, fallback="pc"),
+            device_label(peer_id, limit=32, fallback="?"),
+            known,
         )
+        # Capacity is checked before auth_ok: a peer that is about to be refused
+        # must not first be told the session is up, then dropped (the PC would
+        # report a successful connection and an immediate unexplained close).
+        refusal = self._session_refusal(peer_id)
+        if refusal is not None:
+            log.warning("refusing session from %s: %s", peer_id, refusal)
+            await ws.close(code=1008, reason=refusal)
+            return
 
         if not await self._authenticate(ws, codec, responder, hello, known):
             return
 
+        # Re-check: two peers can pass the first check while both are still
+        # in the setup phase (auth takes a round trip).
+        refusal = self._session_refusal(peer_id)
+        if refusal is not None:
+            log.warning("refusing session from %s: %s", peer_id, refusal)
+            await ws.close(code=1008, reason=refusal)
+            return
+
         self.connections.append((ws, codec))
+        self._peer_by_connection[ws] = peer_id
         try:
             await self._serve_session(ws, codec)
         finally:
             self.connections = [c for c in self.connections if c[1] is not codec]
+            self._peer_by_connection.pop(ws, None)
 
     async def _authenticate(
         self,
@@ -412,11 +630,14 @@ class SimulatedPhone:
         and ephemeral private keys that produced the session keys, so there is
         no separate signature step: identity == pinned key + ability to decrypt.
         """
-        env = decode_envelope(await ws.recv())
+        env = await self._recv_setup(ws)
         try:
             msg_type, _stream, payload = codec.unseal(env)
         except HandshakeError as exc:
             log.warning("auth frame failed to decrypt: %s", exc)
+            # Close with a reason: returning from the handler closes the socket
+            # without a close frame, which the PC can only report as a drop.
+            await ws.close(code=1008, reason="auth frame could not be decrypted")
             return False
         if msg_type != MSG_CONTROL:
             await ws.close(code=1002, reason="expected auth")
@@ -427,6 +648,7 @@ class SimulatedPhone:
             return False
         if msg.get("proto") != 1:
             await _send(ws, codec, handshake_msg("auth_fail", reason="protocol version"))
+            await ws.close(code=1002, reason="protocol version")
             return False
 
         peer_id = str(msg.get("id", ""))
@@ -437,9 +659,11 @@ class SimulatedPhone:
             # The device id is a hash of the identity key, so a mismatch means a
             # broken or hostile peer.
             await _send(ws, codec, handshake_msg("auth_fail", reason="identity mismatch"))
+            await ws.close(code=1008, reason="identity mismatch")
             return False
         if peer_id in self.paired and self.paired[peer_id] != peer_static_b64:
             await _send(ws, codec, handshake_msg("auth_fail", reason="identity key changed"))
+            await ws.close(code=1008, reason="identity key changed")
             return False
 
         if peer_id in self.paired:
@@ -450,19 +674,32 @@ class SimulatedPhone:
                     "auth_ok",
                     id=self.identity.device_id,
                     name=self.name,
-                    capabilities=CAPABILITIES,
+                    capabilities=self.capabilities(),
                 ),
             )
             return True
 
         # ---- first-time pairing ------------------------------------------ #
+        if len(self._pending_pairings) >= self.max_pending_pairings:
+            log.warning(
+                "refusing pairing request from %r: %d already pending",
+                peer_name,
+                len(self._pending_pairings),
+            )
+            await _send(
+                ws,
+                codec,
+                handshake_msg("pair_fail", reason="too many pending pairing requests"),
+            )
+            await ws.close(code=1008, reason="too many pending pairing requests")
+            return False
         self.pairing_requests += 1
         sas = responder.keys.sas_digits  # type: ignore[union-attr]
+        # The digits belong on the phone's screen, not in a log line.
         log.warning(
-            "PAIRING REQUEST from %r. On the phone the user sees SAS %s; the PC "
-            "must show the identical code.",
+            "PAIRING REQUEST from %r: the phone must display the six-digit code "
+            "(withheld from logs) for the user to compare.",
             peer_name,
-            sas,
         )
         await _send(
             ws,
@@ -472,12 +709,16 @@ class SimulatedPhone:
                 id=self.identity.device_id,
                 name=self.name,
                 sas=sas,
-                capabilities=CAPABILITIES,
+                capabilities=self.capabilities(),
             ),
         )
-        decision = await self._await_pair_confirmation(ws, codec, sas, peer_name)
-        if not decision:
-            await _send(ws, codec, handshake_msg("pair_fail", reason="declined"))
+        self._pending_pairings.add(peer_id)
+        try:
+            reason = await self._await_pair_confirmation(ws, codec, sas, peer_name)
+        finally:
+            self._pending_pairings.discard(peer_id)
+        if reason:
+            await _send(ws, codec, handshake_msg("pair_fail", reason=reason))
             return False
         self.paired[peer_id] = peer_static_b64
         self._save_state()
@@ -493,38 +734,56 @@ class SimulatedPhone:
         codec: SecureCodec,
         sas: str,
         peer_name: str,
-    ) -> bool:
+    ) -> str:
         """Wait for the PC's confirmation, then apply the phone-side policy.
 
-        The confirmation is always read first, even when the policy is 'deny':
-        that keeps the exchange symmetric and avoids closing the link on a PC
-        that is still writing.
+        Returns ``""`` when pairing may proceed, or a human-readable reason why
+        it may not.  The confirmation is always read first, even when the policy
+        is 'deny': that keeps the exchange symmetric and avoids closing the link
+        on a PC that is still writing.
+
+        Policies: ``auto`` (test/automation: accept), ``deny``, ``prompt`` (asks
+        on stdin) and ``wait`` (never decides, so the expiry path can be tested
+        without a keyboard -- the request must expire, not hang forever).
         """
         try:
-            env = decode_envelope(await asyncio.wait_for(ws.recv(), 90))
+            env = decode_envelope(await asyncio.wait_for(ws.recv(), self.pairing_window_s))
             msg_type, _stream, payload = codec.unseal(env)
-        except (asyncio.TimeoutError, HandshakeError):
-            return False
+        except asyncio.TimeoutError:
+            log.warning(
+                "pairing request from %r expired after %.0fs with no answer",
+                peer_name,
+                self.pairing_window_s,
+            )
+            return "pairing window expired"
+        except HandshakeError:
+            return "confirmation could not be decrypted"
         if msg_type != MSG_CONTROL:
-            return False
+            return "expected a pairing confirmation"
         msg = decode_control(payload)
         if msg.get("k") == "pair_cancel":
             log.info("PC cancelled pairing")
-            return False
+            return "cancelled by the PC"
         if msg.get("k") != "pair_confirm":
-            return False
+            return "expected a pairing confirmation"
         if msg.get("sas") != sas:
             log.warning("PC confirmed a different SAS (%r vs %r)", msg.get("sas"), sas)
-            return False
+            return "SAS mismatch"
         if self.pair_policy == "auto":
-            return True
+            return ""
         if self.pair_policy == "deny":
-            return False
+            return "declined on the phone"
+        if self.pair_policy == "wait":
+            # Nobody answers: hold the request for the whole window, then let it
+            # expire. This is how the PC sees what a forgotten prompt looks like.
+            await asyncio.sleep(self.pairing_window_s)
+            log.warning("pairing request from %r expired unanswered", peer_name)
+            return "pairing window expired"
         answer = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: input(f"Allow pairing from {peer_name} (SAS {sas} matches PC)? [y/N] "),
+            lambda: input(f"Allow pairing from {peer_name} -- codes match? [y/N] "),
         )
-        return answer.strip().lower() in {"y", "yes"}
+        return "" if answer.strip().lower() in {"y", "yes"} else "declined on the phone"
 
     async def _serve_session(self, ws: ServerConnection, codec: SecureCodec) -> None:
         while True:
@@ -539,12 +798,12 @@ class SimulatedPhone:
             if msg_type == MSG_CONTROL:
                 await self._handle_control(ws, codec, payload)
             elif msg_type == MSG_PING:
-                await ws.send(_seal(codec, pong_payload(parse_ping(payload)), MSG_PONG))
+                await self._send_frame(ws, _seal(codec, pong_payload(parse_ping(payload)), MSG_PONG))
             elif msg_type == MSG_BLOB:
                 self.blobs_echoed += 1
                 # Echo the blob back on the same stream: a clean, boring way to
                 # prove binary round-trips without involving real hardware.
-                await ws.send(_seal(codec, payload, MSG_BLOB, stream_id))
+                await self._send_frame(ws, _seal(codec, payload, MSG_BLOB, stream_id))
 
     async def _handle_control(
         self, ws: ServerConnection, codec: SecureCodec, payload: bytes
@@ -555,12 +814,42 @@ class SimulatedPhone:
             return
         kind = msg.get("k")
         if kind == "req":
+            # dispatch() returns the control payload; it still has to be sealed
+            # into a SECURE envelope before it goes on the wire.
             reply = self.router.dispatch(msg)
-            await _send(ws, codec, reply)
+            await self._send_frame(ws, _seal(codec, reply))
         elif kind == "evt":
             log.debug("event from PC: %s", msg.get("event"))
         elif kind == "res":
             log.debug("unexpected response from PC: %s", msg.get("id"))
+
+    async def _send_frame(self, ws: ServerConnection, data: bytes) -> None:
+        """Send one envelope, keeping the outbound counters honest."""
+        await ws.send(data)
+        self.frames_out += 1
+        self.bytes_out += len(data)
+
+    def capabilities(self) -> dict[str, Any]:
+        """The capability map, derived the way the phone derives it.
+
+        Implemented AND hardware present AND permission granted - so flipping a
+        permission in `self.permissions` changes what `system.info` reports, and
+        the PC-side contract can be tested without pretending.
+        """
+        out: dict[str, Any] = {"simulated": True}
+        for key in CAPABILITY_KEYS:
+            permission = _PERMISSION_FOR.get(key)
+            granted = True if permission is None else self.permissions.get(permission) == "granted"
+            usable = bool(_HARDWARE[key] and key in self.implemented and granted)
+            out[key] = usable
+            out[f"hardware.{key}"] = _HARDWARE[key]
+            if usable:
+                out[f"detail.{key}"] = _DETAIL[key]
+            elif not granted and permission is not None:
+                out[f"detail.{key}"] = f"permission {permission} is {self.permissions.get(permission)}"
+            else:
+                out[f"detail.{key}"] = _DETAIL[key]
+        return out
 
     # ------------------------------------------------------------------ #
     # test/automation helpers
@@ -630,6 +919,9 @@ async def main_async(args: argparse.Namespace) -> None:
         android_release=args.android_release,
         headset_connected=args.headset == "yes",
         probe_profile=args.probe_profile,
+        setup_timeout_s=args.setup_timeout,
+        max_sessions=args.max_sessions,
+        max_sessions_per_device=args.max_sessions_per_device,
     )
     await phone.start()
     print(f"Simulated phone '{args.name}' id={ident.device_id} on ws://{args.host}:{phone.port}")
@@ -648,7 +940,13 @@ def main() -> None:
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--name", default="Pixel-sim")
     p.add_argument("--state-dir", default=".phone-sim")
-    p.add_argument("--pair-policy", choices=["auto", "prompt", "deny"], default="prompt")
+    p.add_argument(
+        "--pair-policy",
+        choices=["auto", "prompt", "deny", "wait"],
+        default="prompt",
+        help="auto accepts, prompt asks on stdin, deny refuses, wait never decides "
+        "(the request expires, which is how a forgotten prompt behaves)",
+    )
     p.add_argument("--beacon", action="store_true", help="broadcast a discovery beacon")
     p.add_argument("--model", default="PhoneBridge Simulator",
                    help="model name reported by the simulated capability probe")
@@ -659,6 +957,12 @@ def main() -> None:
     p.add_argument("--android-release", default="14")
     p.add_argument("--headset", choices=["yes", "no"], default="yes",
                    help="whether a headset is attached in the simulated probe")
+    p.add_argument("--setup-timeout", type=float, default=20.0,
+                   help="seconds a peer gets to finish the handshake (default 20)")
+    p.add_argument("--max-sessions", type=int, default=8,
+                   help="total concurrent sessions the phone will accept")
+    p.add_argument("--max-sessions-per-device", type=int, default=4,
+                   help="concurrent sessions allowed from one PC device id")
     p.add_argument("--probe-profile", default="duplex",
                    choices=["duplex", "output_only", "no_headset", "fail"],
                    help="simulated outcome of the capability probe")

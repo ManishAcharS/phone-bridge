@@ -49,12 +49,18 @@ class WebSocketLink:
         ping_interval: float = 10.0,
         ping_timeout: float = 8.0,
         max_queue: int = 64,
+        close_timeout: float = 1.0,
     ) -> None:
         self.uri = uri
         self.connect_timeout = connect_timeout
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.max_queue = max_queue
+        #: How long ``close()`` waits for the peer's close frame. The library
+        #: default is 10 s, which a hostile peer can hold open after every
+        #: handshake it provokes -- refusing a connection must not cost more
+        #: than making it.
+        self.close_timeout = close_timeout
         self._ws: Any = None
 
     async def open(self) -> None:
@@ -69,6 +75,7 @@ class WebSocketLink:
                     ping_interval=self.ping_interval,
                     ping_timeout=self.ping_timeout,
                     open_timeout=self.connect_timeout,
+                    close_timeout=self.close_timeout,
                     compression=None,  # audio/video is already compressed
                 ),
                 timeout=self.connect_timeout + 1.0,
@@ -108,6 +115,19 @@ class WebSocketLink:
             except Exception:  # noqa: BLE001 - best effort teardown
                 pass
             self._ws = None
+
+    @property
+    def close_info(self) -> tuple[int | None, str]:
+        """The peer's close ``(code, reason)``, or ``(None, "")`` if it never closed.
+
+        The phone refuses sessions by closing with 1008 and a human-readable
+        reason ("too many connections from this device"). ``str(ConnectionClosed)``
+        contains that text, but the caller needs it as data to show the user.
+        """
+        ws = self._ws
+        if ws is None:
+            return None, ""
+        return ws.close_code, (ws.close_reason or "")
 
     @property
     def is_open(self) -> bool:

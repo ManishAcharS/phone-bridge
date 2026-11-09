@@ -27,8 +27,16 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from ..core.sanitize import device_label
+from ..protocol.crypto import DEVICE_ID_RE
+
 DISCOVERY_PORT = 47823
 BEACON_MAGIC = "phonebridge"
+
+#: Real beacons are ~120 bytes.  A datagram larger than this is not a phone, and
+#: parsing it only feeds attacker-chosen strings into memory and into the UI.
+MAX_BEACON_BYTES = 512
+MAX_METHOD_LEN = 16
 
 HELP = (
     "If nothing is found: confirm the PC and phone are on the same network, "
@@ -69,6 +77,11 @@ class _BeaconProtocol(asyncio.DatagramProtocol):
         self.on_new = on_new
 
     def datagram_received(self, data: bytes, addr) -> None:  # noqa: ANN001
+        # Anyone on the LAN can send this datagram, so every field is untrusted
+        # input: bound its size, validate the id against the same format the
+        # protocol uses, and make the display name safe before it reaches the UI.
+        if len(data) > MAX_BEACON_BYTES:
+            return
         try:
             msg = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -77,17 +90,19 @@ class _BeaconProtocol(asyncio.DatagramProtocol):
             return
         if msg.get("v") != 1:
             return
-        device_id = str(msg.get("id", "")).strip()
+        device_id = msg.get("id")
         port = msg.get("port")
-        if not device_id or not isinstance(port, int) or not 0 < port < 65536:
+        if not isinstance(device_id, str) or not DEVICE_ID_RE.match(device_id):
+            return
+        if not isinstance(port, int) or isinstance(port, bool) or not 0 < port < 65536:
             return
         host = addr[0]
         phone = DiscoveredPhone(
             device_id=device_id,
-            name=str(msg.get("name", "android-phone")),
+            name=device_label(msg.get("name"), fallback="android-phone"),
             host=host,
             port=port,
-            method=str(msg.get("method", "wifi")),
+            method=device_label(msg.get("method"), limit=MAX_METHOD_LEN, fallback="wifi"),
         )
         is_new = device_id not in self.table
         self.table[device_id] = phone
@@ -129,7 +144,7 @@ class DiscoveryService:
         transport, _ = await loop.create_datagram_endpoint(
             lambda: _BeaconProtocol(self.phones, _on_new), sock=sock
         )
-        self._transport = transport  # type: ignore[assignment]
+        self._transport = transport
 
     async def stop(self) -> None:
         if self._transport is not None:

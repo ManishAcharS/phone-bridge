@@ -25,6 +25,26 @@ from pathlib import Path
 from typing import Any
 
 from ..protocol.crypto import Identity, b64d, b64e
+from .sanitize import device_label
+
+
+class StoreCorruptError(Exception):
+    """A local state file exists but cannot be trusted.
+
+    Raised instead of "the file did not parse, pretend it was empty".  For
+    ``peers.json`` that difference is a security control: silently treating an
+    unreadable pin list as "no phones are pinned" would drop every pin, and the
+    next connection would fall back to trust-on-first-use pairing for a phone
+    that had already been verified.  Failing closed makes the user fix the file.
+    """
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(
+            f"{path} is unreadable or corrupt ({reason}). PhoneBridge refuses to "
+            f"guess at your pinned devices: fix or delete that file and try again."
+        )
+        self.path = path
+        self.reason = reason
 
 
 def default_config_dir() -> Path:
@@ -52,12 +72,21 @@ def _write_private(path: Path, data: bytes) -> None:
         pass
 
 
-def _read_json(path: Path, default: Any) -> Any:
+def _read_json(path: Path, default: Any, *, strict: bool = False) -> Any:
+    """Read a state file.
+
+    A *missing* file is normal (first run) and returns ``default``.  A file that
+    exists but cannot be read or parsed is only tolerated when ``strict`` is
+    False; security-relevant state (the pin list) passes ``strict=True`` so the
+    caller fails closed instead of silently forgetting its pins.
+    """
     if not path.exists():
         return default
     try:
         return json.loads(path.read_text("utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        if strict:
+            raise StoreCorruptError(path, f"{type(exc).__name__}: {exc}") from exc
         return default
 
 
@@ -98,7 +127,14 @@ class Peer:
 class DeviceStore:
     def __init__(self, config_dir: Path | None = None) -> None:
         self.dir = config_dir or default_config_dir()
-        self.dir.mkdir(parents=True, exist_ok=True)
+        # 0700: the directory holds a private identity key. The umask alone
+        # usually gives 0755, which leaks the *presence* of the key and lets any
+        # local user read peers.json (which pins which phones this PC trusts).
+        self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:  # belt and braces; Windows ignores POSIX modes
+            os.chmod(self.dir, 0o700)
+        except OSError:
+            pass
 
     # -- identity ----------------------------------------------------------- #
     @property
@@ -137,19 +173,37 @@ class DeviceStore:
         return self.dir / "peers.json"
 
     def list_peers(self) -> list[Peer]:
-        raw = _read_json(self._peers_file(), {"peers": []})
-        return [Peer.from_json(p) for p in raw.get("peers", [])]
+        path = self._peers_file()
+        raw = _read_json(path, {"peers": []}, strict=True)
+        if not isinstance(raw, dict) or not isinstance(raw.get("peers", []), list):
+            raise StoreCorruptError(path, "expected an object with a 'peers' list")
+        peers: list[Peer] = []
+        for entry in raw.get("peers", []):
+            if not isinstance(entry, dict):
+                raise StoreCorruptError(path, f"peer entry is not an object: {entry!r}")
+            try:
+                peer = Peer.from_json(entry)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StoreCorruptError(path, f"unusable peer entry: {exc}") from exc
+            peers.append(peer)
+        return peers
 
     def find_peer(self, peer_id: str) -> Peer | None:
         return next((p for p in self.list_peers() if p.peer_id == peer_id), None)
 
     def pin_peer(self, peer_id: str, peer_name: str, static_key: bytes) -> Peer:
+        if len(static_key) != 65:
+            # A truncated key would pin nothing and every later handshake would
+            # fail with a confusing "key changed"; refuse it at the source.
+            raise ValueError("a pinned identity key must be a 65-byte P-256 point")
         peers = {p.peer_id: p for p in self.list_peers()}
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         existing = peers.get(peer_id)
         peer = Peer(
             peer_id=peer_id,
-            peer_name=peer_name,
+            # The name comes from the peer: strip escapes/controls before it is
+            # written to disk and shown by every later `phonebridge peers`.
+            peer_name=device_label(peer_name, fallback="phone"),
             static_key=static_key,
             added_at=existing.added_at if existing else now,
             last_seen=now,
@@ -171,16 +225,41 @@ class DeviceStore:
     def _known_hosts_file(self) -> Path:
         return self.dir / "known_hosts.json"
 
-    def remember_endpoint(self, transport: str, host: str, port: int) -> None:
+    def remember_endpoint(
+        self,
+        transport: str,
+        host: str,
+        port: int,
+        peer_id: str | None = None,
+    ) -> None:
+        """Cache where a phone was last reachable.
+
+        ``peer_id`` ties the address to a pinned identity so ``--device <name>``
+        can find it again. Older records have no ``device_id`` key; they are
+        still listed by ``known_endpoints`` and remain usable via ``--last``.
+        """
         data = _read_json(self._known_hosts_file(), [])
         entry = {"transport": transport, "host": host, "port": port,
                  "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        if peer_id:
+            entry["device_id"] = peer_id
         data = [e for e in data if not (e.get("transport") == transport and e.get("host") == host)]
         data.insert(0, entry)
         _write_json(self._known_hosts_file(), data[:12])
 
     def known_endpoints(self) -> list[dict[str, Any]]:
         return _read_json(self._known_hosts_file(), [])
+
+    def endpoint_for(self, peer_id: str) -> dict[str, Any] | None:
+        """Most recent saved address for one pinned phone, if any."""
+        for entry in self.known_endpoints():
+            if entry.get("device_id") == peer_id:
+                return entry
+        return None
+
+    def last_endpoint(self) -> dict[str, Any] | None:
+        found = self.known_endpoints()
+        return found[0] if found else None
 
     def path_summary(self) -> str:
         return str(self.dir)

@@ -3,6 +3,20 @@
 Legend: `[x]` implemented and tested · `[~]` partially implemented ·
 `[ ]` not started · `[!]` blocked/limited by the platform (explained)
 
+## Release 1.0.0 — code-complete, two gates open
+
+| | |
+| --- | --- |
+| Version | `1.0.0` (PC package and Android app) |
+| Gate status | 476 tests, ruff, mypy, `verify.py` 7/7 — all green |
+| Open blockers | **B1** no physical-device run · **B2** release APK not built here (plus B3–B6: Play `targetSdk`, keystore, Windows/PowerShell run, Kotlin stub compile) |
+| Ship/no-ship | **Not shippable until B1 and B2 are cleared.** See [`14-release-readiness.md`](14-release-readiness.md). |
+
+Scope delivered in 1.0.0: Phase 0 (feasibility, architecture, protocol), Phase 1
+(encrypted PC ↔ phone channel, CLI, Android app), the end-to-end verification
+pass ([`12`](12-end-to-end-verification.md)) and the security hardening pass
+([`13`](13-security-review.md)). Phases 2–5 are untouched.
+
 ## Phase 0 — Technical feasibility ✅
 
 - [x] Environment inspection (this sandbox) and a Windows audit script

@@ -86,6 +86,22 @@ def check_lint() -> tuple[str, str]:
     return OK, "ruff clean (whole repo, configured by ruff.toml)"
 
 
+def check_types() -> tuple[str, str]:
+    """mypy over the package.
+
+    Optional on purpose: a user who installed without the ``dev`` extra should
+    still be able to run this script. A *failing* run is never skipped, though -
+    that is a real error in the package.
+    """
+    if _run([sys.executable, "-m", "mypy", "--version"], WINDOWS).returncode != 0:
+        return SKIP, "mypy is not installed (pip install mypy, or pip install -e '.[dev]')"
+    proc = _run([sys.executable, "-m", "mypy"], WINDOWS)
+    if proc.returncode != 0:
+        return FAIL, f"mypy reported problems:\n{_tail(proc.stdout)}"
+    summary = [line for line in proc.stdout.splitlines() if "Success" in line or "no issues" in line]
+    return OK, summary[-1] if summary else "no issues"
+
+
 def check_vectors() -> tuple[str, str]:
     proc = _run([sys.executable, str(VECTORGEN), "--check"], REPO)
     if proc.returncode != 0:
@@ -193,6 +209,7 @@ def main() -> int:
         ("Generated vectors", check_vectors),
         ("Unit + integration tests", check_tests),
         ("Lint", check_lint),
+        ("Type check", check_types),
     ]
     if not args.quick:
         steps.append(("CLI end-to-end smoke", check_cli_smoke))

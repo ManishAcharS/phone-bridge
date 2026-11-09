@@ -95,30 +95,69 @@ Listening for phone beacons on UDP 47823 for 10.0s ...
 
 ```json
 {
+  "android_release": "14",
   "android_version": "14",
+  "app_version": "1.0.0",
+  "app_version_code": 1,
+  "brand": "google",
   "capabilities": {
-    "audio.bluetooth_sco": false,
     "audio.bluetooth_profile": "none",
-    "audio.capture": true,
-    "audio.playback": true,
+    "audio.bluetooth_sco": false,
+    "audio.capture": false,
+    "audio.playback": false,
     "bluetooth_scan": false,
-    "camera.back": true,
-    "camera.front": true,
-    "file_transfer": true,
+    "camera.back": false,
+    "camera.front": false,
+    "detail.audio.capture": "present, not implemented yet (Phase 2) — ...",
+    "detail.camera.back": "present, not implemented yet (Phase 4) — ...",
+    "file_transfer": false,
+    "hardware.audio.capture": true,
+    "hardware.audio.playback": true,
+    "hardware.camera.back": true,
+    "hardware.camera.front": true,
+    "hardware.file_transfer": true,
+    "hardware.sensors": true,
     "protocol_version": 1,
-    "sensors": true
+    "sensors": false
   },
+  "device": "panther",
   "device_id": "13000791ea89b7e7",
+  "hardware": "panther",
+  "is_emulator": false,
+  "manufacturer": "Google",
   "model": "Pixel 7",
   "name": "Pixel 7",
+  "package": "dev.phonebridge",
+  "permissions": {
+    "BLUETOOTH_CONNECT": "granted",
+    "POST_NOTIFICATIONS": "granted",
+    "RECORD_AUDIO": "denied"
+  },
   "protocol_version": 1,
-  "sdk_int": 34
+  "rom": "unknown",
+  "sdk_int": 34,
+  "target_sdk": 34
 }
 ```
 
-`audio.bluetooth_sco` reflects whether a headset is currently connected to the
-phone — connect your headphones and run `info` again to watch it flip to `true`.
-That flag is the Phase 2 go/no-go signal.
+Read this carefully, because two different questions are answered here:
+
+* **`hardware.*`** — does the phone physically have it? This is a measurement of
+  the device (camera enumeration, sensor list, audio devices).
+* **the bare capability keys** — can PhoneBridge *use* it today? Every one of
+  them is `false` in this phase, because the audio relay (Phase 2), camera
+  streaming (Phase 4) and file transfer (Phase 5) are not implemented. A key only
+  becomes `true` when the feature exists, the hardware is present **and** any
+  runtime permission is granted.
+* **`detail.<key>`** — the one-sentence reason, so `false` is never a mystery.
+* **`permissions`** — the runtime permission state the phone is in, which is what
+  decides whether a capture capability *could* be available.
+
+Earlier builds hard-coded `camera.back`, `camera.front`, `sensors` and
+`file_transfer` to `true`; that is exactly the kind of claim this phase removed.
+`audio.bluetooth_sco` still reflects whether a headset is currently connected on
+the `hardware.` side — connect your headphones and run `info` again to watch
+`hardware.audio.bluetooth_sco` flip to `true`.
 
 ### Measure it
 

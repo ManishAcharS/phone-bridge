@@ -7,6 +7,8 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -18,8 +20,10 @@ import dev.phonebridge.net.IdentityStore
 import dev.phonebridge.net.PairingStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
@@ -37,6 +41,18 @@ class BridgeService : Service() {
     private var server: BridgeServer? = null
     private var beacon: DiscoveryBeacon? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var startAttempts = 0
+
+    /**
+     * The notification-text collectors started for the current server.
+     *
+     * They used to be launched per `startBridge()` and never cancelled, so every
+     * restart (Settings → Save, ACTION_RESTART, a retry after a failed bind) left
+     * the previous pair running: N collectors all calling notify() on the same
+     * notification, forever.
+     */
+    private var stateJobs: List<Job> = emptyList()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -46,6 +62,16 @@ class BridgeService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Android 8+ requires startForeground() shortly after
+        // startForegroundService(), which is how this service is normally
+        // entered. That applies to the stop and restart paths below too: doing
+        // them before startForeground() got the process killed on Android 12+
+        // (ForegroundServiceDidNotStartInTimeException) instead of stopped.
+        startForeground(
+            NOTIFICATION_ID,
+            buildNotification(if (server == null) "Starting…" else "Listening…"),
+        )
+
         when (intent?.action) {
             ACTION_STOP -> {
                 stopBridge()
@@ -60,12 +86,14 @@ class BridgeService : Service() {
             }
         }
 
-        startForeground(NOTIFICATION_ID, buildNotification("Starting…"))
+        // A null intent is the system re-creating a START_STICKY service after
+        // it killed the process: rebuild everything from disk.
         if (server == null) startBridge()
         return START_STICKY
     }
 
     private fun startBridge() {
+        if (server != null) return
         val identityStore = IdentityStore(this)
         val pairingStore = PairingStore(this)
         val identity = identityStore.loadOrCreate(defaultDeviceName())
@@ -77,40 +105,120 @@ class BridgeService : Service() {
         BridgeState.bind(srv, scope)
         BridgeState.setPort(port)
 
-        srv.start().onFailure { error ->
-            BridgeState.answerPairing(false)
-            updateNotification("Error: ${error.message}")
-            stopBridge()
-            stopSelf()
+        val started = srv.start()
+        if (started.isFailure) {
+            retryStart(srv, port, started.exceptionOrNull())
+            return
         }
+        startAttempts = 0
 
-        if (srv.running.value) {
-            beacon = DiscoveryBeacon(identity.deviceId, identity.name, port).also { it.start() }
-            acquireWakeLock()
-            updateNotification("Listening on port $port")
-        }
+        beacon = DiscoveryBeacon(identity.deviceId, identity.name, port).also { it.start() }
+        acquireWakeLock()
+        watchNetwork()
+        updateNotification("Listening on port $port")
 
         // Keep the notification text roughly in sync with reality.
-        scope.launch {
-            BridgeState.peers.collectLatest { peers ->
-                val text = when {
-                    peers.isEmpty() -> "Listening on port $port · no PC connected"
-                    peers.size == 1 -> "Connected: ${peers[0].name}"
-                    else -> "${peers.size} PCs connected"
+        stateJobs = listOf(
+            scope.launch {
+                BridgeState.peers.collectLatest { peers ->
+                    val text = when {
+                        peers.isEmpty() -> "Listening on port $port · no PC connected"
+                        peers.size == 1 -> "Connected: ${peers[0].name}"
+                        else -> "${peers.size} PCs connected"
+                    }
+                    updateNotification(text)
                 }
-                updateNotification(text)
-            }
+            },
+            scope.launch {
+                BridgeState.pairingRequest.collectLatest { request ->
+                    if (request != null) {
+                        updateNotification("Pairing request from ${request.name} — open the app")
+                    }
+                }
+            },
+        )
+    }
+
+    /**
+     * Handle a failed bind.
+     *
+     * The common cause is a socket that the previous run has not released yet
+     * (restart from the notification, or the system re-creating the service), so
+     * a short retry wins where an immediate stopSelf() would leave the user with
+     * a bridge that never came up and no explanation. Retries are bounded; after
+     * that the error is shown and the service stops honestly.
+     */
+    private fun retryStart(srv: BridgeServer, port: Int, error: Throwable?) {
+        val detail = error?.message ?: "unknown error"
+        startAttempts++
+        val wait = START_RETRY_DELAYS_MS.getOrNull(startAttempts - 1)
+        if (wait == null) {
+            BridgeState.denyAllPairings()
+            updateNotification("Cannot listen on port $port: $detail")
+            stopBridge()
+            stopSelf()
+            return
         }
+        updateNotification("Port $port unavailable ($detail) — retrying in ${wait / 1000}s")
         scope.launch {
-            BridgeState.pairingRequest.collectLatest { request ->
-                if (request != null) {
-                    updateNotification("Pairing request from ${request.name} — open the app")
-                }
+            delay(wait)
+            if (server === srv) {
+                stopBridge()
+                startBridge()
             }
         }
     }
 
+    /**
+     * Follow network changes.
+     *
+     * The listening socket survives a Wi-Fi dropout, but the discovery beacon's
+     * datagram socket is bound to the old interface and its broadcasts go
+     * nowhere after the phone rejoins a network. Rebinding it keeps discovery
+     * working; the PC still reconnects to the same port on the new address.
+     */
+    private fun watchNetwork() {
+        if (networkCallback != null) return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                scope.launch {
+                    val b = beacon
+                    if (b != null) {
+                        b.restart()
+                        updateNotification("Network changed — re-advertising on ${BridgeState.port.value}")
+                    }
+                }
+            }
+
+            override fun onLost(network: Network) {
+                scope.launch { updateNotification("Network lost — waiting for a network") }
+            }
+        }
+        networkCallback = callback
+        try {
+            cm.registerDefaultNetworkCallback(callback)
+        } catch (e: Exception) {
+            // Not fatal: discovery is a convenience, and the PC can still
+            // connect to the address it used before.
+            networkCallback = null
+            updateNotification("Network monitoring unavailable: ${e.message}")
+        }
+    }
+
     private fun stopBridge() {
+        stateJobs.forEach { it.cancel() }
+        stateJobs = emptyList()
+        networkCallback?.let { callback ->
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            try {
+                cm?.unregisterNetworkCallback(callback)
+            } catch (e: Exception) {
+                // Already unregistered (or the process is going away).
+                android.util.Log.w("BridgeService", "unregisterNetworkCallback: ${e.message}")
+            }
+        }
+        networkCallback = null
         beacon?.stop()
         beacon = null
         server?.stop()
@@ -122,6 +230,10 @@ class BridgeService : Service() {
     override fun onDestroy() {
         stopBridge()
         scope.cancel()
+        // Without this the "Listening on port …" notification can outlive the
+        // service when the system kills and re-creates it.
+        @Suppress("DEPRECATION")
+        stopForeground(true)
         super.onDestroy()
     }
 
@@ -207,6 +319,9 @@ class BridgeService : Service() {
         const val ACTION_STOP = "dev.phonebridge.action.STOP"
         const val ACTION_RESTART = "dev.phonebridge.action.RESTART"
 
+        /** Backoff for a bind that failed because the old socket was still closing. */
+        private val START_RETRY_DELAYS_MS = longArrayOf(1_000L, 2_000L, 4_000L)
+
         fun start(context: Context) {
             val intent = Intent(context, BridgeService::class.java).setAction(ACTION_START)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -220,6 +335,22 @@ class BridgeService : Service() {
             context.startService(
                 Intent(context, BridgeService::class.java).setAction(ACTION_STOP)
             )
+        }
+
+        /**
+         * Restart in place.
+         *
+         * A stop-then-start with a sleep between them (what the UI used to do)
+         * raced the old socket's teardown: the rebind could hit EADDRINUSE and
+         * the bridge silently stayed down. The service now owns the ordering.
+         */
+        fun restart(context: Context) {
+            val intent = Intent(context, BridgeService::class.java).setAction(ACTION_RESTART)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
         }
     }
 }

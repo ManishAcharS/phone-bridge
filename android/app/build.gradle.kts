@@ -12,13 +12,51 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 1
-        versionName = "0.1.0-phase1"
+        versionName = "1.0.0"
+    }
+
+    // Release signing is read from android/keystore.properties, which is NOT in
+    // the repository (.gitignore) and never should be:
+    //
+    //     storeFile=phonebridge-release.jks
+    //     storePassword=...
+    //     keyAlias=phonebridge
+    //     keyPassword=...
+    //
+    // Without that file `assembleRelease` still builds, but produces
+    // app-release-unsigned.apk - an APK that cannot be installed or updated.
+    // The build fails loudly at the end instead of silently shipping that.
+    val keystorePropertiesFile = rootProject.file("keystore.properties")
+    val keystoreProperties = java.util.Properties().apply {
+        if (keystorePropertiesFile.exists()) {
+            keystorePropertiesFile.inputStream().use { load(it) }
+        }
+    }
+    val hasReleaseKeystore = keystoreProperties.getProperty("storeFile") != null
+
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
     }
 
     buildTypes {
         release {
+            // Minification stays off on purpose: R8 rules for Compose + a
+            // reflective WebSocket library cannot be validated without building
+            // and exercising the APK on a device, and a shrunk app that crashes
+            // is worse than a larger one that runs. Revisit with a device test.
             isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (hasReleaseKeystore) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

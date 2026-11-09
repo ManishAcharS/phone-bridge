@@ -1,8 +1,8 @@
 package dev.phonebridge.net
 
 import android.content.Context
-import android.os.Build
 import android.util.Log
+import dev.phonebridge.Permissions
 import dev.phonebridge.protocol.Crypto
 import dev.phonebridge.protocol.Framing
 import dev.phonebridge.protocol.Json
@@ -21,7 +21,10 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -47,6 +50,52 @@ class BridgeServer(
         const val DEFAULT_PORT = 8765
         private const val MAX_LOG_LINES = 200
         private const val BIND_TIMEOUT_S = 5L
+
+        /**
+         * How long a peer gets to finish HELLO -> AUTH -> READY.
+         *
+         * A socket that opens and then says nothing used to hold a PeerSession
+         * (and a WebSocket) forever; whoever can reach port 8765 could exhaust
+         * the process just by connecting and staying silent.
+         */
+        private const val SETUP_TIMEOUT_S = 20L
+
+        /** Hard ceilings so one host cannot consume the bridge. */
+        private const val MAX_SESSIONS = 8
+        private const val MAX_SESSIONS_PER_DEVICE = 4
+
+        /** A device id is the first 16 hex characters of SHA-256(pubkey). */
+        private val DEVICE_ID = Regex("^[0-9a-f]{16}$")
+
+        /**
+         * How many un-answered pairing requests may exist at once.
+         *
+         * Every pending request holds a session, and an attacker on the LAN can
+         * produce them faster than a human can read them. Beyond this the phone
+         * refuses the request outright instead of queueing it.
+         */
+        private const val MAX_PENDING_PAIRINGS = 4
+
+        /** ANSI escapes: they can move a cursor and retitle a window. */
+        private val ANSI_ESCAPE = Regex("\u001B\\[[0-9;?]*[ -/]*[@-~]")
+
+        /**
+         * Peer-supplied text, made safe for the log, the UI and the pin store.
+         *
+         * The PC picks its own name. Control characters would let it forge log
+         * lines and escapes would let it repaint the screen the user is reading,
+         * so anything that is not printable text is dropped here, once, at the
+         * boundary.
+         */
+        internal fun safeLabel(value: Any?, limit: Int = 64, fallback: String = "pc"): String {
+            val raw = (value as? String) ?: value?.toString() ?: return fallback
+            val cleaned = ANSI_ESCAPE.replace(raw, "")
+                .filter { !it.isISOControl() }
+                .replace(Regex("[ \\t\\u00a0]+"), " ")
+                .trim()
+                .take(limit)
+            return cleaned.ifBlank { fallback }
+        }
     }
 
     data class PeerInfo(
@@ -56,7 +105,19 @@ class BridgeServer(
         val connectedAt: Long,
     )
 
-    data class PairingRequest(val deviceId: String, val name: String, val sas: String)
+    /**
+     * One pending pairing, identified by [token].
+     *
+     * The decision must name the request it answers: approving "whatever is
+     * pending" would grant every concurrent pairing request on the strength of
+     * one code the user only looked at once.
+     */
+    data class PairingRequest(
+        val deviceId: String,
+        val name: String,
+        val sas: String,
+        val token: Long = 0L,
+    )
 
     data class LogLine(val at: String, val level: String, val message: String)
 
@@ -97,6 +158,9 @@ class BridgeServer(
 
     private var impl: ServerImpl? = null
 
+    /** Enforces [SETUP_TIMEOUT_S] for connections that never reach READY. */
+    private var setupTimer: ScheduledExecutorService? = null
+
     // WebSocketServer.start() returns before the socket is bound, so the bind
     // result arrives on the server thread via onStart()/onError(). These two
     // fields let start() wait for the real answer instead of assuming success.
@@ -111,6 +175,16 @@ class BridgeServer(
     private var lastCapabilityReport: Map<String, Any?>? = null
 
     private val probeLock = Any()
+
+    /**
+     * True while a capability probe is queued or running.
+     *
+     * The executor has one thread, so without this a PC (or a looping script)
+     * could queue probe after probe: each one can hold the microphone for five
+     * minutes, and every queued request is a promised answer that will be sent
+     * long after the caller gave up.
+     */
+    private val probeInFlight = AtomicBoolean(false)
 
     /** Store a report measured in the UI, so a later PC connection can read it. */
     fun publishCapabilityReport(report: Map<String, Any?>) {
@@ -149,6 +223,10 @@ class BridgeServer(
             } catch (e: Exception) {
                 addLog("ERROR", "capability probe failed: ${e.message}")
                 Messages.responseErr(rpcId, "probe_failed", "${e.javaClass.simpleName}: ${e.message}")
+            } finally {
+                // Released before the answer is sent: the next probe may start as
+                // soon as this one stopped touching the audio path.
+                probeInFlight.set(false)
             }
             peer.sendControl(payload)
         }
@@ -158,7 +236,10 @@ class BridgeServer(
     private var pendingPairing: MutableList<PendingPairing> =
         Collections.synchronizedList(mutableListOf())
 
+    private val pairingTokens = AtomicLong()
+
     private data class PendingPairing(
+        val token: Long,
         val deviceId: String,
         val name: String,
         val sas: String,
@@ -188,6 +269,9 @@ class BridgeServer(
             }
             bindError?.let { throw it }
             impl = server
+            setupTimer = Executors.newSingleThreadScheduledExecutor { runnable ->
+                Thread(runnable, "pb-setup-timeout").apply { isDaemon = true }
+            }
             _lastError.value = null
             addLog("INFO", "listening on 0.0.0.0:$port (device ${identity.deviceId})")
             Result.success(Unit)
@@ -201,10 +285,13 @@ class BridgeServer(
     }
 
     fun stop() {
-        sessions.toList().forEach { it.close("server stopping") }
+        denyAllPairings("server stopping")
+        sessions.toList().forEach { it.close("server stopping", bye = true) }
         sessions.clear()
         pendingPairing.clear()
         _pairingRequest.value = null
+        setupTimer?.shutdownNow()
+        setupTimer = null
         impl?.let {
             try {
                 it.stop(1000)
@@ -218,11 +305,32 @@ class BridgeServer(
         addLog("INFO", "server stopped")
     }
 
-    fun answerPairing(approve: Boolean) {
+    /**
+     * Answer exactly the pairing request the user is looking at.
+     *
+     * [token] must be the token of that request. An unknown or stale token is
+     * refused loudly rather than applied to a different PC's session.
+     */
+    fun answerPairing(token: Long, approve: Boolean) {
+        val target = pendingPairing.firstOrNull { it.token == token }
+        if (target == null) {
+            addLog("WARN", "pairing decision for unknown/stale request $token ignored")
+            _pairingRequest.value = pendingPairing.firstOrNull()?.toRequest()
+            return
+        }
+        pendingPairing.remove(target)
+        // Show the next waiter (one SAS on screen at a time), or clear it.
+        _pairingRequest.value = pendingPairing.firstOrNull()?.toRequest()
+        target.session.onUserPairingDecision(approve)
+    }
+
+    /** Refuse everything pending: used when the server is going down. */
+    fun denyAllPairings(reason: String = "bridge stopping") {
         val pending = pendingPairing.toList()
-        _pairingRequest.value = null
-        pending.forEach { it.session.onUserPairingDecision(approve) }
         pendingPairing.clear()
+        _pairingRequest.value = null
+        pending.forEach { it.session.onUserPairingDecision(false) }
+        if (pending.isNotEmpty()) addLog("WARN", "refused ${pending.size} pending pairing(s): $reason")
     }
 
     // ------------------------------------------------------------------ //
@@ -268,9 +376,28 @@ class BridgeServer(
         )
     }
 
-    internal fun registerSession(session: PeerSession) {
+    /**
+     * Admit a READY session, enforcing the per-device and global ceilings.
+     *
+     * Returns the refusal reason when the session must be refused; the caller
+     * closes it with that reason so the PC can show it. Bounded because an attacker on the LAN can
+     * otherwise open sessions until the process runs out of sockets.
+     */
+    internal fun admitSession(session: PeerSession, deviceId: String): String? {
+        val ready = sessions.count { it.isReady }
+        val forDevice = sessions.count { it.isReady && it.peerDeviceId == deviceId }
+        val refusal = when {
+            forDevice >= MAX_SESSIONS_PER_DEVICE -> "too many connections from this device"
+            ready >= MAX_SESSIONS -> "server connection limit reached"
+            else -> null
+        }
+        if (refusal != null) {
+            addLog("WARN", "refusing session from '$deviceId': $refusal")
+            return refusal
+        }
         sessions.add(session)
         publishPeers()
+        return null
     }
 
     internal fun unregisterSession(session: PeerSession) {
@@ -279,16 +406,62 @@ class BridgeServer(
     }
 
     private fun publishPeers() {
+        // One row per PC, however many sessions it holds (a `watch` and a
+        // `ping` at the same time are two sessions, one peer).
         _peers.value = sessions
             .filter { it.isReady }
+            .sortedByDescending { it.toPeerInfo().connectedAt }
+            .distinctBy { it.toPeerInfo().deviceId }
             .map { it.toPeerInfo() }
     }
 
-    internal fun requestPairingApproval(session: PeerSession, deviceId: String, name: String, sas: String) {
-        pendingPairing.add(PendingPairing(deviceId, name, sas, session))
-        _pairingRequest.value = PairingRequest(deviceId, name, Crypto.formatSas(sas))
-        addLog("WARN", "pairing request from '$name' - compare SAS ${Crypto.formatSas(sas)}")
+    internal fun requestPairingApproval(
+        session: PeerSession,
+        deviceId: String,
+        name: String,
+        sas: String,
+    ): Boolean {
+        if (pendingPairing.size >= MAX_PENDING_PAIRINGS) {
+            addLog(
+                "WARN",
+                "refusing pairing request from '$name': " +
+                    "${pendingPairing.size} requests are already waiting for an answer",
+            )
+            return false
+        }
+        val token = pairingTokens.incrementAndGet()
+        val pending = PendingPairing(token, deviceId, name, sas, session)
+        pendingPairing.add(pending)
+        _pairingRequest.value = pending.toRequest()
+        addLog(
+            "WARN",
+            "pairing request #$token from '$name' - the code is shown on screen only",
+        )
+        return true
     }
+
+    /**
+     * Forget the pairing request that belongs to a session that just ended.
+     *
+     * Without this the entry outlived its socket: the prompt stayed on screen
+     * and the list grew for as long as the process ran, because nothing ever
+     * removed a request whose PC had gone away.
+     */
+    private fun dropPendingPairing(session: PeerSession) {
+        synchronized(pendingPairing) {
+            val removed = pendingPairing.filter { it.session === session }
+            if (removed.isEmpty()) return
+            pendingPairing.removeAll(removed)
+            addLog(
+                "INFO",
+                "dropped ${removed.size} pairing request(s) from a closed session",
+            )
+            _pairingRequest.value = pendingPairing.firstOrNull()?.toRequest()
+        }
+    }
+
+    private fun PendingPairing.toRequest(): PairingRequest =
+        PairingRequest(deviceId, name, Crypto.formatSas(sas), token)
 
     /** Broadcast an event to every ready PC (Phase 2+ telemetry, headset changes). */
     fun broadcastEvent(name: String, data: Map<String, Any?> = emptyMap()) {
@@ -299,20 +472,17 @@ class BridgeServer(
     // ------------------------------------------------------------------ //
     // RPC surface
     // ------------------------------------------------------------------ //
-    private fun capabilities(): Map<String, Any?> = mapOf(
-        "audio.playback" to true,
-        "audio.capture" to true,
-        // Reported as a probe result, not a promise: the real answer depends on
-        // the headset and on whether a SCO link can be established off-call.
-        "audio.bluetooth_sco" to AudioProbe.headsetConnected(context),
-        "audio.bluetooth_profile" to AudioProbe.bluetoothProfileName(context),
-        "camera.back" to true,
-        "camera.front" to true,
-        "sensors" to true,
-        "file_transfer" to true,
-        "bluetooth_scan" to false, // Phase 5, needs runtime permission
-        "protocol_version" to Framing.PROTOCOL_VERSION,
-    )
+
+    /**
+     * What this phone can do *through PhoneBridge v1 today*.
+     *
+     * Every value is measured by [DeviceFacts] and gated on the feature actually
+     * existing. The version this replaced returned `true` for camera, sensors and
+     * file transfer without checking anything, so a PC had no way to tell a real
+     * capability from a placeholder. Hardware facts are still published, under
+     * `hardware.*`, and a per-key explanation under `detail.*`.
+     */
+    private fun capabilities(): Map<String, Any?> = DeviceFacts.capabilities(context)
 
     /**
      * Handle one control request.
@@ -332,20 +502,18 @@ class BridgeServer(
 
         return try {
             when (method) {
-                "system.info" -> Messages.responseOk(
-                    id,
-                    mapOf(
+                "system.info" -> {
+                    // One source for the device block, shared with the app's
+                    // "This device" card, so the two cannot disagree.
+                    val info = linkedMapOf<String, Any?>(
                         "device_id" to identity.deviceId,
                         "name" to identity.name,
-                        "model" to Build.MODEL,
-                        "manufacturer" to Build.MANUFACTURER,
-                        "android_version" to Build.VERSION.RELEASE,
-                        "sdk_int" to Build.VERSION.SDK_INT,
-                        "protocol_version" to Framing.PROTOCOL_VERSION,
-                        "capabilities" to capabilities(),
-                        "app_version" to appVersion(),
-                    ),
-                )
+                    )
+                    info.putAll(DeviceFacts.deviceInfo(context))
+                    info["capabilities"] = capabilities()
+                    info["permissions"] = Permissions.wireSnapshot(context)
+                    Messages.responseOk(id, info)
+                }
 
                 "system.echo" -> Messages.responseOk(
                     id,
@@ -382,11 +550,21 @@ class BridgeServer(
                 )
 
                 "audio.capabilities.run" -> {
-                    val seconds = ((params["seconds"] as? Number)?.toInt() ?: 30)
-                        .coerceIn(5, 300)
-                    val acoustic = params["acoustic"] as? Boolean ?: false
-                    runCapabilityProbeAsync(id, seconds, acoustic, peer)
-                    null // answered from the probe thread when it finishes
+                    if (!probeInFlight.compareAndSet(false, true)) {
+                        // Refusing is honest: the answer would otherwise arrive
+                        // minutes later, after the PC had already timed out.
+                        Messages.responseErr(
+                            id,
+                            "busy",
+                            "a capability probe is already running on this phone",
+                        )
+                    } else {
+                        val seconds = ((params["seconds"] as? Number)?.toInt() ?: 30)
+                            .coerceIn(5, 300)
+                        val acoustic = params["acoustic"] as? Boolean ?: false
+                        runCapabilityProbeAsync(id, seconds, acoustic, peer)
+                        null // answered from the probe thread when it finishes
+                    }
                 }
 
                 "audio.capabilities.last" -> Messages.responseOk(
@@ -401,12 +579,6 @@ class BridgeServer(
             addLog("ERROR", "RPC $method failed: ${e.message}")
             Messages.responseErr(id, "internal", "${e.javaClass.simpleName}: ${e.message}")
         }
-    }
-
-    private fun appVersion(): String = try {
-        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "?"
-    } catch (e: Exception) {
-        "?"
     }
 
     // ------------------------------------------------------------------ //
@@ -436,6 +608,37 @@ class BridgeServer(
     ) {
         private val lock = Any()
         private var stage = Stage.AWAIT_HELLO
+        private var setupTimeoutTask: ScheduledFuture<*>? = null
+
+        init {
+            // Armed before the first frame arrives: a silent socket must not be
+            // able to sit in the setup states indefinitely.
+            setupTimeoutTask = setupTimer?.schedule({
+                val state = synchronized(lock) { stage }
+                if (state != Stage.READY && state != Stage.DEAD) {
+                    if (state == Stage.AWAIT_PAIR_CONFIRM) {
+                        // A prompt nobody answered is an expired prompt: it must
+                        // not stay on screen (or stay answerable) any longer.
+                        addLog(
+                            "WARN",
+                            "pairing request from $remote expired after ${SETUP_TIMEOUT_S}s " +
+                                "with no decision",
+                        )
+                    } else {
+                        addLog(
+                            "WARN",
+                            "connection from $remote did not finish setup in ${SETUP_TIMEOUT_S}s",
+                        )
+                    }
+                    close("setup timeout", code = 1002)
+                }
+            }, SETUP_TIMEOUT_S, TimeUnit.SECONDS)
+        }
+
+        private fun cancelSetupTimeout() {
+            setupTimeoutTask?.cancel(false)
+            setupTimeoutTask = null
+        }
         private var responder: Crypto.HandshakeResponder? = null
         private var codec: Crypto.SecureCodec? = null
 
@@ -486,18 +689,27 @@ class BridgeServer(
 
         private fun onHello(env: Framing.Envelope) {
             if (env.kind != Framing.KIND_HANDSHAKE) {
-                close("expected handshake")
+                close("expected handshake", code = 1002)
                 return
             }
             val hello = env.asJson()
             val claimedId = hello["id"] as? String ?: ""
             val claimedStatic = hello["static"] as? String ?: ""
 
+            // The device id is SHA-256(pubkey)[:16]. Anything else cannot be
+            // pinned, cannot be looked up, and must not reach the pairing path
+            // (an empty id used to be stored as a pin for "").
+            if (!DEVICE_ID.matches(claimedId)) {
+                addLog("WARN", "rejecting hello with malformed device id '$claimedId'")
+                close("bad hello", code = 1002)
+                return
+            }
+
             // Known device id with a different key: refuse, do not fall back to
             // pairing. That is the "phone got reflashed" signal.
             if (pairingStore.isPaired(claimedId) && !pairingStore.verify(claimedId, claimedStatic)) {
                 addLog("WARN", "device $claimedId presented a different identity key; refusing")
-                close("identity key changed for known device")
+                close("identity key changed for known device", code = 1008)
                 return
             }
 
@@ -507,13 +719,11 @@ class BridgeServer(
             responder = r
             codec = r.keys?.let { Crypto.SecureCodec.forServer(it) }
             peerDeviceId = r.peerDeviceId ?: ""
-            peerName = r.peerName ?: "pc"
+            peerName = safeLabel(r.peerName)
             bumpHandshake()
-            addLog(
-                "INFO",
-                "handshake with '$peerName' (${r.peerDeviceId}) known=$known " +
-                    "SAS=${r.keys?.sasDigits}",
-            )
+            // The six digits are for the screen the human compares, not for a
+            // log file that outlives the pairing.
+            addLog("INFO", "handshake with '$peerName' (${r.peerDeviceId}) known=$known")
             sendRaw(ack)
             stage = Stage.AWAIT_AUTH
         }
@@ -531,7 +741,7 @@ class BridgeServer(
             }
             if ((msg["proto"] as? Number)?.toInt() != Framing.PROTOCOL_VERSION) {
                 sendControl(Messages.handshake("auth_fail", "reason" to "protocol version"))
-                close("version")
+                close("version", code = 1002)
                 return
             }
             val pcId = msg["id"] as? String ?: ""
@@ -540,18 +750,19 @@ class BridgeServer(
 
             if (pcId != peerDeviceId) {
                 sendControl(Messages.handshake("auth_fail", "reason" to "identity mismatch"))
-                close("identity mismatch")
+                close("identity mismatch", code = 1008)
                 return
             }
             if (pairingStore.isPaired(pcId) && !pairingStore.verify(pcId, peerStatic)) {
                 sendControl(Messages.handshake("auth_fail", "reason" to "identity key changed"))
-                close("identity key changed")
+                close("identity key changed", code = 1008)
                 return
             }
 
             if (pairingStore.isPaired(pcId)) {
-                peerName = pcName
-                markReady()
+                peerName = safeLabel(pcName)
+                // markReady() closes the session itself when we are at a limit.
+                if (!markReady()) return
                 sendControl(
                     Messages.handshake(
                         "auth_ok",
@@ -575,7 +786,15 @@ class BridgeServer(
                 )
             )
             stage = Stage.AWAIT_PAIR_CONFIRM
-            requestPairingApproval(this, pcId, pcName, sas)
+            if (!requestPairingApproval(this, pcId, peerName, sas)) {
+                sendControl(
+                    Messages.handshake(
+                        "pair_fail",
+                        "reason" to "too many pending pairing requests",
+                    ),
+                )
+                close("too many pending pairing requests", code = 1008)
+            }
         }
 
         private fun onPairConfirm(env: Framing.Envelope) {
@@ -615,12 +834,12 @@ class BridgeServer(
             if (pcSas != responseSasNormalised(expectedFormatted)) {
                 addLog("WARN", "PC confirmed a mismatched SAS; refusing pairing")
                 sendControl(Messages.handshake("pair_fail", "reason" to "SAS mismatch"))
-                close("SAS mismatch")
+                close("SAS mismatch", code = 1008)
                 return
             }
             if (!decision) {
                 sendControl(Messages.handshake("pair_fail", "reason" to "declined on phone"))
-                close("declined")
+                close("declined", code = 1008)
                 return
             }
             val staticKey = responder?.peerStaticKey
@@ -635,7 +854,10 @@ class BridgeServer(
                 close("pin failed")
                 return
             }
-            markReady()
+            if (!markReady()) {
+                addLog("WARN", "paired with '$peerName' but the session was refused")
+                return
+            }
             sendControl(
                 Messages.handshake("pair_ok", "id" to identity.deviceId, "name" to identity.name)
             )
@@ -644,10 +866,22 @@ class BridgeServer(
 
         private fun responseSasNormalised(formatted: String) = formatted.replace(" ", "")
 
-        private fun markReady() {
+        /** @return true when this session was admitted; false means it was closed. */
+        private fun markReady(): Boolean {
+            cancelSetupTimeout()
+            val refusal = admitSession(this, peerDeviceId)
+            if (refusal != null) {
+                close(refusal, code = 1008)
+                return false
+            }
             stage = Stage.READY
             connectedAt = System.currentTimeMillis()
-            registerSession(this)
+            // admitSession() published the peer list while this session was
+            // still in a setup stage, so it was filtered out: republish now that
+            // the session counts as ready, or the UI would not show the PC until
+            // some unrelated event changed the list.
+            publishPeers()
+            return true
         }
 
         // --- steady state ---------------------------------------------- //
@@ -656,12 +890,22 @@ class BridgeServer(
                 close("PC closed")
                 return
             }
-            val opened = codec?.unseal(env) ?: return
+            val opened = codec?.unseal(env)
+            if (opened == null) {
+                close("no session keys")
+                return
+            }
             when (opened.msgType) {
                 Messages.MSG_CONTROL -> onControl(opened.payload)
                 Messages.MSG_PING -> {
                     val echoed = Messages.parsePingEcho(opened.payload)
                     sendSecure(Messages.MSG_PONG, Messages.STREAM_CONTROL, Messages.pong(echoed))
+                }
+
+                Messages.MSG_BYE -> {
+                    val reason = String(opened.payload, Charsets.UTF_8).trim()
+                    addLog("INFO", "PC said bye${if (reason.isEmpty()) "" else ": $reason"}")
+                    close("PC said bye")
                 }
 
                 Messages.MSG_BLOB -> sendSecure(Messages.MSG_BLOB, opened.streamId, opened.payload)
@@ -684,7 +928,14 @@ class BridgeServer(
             sendSecure(Messages.MSG_CONTROL, Messages.STREAM_CONTROL, payload)
 
         fun sendSecure(msgType: Int, streamId: Int, payload: ByteArray) {
-            val c = codec ?: return
+            val c = codec
+            if (c == null) {
+                // Unreachable in a correct run: nothing is sent before the
+                // handshake produced keys. Loud, because silently dropping a
+                // frame the caller believes was sent is how sessions hang.
+                addLog("WARN", "dropping msg 0x%02x: no session keys yet".format(msgType))
+                return
+            }
             try {
                 val env = c.seal(msgType, streamId, payload)
                 sendRaw(env)
@@ -699,25 +950,49 @@ class BridgeServer(
                 conn.send(bytes)
                 bumpOut(bytes.size)
             } catch (e: Exception) {
-                Log.w(TAG, "sendRaw failed", e)
+                // A failed send means the socket is gone; keeping the session
+                // "open" would keep answering RPCs that can never be delivered.
+                addLog("ERROR", "send failed: ${e.javaClass.simpleName}: ${e.message}")
+                close("send failed")
             }
         }
 
-        fun close(reason: String) {
+        /**
+         * Tear the session down.
+         *
+         * [bye] sends the protocol-v1 BYE frame first. Use it for intentional
+         * shutdowns (user pressed Stop, service torn down) so the PC records
+         * "the phone stopped" instead of "the link died" and does not treat a
+         * planned stop as a network failure worth reconnecting to.
+         */
+        fun close(reason: String, bye: Boolean = false, code: Int = 1000) {
+            cancelSetupTimeout()
+            // Only the first caller gets to tear down (and to send BYE).
             synchronized(lock) {
                 if (stage == Stage.DEAD) return
                 stage = Stage.DEAD
             }
+            if (bye) {
+                // Best effort: the socket may already be gone.
+                runCatching {
+                    codec?.let { c ->
+                        sendRaw(c.seal(Messages.MSG_BYE, Messages.STREAM_CONTROL, reason.toByteArray()))
+                    }
+                }.onFailure { addLog("WARN", "could not send BYE: ${it.message}") }
+            }
             try {
-                if (conn.isOpen) conn.close(1000, reason.take(120))
+                if (conn.isOpen) conn.close(code, reason.take(120))
             } catch (e: Exception) {
                 Log.w(TAG, "close failed", e)
             }
+            dropPendingPairing(this)
             unregisterSession(this)
         }
 
         fun onClosed() {
+            cancelSetupTimeout()
             synchronized(lock) { stage = Stage.DEAD }
+            dropPendingPairing(this)
             unregisterSession(this)
         }
     }
@@ -736,6 +1011,26 @@ class BridgeServer(
 
         override fun onOpen(conn: WebSocket, handshake: ClientHandshake) {
             val remote = conn.remoteSocketAddress?.address?.hostAddress ?: "?"
+            // Only browsers send Origin, and a browser must never drive the
+            // bridge: WebSocket bypasses the same-origin policy entirely, so a
+            // page the user visits could otherwise open ws://<phone-ip>:8765,
+            // complete a handshake with its own keys and provoke a pairing
+            // prompt. Native clients (our PC app, the simulator) send no Origin.
+            val origin = handshake.getFieldValue("Origin")
+            if (!origin.isNullOrBlank()) {
+                addLog(
+                    "WARN",
+                    "refusing connection from $remote: browser Origin " +
+                        "'${safeLabel(origin, limit = 80)}' (only native clients may connect)",
+                )
+                runCatching { conn.close(1008, "browser origins are not accepted") }
+                return
+            }
+            if (byConnection.size >= MAX_SESSIONS) {
+                addLog("WARN", "refusing connection from $remote: server connection limit reached")
+                runCatching { conn.close(1008, "server connection limit reached") }
+                return
+            }
             addLog("INFO", "connection from $remote")
             byConnection[conn] = PeerSession(conn, remote)
         }
@@ -747,6 +1042,19 @@ class BridgeServer(
         }
 
         override fun onMessage(conn: WebSocket, message: ByteBuffer) {
+            // Checked before the copy: the 8 MiB ceiling is enforced again in
+            // Framing.decode, but by then the whole hostile payload has already
+            // been copied into a fresh array -- repeatedly, once per frame.
+            if (message.remaining() > Framing.MAX_ENVELOPE_BODY) {
+                addLog(
+                    "WARN",
+                    "refusing oversized frame from " +
+                        "${conn.remoteSocketAddress?.address?.hostAddress ?: "?"}: " +
+                        "${message.remaining()} bytes (limit ${Framing.MAX_ENVELOPE_BODY})",
+                )
+                runCatching { conn.close(1009, "frame too large") }
+                return
+            }
             val bytes = ByteArray(message.remaining())
             message.get(bytes)
             bumpIn(bytes.size)
