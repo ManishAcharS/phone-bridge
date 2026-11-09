@@ -89,8 +89,41 @@ object BridgeState {
         server?.publishCapabilityReport(report)
     }
 
-    fun answerPairing(approve: Boolean) {
-        server?.answerPairing(approve)
+    /**
+     * Answer the pairing request that is currently displayed.
+     *
+     * [request] is passed explicitly (rather than a bare boolean) so the
+     * decision can only apply to the SAS the user actually looked at.
+     */
+    fun answerPairing(request: BridgeServer.PairingRequest?, approve: Boolean) {
+        val srv = server
+        if (srv == null || request == null) return
+        srv.answerPairing(request.token, approve)
+    }
+
+    /** Refuse everything pending (service teardown / failure). */
+    fun denyAllPairings() {
+        server?.denyAllPairings()
+    }
+
+    /**
+     * Record a local event in the bridge log (and therefore in the UI).
+     *
+     * Used for things only the UI can observe, such as a permission being
+     * revoked from the system settings while the app is open. With no server
+     * running there is no log to append to, so it goes to logcat only.
+     */
+    fun note(level: String, message: String) {
+        val srv = server
+        if (srv != null) {
+            srv.addLog(level, message)
+        } else {
+            android.util.Log.println(
+                if (level == "ERROR") android.util.Log.ERROR else android.util.Log.WARN,
+                "BridgeState",
+                message,
+            )
+        }
     }
 
     fun forgetAllPairings(store: dev.phonebridge.net.PairingStore) {

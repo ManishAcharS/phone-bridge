@@ -7,6 +7,10 @@ __pycache__/
 .venv/
 venv/
 
+# Python packaging output
+/windows/build/
+/windows/dist/
+
 # Local tool state / credentials-ish
 .phone-sim/
 phonebridge-log-*.txt
@@ -19,6 +23,10 @@ android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
+# Release signing material - must never be committed.
+android/keystore.properties
+*.jks
+*.keystore
 android/.idea/
 android/captures/
 *.apk

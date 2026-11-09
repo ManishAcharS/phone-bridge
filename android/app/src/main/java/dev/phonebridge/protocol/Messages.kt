@@ -1,7 +1,5 @@
 package dev.phonebridge.protocol
 
-import org.json.JSONObject
-
 /**
  * Message layer inside the encrypted channel.  Mirrors
  * `windows/phonebridge/protocol/messages.py`.
@@ -30,7 +28,9 @@ object Messages {
 
     fun responseOk(id: Any?, result: Map<String, Any?>): ByteArray =
         Json.encodeToBytes(
-            Json.obj("k" to K_RESPONSE, "id" to id, "ok" to true, "result" to JSONObject(result as Map<*, *>))
+            // Json.obj converts nested maps recursively; wrapping in JSONObject
+            // here would only convert the top level.
+            Json.obj("k" to K_RESPONSE, "id" to id, "ok" to true, "result" to result)
         )
 
     fun responseErr(id: Any?, code: String, message: String): ByteArray =
@@ -45,7 +45,7 @@ object Messages {
 
     fun event(name: String, data: Map<String, Any?> = emptyMap()): ByteArray =
         Json.encodeToBytes(
-            Json.obj("k" to K_EVENT, "event" to name, "data" to JSONObject(data as Map<*, *>))
+            Json.obj("k" to K_EVENT, "event" to name, "data" to data)
         )
 
     /** Setup messages carry their own `k` and top-level fields. */

@@ -14,8 +14,7 @@ import org.json.JSONObject
 object Json {
     class JsonException(message: String) : Exception(message)
 
-    fun encodeToBytes(map: Map<String, Any?>): ByteArray =
-        encodeToBytes(JSONObject(map as Map<*, *>))
+    fun encodeToBytes(map: Map<String, Any?>): ByteArray = encodeToBytes(mapToJson(map))
 
     fun encodeToBytes(obj: JSONObject): ByteArray = obj.toString().toByteArray(Charsets.UTF_8)
 
@@ -49,9 +48,48 @@ object Json {
 
     fun obj(vararg pairs: Pair<String, Any?>): JSONObject {
         val o = JSONObject()
-        for ((k, v) in pairs) o.put(k, v ?: JSONObject.NULL)
+        for ((k, v) in pairs) o.put(k, wrap(v))
         return o
     }
 
-    fun mapToJson(map: Map<String, Any?>): JSONObject = JSONObject(map as Map<*, *>)
+    /**
+     * Build a JSONObject from a Kotlin map, converting nested values.
+     *
+     * `JSONObject.put` stores a nested `Map` as an ordinary object, and the
+     * encoder then prints it as `{a=1}` — a *string*, not JSON. The probe report
+     * and `system.info` are nested, so they must be converted explicitly. The
+     * previous implementation passed the map straight to `JSONObject(map)`, which
+     * only resolved the top level.
+     */
+    fun mapToJson(map: Map<String, Any?>): JSONObject {
+        val o = JSONObject()
+        for ((k, v) in map) o.put(k, wrap(v))
+        return o
+    }
+
+    private fun wrap(value: Any?): Any = when (value) {
+        null -> JSONObject.NULL
+        is Map<*, *> -> {
+            val o = JSONObject()
+            for ((k, v) in value) o.put(k.toString(), wrap(v))
+            o
+        }
+
+        is Iterable<*> -> {
+            val a = JSONArray()
+            for (v in value) a.put(wrap(v))
+            a
+        }
+
+        is Array<*> -> {
+            val a = JSONArray()
+            for (v in value) a.put(wrap(v))
+            a
+        }
+
+        // NaN/Infinity are not valid JSON and org.json would emit them verbatim.
+        is Double -> if (value.isFinite()) value else JSONObject.NULL
+        is Float -> if (value.isFinite()) value else JSONObject.NULL
+        else -> value
+    }
 }

@@ -1,0 +1,22 @@
+# Optional dependencies for the phases after Phase 1.
+#
+# Phase 1 (protocol, pairing, encrypted link, CLI) needs only the two packages
+# in windows/pyproject.toml: websockets and cryptography.  Nothing in this file
+# is imported by the Phase-1 code, and none of it is exercised by the test suite
+# on this machine - it is listed so that an install for Phase 2+ is one command:
+#
+#     pip install -e "windows[dev]" -r windows/requirements-phase2plus.txt
+#
+# `phonebridge doctor` reports which of these are present and why each is needed.
+#
+# Phase 2 - Bluetooth audio relay
+soundcard>=0.4          # WASAPI loopback capture of PC audio (Windows only)
+sounddevice>=0.4        # low-latency playback to the selected output device
+numpy>=1.26             # audio buffers, resampling
+av>=12.0                # Opus encode/decode (bundles libopus)
+
+# Phase 3 - desktop dashboard
+PySide6>=6.7
+
+# Phase 4 - camera / virtual webcam output
+pyvirtualcam>=0.11      # needs OBS Virtual Camera or Unity Capture installed

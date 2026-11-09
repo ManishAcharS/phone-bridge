@@ -39,6 +39,7 @@ import base64
 import hashlib
 import hmac
 import os
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Any
@@ -71,8 +72,38 @@ class HandshakeError(Exception):
     """Handshake failed (bad version, bad MAC, tampered transcript, ...)."""
 
 
+class PeerKeyChangedError(HandshakeError):
+    """The phone's identity key changed for a device we had pinned.
+
+    Distinct from a generic handshake failure because it must **never** be
+    retried in a loop: either the phone was reflashed, or someone is
+    substituting a device. Retrying would silently re-establish a session with
+    the wrong peer, which is exactly the attack pinning exists to stop.
+    """
+
+
+class ProtocolVersionError(HandshakeError):
+    """The peer speaks a different protocol version.
+
+    Also terminal: retrying cannot make the two implementations agree, and a
+    reconnect loop would hide the mismatch behind "reconnecting forever".
+    """
+
+
 class ReplayError(HandshakeError):
     """A frame arrived with a non-increasing counter."""
+
+
+class IdentityBindingError(HandshakeError):
+    """The peer's claimed device id is not the hash of the key it presented.
+
+    The id is *self-certifying*: ``sha256(static_public_key)[:16]``.  Checking
+    that is what stops a peer from claiming somebody else's id -- for instance
+    presenting itself under the id of a phone the PC has pinned, or of a PC the
+    phone has pinned, while using a key of its own.  The pin comparison would
+    also reject that, but only when the id happens to be known; for a
+    first-time (trust-on-first-use) connection nothing else would.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -93,6 +124,38 @@ def hkdf_sha256(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes
     return HKDF(
         algorithm=hashes.SHA256(), length=length, salt=salt, info=info
     ).derive(ikm)
+
+
+#: A device id is the first 16 lowercase hex chars of SHA-256(public point).
+DEVICE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+
+
+def device_id_for(public_raw: bytes) -> str:
+    """The self-certifying device id for a public key.
+
+    Must stay identical to the Kotlin ``Crypto`` implementation and to the
+    ``DEVICE_ID`` regex in ``BridgeServer.kt``.
+    """
+    return hashlib.sha256(public_raw).hexdigest()[:16]
+
+
+def check_identity_binding(claimed_id: object, public_raw: bytes) -> str:
+    """Return ``claimed_id`` if it really is the id of ``public_raw``.
+
+    Raises [IdentityBindingError] otherwise, so an unauthenticated peer cannot
+    pick its own id.
+    """
+    if not isinstance(claimed_id, str) or not DEVICE_ID_RE.match(claimed_id):
+        raise IdentityBindingError(
+            f"peer sent a malformed device id: {claimed_id!r}"
+        )
+    expected = device_id_for(public_raw)
+    if not hmac.compare_digest(claimed_id, expected):
+        raise IdentityBindingError(
+            "peer device id does not match its identity key "
+            f"(claimed {claimed_id}, key hashes to {expected}); refusing"
+        )
+    return claimed_id
 
 
 def public_key_from_raw(raw: bytes) -> ec.EllipticCurvePublicKey:
@@ -127,7 +190,7 @@ class Identity:
 
     @property
     def device_id(self) -> str:
-        return hashlib.sha256(self.public_raw).hexdigest()[:16]
+        return device_id_for(self.public_raw)
 
     def public_pem(self) -> bytes:
         return self.private_key.public_key().public_bytes(
@@ -198,6 +261,7 @@ class HandshakeInitiator:
         self._peer_static: bytes | None = None
         self._peer_eph: bytes | None = None
         self._snonce: bytes | None = None
+        self.peer_device_id: str | None = None
         self.keys: SessionKeys | None = None
 
     @property
@@ -227,18 +291,20 @@ class HandshakeInitiator:
         if msg.get("t") != "hello_ack":
             raise HandshakeError(f"expected hello_ack, got {msg.get('t')!r}")
         if msg.get("v") != PROTOCOL_VERSION:
-            raise HandshakeError(
+            raise ProtocolVersionError(
                 f"protocol version mismatch: phone speaks {msg.get('v')}, "
                 f"PC speaks {PROTOCOL_VERSION}"
             )
         peer_static = b64d(msg["static"])
+        # Before anything is pinned or paired: the id must certify the key.
+        self.peer_device_id = check_identity_binding(msg.get("id"), peer_static)
         required = (
             expected_peer_static
             if expected_peer_static is not None
             else self.expected_peer_static
         )
         if required is not None and not hmac.compare_digest(peer_static, required):
-            raise HandshakeError(
+            raise PeerKeyChangedError(
                 "phone identity key does not match the pinned key. "
                 "Refusing to connect: this may be a substituted device."
             )
@@ -286,14 +352,16 @@ class HandshakeResponder:
         if msg.get("t") != "hello":
             raise HandshakeError(f"expected hello, got {msg.get('t')!r}")
         if msg.get("v") != PROTOCOL_VERSION:
-            raise HandshakeError(
+            raise ProtocolVersionError(
                 f"protocol version mismatch: PC speaks {msg.get('v')}, "
                 f"phone speaks {PROTOCOL_VERSION}"
             )
         self._peer_static = b64d(msg["static"])
         self._peer_eph = b64d(msg["eph"])
         self._cnonce = b64d(msg["nonce"])
-        self.peer_device_id = str(msg["id"])
+        # Trust-on-first-use still needs the id to certify the key: otherwise a
+        # peer could present somebody else's id and be pinned under it.
+        self.peer_device_id = check_identity_binding(msg.get("id"), self._peer_static)
         self.peer_name = str(msg.get("name", "pc"))
 
         static_shared = self.identity.private_key.exchange(

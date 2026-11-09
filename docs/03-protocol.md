@@ -31,6 +31,13 @@ Transport: one envelope = one WebSocket **binary** frame. A text frame is a
 protocol violation (close 1003). The same envelope can be carried over a raw TCP
 stream using a length-prefix reassembler.
 
+**Who may open the socket.** The listener accepts native clients only: a
+handshake that carries an `Origin` header is refused with close `1008` before any
+session state is created. Browsers always send `Origin` and native clients never
+do, so this is what stops a web page -- which is not subject to the same-origin
+policy when it opens a WebSocket -- from driving the bridge or provoking pairing
+prompts. `docs/13-security-review.md` S1.
+
 ## 2. Handshake
 
 All handshake messages are `kind = 0x01`. Field names are snake-free lowercase.
@@ -58,6 +65,14 @@ authoritative answer arrives in `auth_ok` / `pair_required`.
 **Both sides must reject** `v != 1` with a version-mismatch error. If one side
 speaks v2 and the other v1, the connection fails loudly rather than
 misinterpreting fields.
+
+**Device ids are self-certifying.** `id` is `sha256(uncompressed public point)`
+in lowercase hex, first 16 characters, and each side MUST verify that the `id` it
+received really is the hash of the `static` key in the same message (malformed or
+mismatching ids are refused). Without it an unauthenticated peer could present
+itself under any id it liked -- including one the other side has pinned. The id
+in `hello_ack`/`auth_ok`/`pair_required` must also match the id from `hello`.
+`docs/13-security-review.md` S2.
 
 ### 2.3 Key derivation
 
@@ -122,6 +137,25 @@ Closing rules during setup:
   id is looked up in `peers.json`, and if found, `hello_ack.static` must match
   byte for byte.
 
+### 3.1 Limits, setup timeout and shutdown (added in Phase 1)
+
+None of this changes the wire format; it is behaviour both implementations are
+required to have, and each side has tests for it.
+
+| Situation | Behaviour |
+| --- | --- |
+| Peer connects and sends nothing | Close `1002` with reason `setup timeout` after 20 s. Applied on the phone before the first frame, and on the PC around `hello_ack`. |
+| Phone is at a session limit | Close `1008` with reason `too many connections from this device` (4 per device) or `server connection limit reached` (8 total). Sent **before** `auth_ok`/`pair_ok`, so the PC reports a refusal rather than a successful session that immediately vanished. |
+| Phone stops on purpose | Send BYE (`0x7F`, UTF-8 reason) inside the secure channel, then close `1000`. A BYE is a clean shutdown: the PC must not treat it as a network failure. |
+| PC closes on purpose | Send a CLOSE envelope (§1) and close `1000`. The phone treats it as a normal disconnect, not an error. |
+| Identity key of a known device changed | Close `1008`, reason `identity key changed for known device`. **Terminal**: the PC must not retry with the same pin. |
+| Protocol version mismatch | `auth_fail` with `reason: protocol version`, then close `1002`. **Terminal**: no retry, no fallback. |
+| Authentication refused | `auth_fail` inside the secure channel, then close `1008` with the reason. **Terminal**. |
+
+Both sides distinguish *terminal* failures (key change, version skew, refusal,
+declined pairing) from *transient* ones (socket drops, timeouts). Only transient
+failures are retried, with backoff.
+
 ## 4. Secure frames
 
 ```
@@ -181,19 +215,95 @@ exactly 16 bytes is dropped rather than treated as an error.
 
 * `id` is a positive integer chosen by the requester; `0` is reserved.
 * Error codes in use: `method_not_found`, `bad_params`, `internal`,
-  `bad_request`, `unsupported_by_device`.
+  `bad_request`, `unsupported_by_device`, `probe_failed` (the asynchronous
+  `audio.capabilities.run` worker could not complete a measurement; the session
+  stays open), `busy` (a request that is valid but cannot be started now --
+  currently: a second `audio.capabilities.run` while one is already running. The
+  phone refuses instead of queueing, because a probe can hold the microphone for
+  minutes and a queue of probes is an open recording session. The request may be
+  retried later; the session stays open).
 
 ### Implemented RPC methods (phone side)
 
 | method | result |
 | --- | --- |
-| `system.info` | device id, name, model, Android version, capabilities, protocol version |
+| `system.info` | device id, name, device block (see below), `capabilities`, `permissions`, protocol version |
 | `system.echo` | echoes `params.value` |
 | `session.stats` | frames/bytes counters, active connections |
 | `bluetooth.headset.status` | headset connected?, profile name, communication devices |
 | `audio.route.bluetooth` | Phase 2 placeholder that reports support honestly |
 | `audio.capabilities.run` | run the capability probe on the phone; result is the report object itself (see `docs/08-multi-device-test-strategy.md` §2). Params: `seconds` (5-300, default 30), `acoustic` (bool). **Long-running:** the phone answers from a worker thread and never blocks its read loop, so keep the client timeout generous (the CLI uses 420 s) |
 | `audio.capabilities.last` | `{available: bool, report?: object}` — the last probe run, so a reconnecting PC need not re-measure |
+
+#### Response schemas (normative)
+
+The phone answers `{"k":"res","id":<id>,"ok":true,"result":<result>}`; the
+implementations must agree on the **required** keys of every `result`. Extra
+keys are additive and must be ignored by a client. Types are JSON types.
+
+| method | required keys of `result` |
+| --- | --- |
+| `system.info` | `device_id` str, `name` str, `protocol_version` int, `capabilities` object, `permissions` object, plus the device block below (`model`, `manufacturer`, `brand`, `device`, `product`, `hardware`, `android_release`, `android_version`, `sdk_int`, `target_sdk`, `app_version`, `app_version_code`, `package`, `rom`, `rom_version`, `is_emulator`) |
+| `system.echo` | `echo` (whatever was passed in `params.value`, including absent), `at_ns` int |
+| `session.stats` | `frames_in` int, `frames_out` int, `bytes_in` int, `bytes_out` int, `connections` int |
+| `bluetooth.headset.status` | `connected` bool, `profile` str, `devices` array of `{id int, type str, type_id int, product str\|null, is_sink bool, is_source bool, sample_rates int[]}` |
+| `audio.route.bluetooth` | `supported` bool, `detail` str |
+| `audio.capabilities.run` | the probe report itself (schema in `docs/08` §2): `schema_version`, `source`, `device`, `route_output`, `route_input`, `duplex`, `latency` |
+| `audio.capabilities.last` | `available` bool; when true also `report` object with the schema above; when false `reason` str |
+
+`capabilities` (from `system.info`) has, for each of the eight keys, a bool
+`<key>`, a bool `hardware.<key>` and a string `detail.<key>`; the strings
+`audio.bluetooth_profile` and int `protocol_version` may also appear.
+
+Error replies are `{"k":"res","id":<id>,"ok":false,"error":{"code":str,"message":str}}`
+with one of the codes listed above. An unknown method **must** be answered with
+`method_not_found` and must not close the session.
+
+**There is no other operation.** File transfer (both directions), camera capture,
+sensor retrieval and audio capture/playback/relay have no method in this
+protocol: the message kinds `0x30 AUDIO`, `0x40 VIDEO`, `0x50 FILE` and `0x60
+SENSOR` are reserved numbers for later phases with no body format defined and no
+handler on either side. A client that invents a method name will receive
+`method_not_found`, which is the correct answer.
+
+#### `system.info` device block
+
+`device_id` and `name` as before, plus flat fields (all additive; nothing was
+removed): `model`, `manufacturer`, `brand`, `device`, `product`, `hardware`,
+`android_release`, `android_version` (same value, kept for older clients),
+`sdk_int`, `target_sdk`, `app_version`, `app_version_code`, `package`, `rom`,
+`rom_version`, `is_emulator`, `protocol_version`.
+
+#### Capability keys: measured, not asserted
+
+Two separate questions, deliberately kept apart:
+
+* `hardware.<key>` — does this phone have the hardware? Measured with the
+  platform APIs (camera enumeration via `CameraManager`, `SensorManager`, audio
+  device lists, Bluetooth feature flags). No permission is required to ask.
+* `<key>` — can PhoneBridge **use** it today? True only when the feature is
+  implemented, the hardware is present and any runtime permission is granted.
+* `detail.<key>` — one sentence explaining why a capability is not available.
+
+Keys: `audio.playback`, `audio.capture`, `audio.bluetooth_sco`, `camera.back`,
+`camera.front`, `sensors`, `file_transfer`, `bluetooth_scan`, plus the
+string-valued `audio.bluetooth_profile` and the integer `protocol_version`.
+
+In this phase every bare capability key is `false` on a real phone: the audio
+relay is Phase 2, camera streaming Phase 4, file transfer and sensors Phase 5.
+A PC must treat `hardware.*` as "what the device has" and the bare key as "what
+works now"; showing the former as if it were the latter is the bug this contract
+exists to prevent. The simulator (`tools/simulator/phone_sim.py`) reports
+`simulated: true` and may advertise capabilities the real app does not have yet —
+it is a protocol double, never evidence about a device.
+
+#### `permissions`
+
+`system.info.permissions` maps the short permission name to
+`granted` / `denied` / `permanently_denied` / `not_applicable`, for the runtime
+permissions this build declares (`RECORD_AUDIO`, `BLUETOOTH_CONNECT` on Android
+12+, `POST_NOTIFICATIONS` on Android 13+). A permission the app has not declared
+is never reported, and no permission is requested that the app does not use.
 
 Adding a method is backwards compatible: unknown methods return
 `method_not_found` rather than killing the session, so a newer PC can talk to an

@@ -42,8 +42,15 @@
         android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />
 
+    <!--
+      enableOnBackInvokedCallback opts in to predictive back. Android 16 makes it
+      the default for apps targeting SDK 36, so opting in now means back
+      behaviour does not change under us at the next targetSdk bump. The app has
+      no custom back handling, so the system gesture simply closes the activity.
+    -->
     <application
         android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true"
         android:icon="@drawable/ic_phonebridge"
         android:label="@string/app_name"
         android:supportsRtl="true"

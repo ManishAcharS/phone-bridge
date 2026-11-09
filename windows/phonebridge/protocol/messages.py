@@ -47,6 +47,20 @@ class ProtocolError(Exception):
     """Malformed control payload or an RPC-level failure."""
 
 
+class RpcError(ProtocolError):
+    """A handler refusing a request with a *specific* documented error code.
+
+    Plain [ProtocolError] always becomes ``bad_params``.  A refusal that is not
+    about the parameters -- "a probe is already running" (``busy``) -- needs its
+    own code so the PC can react to it instead of printing a misleading
+    argument error.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def handshake_msg(kind: str, **fields: Any) -> bytes:
     """Non-RPC protocol message inside the encrypted channel.
 
@@ -187,6 +201,8 @@ class RpcRouter:
             )
         try:
             result = handler(msg.get("params") or {})
+        except RpcError as exc:
+            return control_response_err(rpc_id, exc.code, str(exc))
         except ProtocolError as exc:
             return control_response_err(rpc_id, "bad_params", str(exc))
         except Exception as exc:  # noqa: BLE001 - never kill the session

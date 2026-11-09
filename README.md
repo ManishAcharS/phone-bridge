@@ -1,214 +1,329 @@
 # PhoneBridge
 
-Use an Android phone as an external hardware hub for a Windows PC — starting
-with Bluetooth headphones, over USB, Wi-Fi or the phone's hotspot. No cloud, no
-accounts, no internet access required.
+Use an Android phone as an external hardware hub for a Windows PC — a
+Bluetooth-headset relay, an encrypted control channel, and a place where the
+phone's hardware becomes reachable from the PC over USB, Wi-Fi or the phone's own
+hotspot. No cloud, no accounts, no internet connection required.
 
-This is a personal-use project for one phone and one PC.
+**Release 1.0.0** is the first public release. It ships a complete, verified PC
+client and a complete Android app, with one honest caveat stated up front: the
+Android app has never been run on a physical handset by this project (there is no
+device in CI and none available to the maintainer's automated checks). Everything
+that can be proven without a handset is proven, and
+[`docs/14-release-readiness.md`](docs/14-release-readiness.md) lists exactly what
+is left, item by item.
 
----
-
-## Status
-
-| Phase | Scope | State |
-| --- | --- | --- |
-| 0 | Feasibility, architecture, protocol | **done** → [`docs/01-feasibility.md`](docs/01-feasibility.md) |
-| 1 | Encrypted bidirectional link PC ↔ phone | **PC side verified (210 tests); Android side compiled/run only on your machine** → [`docs/06-phase1-audit.md`](docs/06-phase1-audit.md) |
-| 2 | Bluetooth audio relay (the defining feature) | next |
-| 3 | Desktop + phone dashboards | planned |
-| 4 | Camera and microphone | planned |
-| 5 | File transfer, Bluetooth manager, sensors | planned |
-| 6 | Reliability and polish | planned |
-
-Details and the per-feature reality check: [`docs/04-roadmap.md`](docs/04-roadmap.md).
-
-### The one thing to know before anything else
-
-PC audio *and* the headset microphone **cannot both be high quality**. A
-Bluetooth headset renders one profile at a time:
-
-* **A2DP** — stereo 44.1/48 kHz output, **no microphone**.
-* **HFP/SCO** — mono 8/16 kHz, **bidirectional**, so this is the only path that
-  carries the headset mic back to your PC, at call quality.
-
-PhoneBridge exposes both as explicitly labelled modes instead of pretending one
-of them is something it is not. Expected duplex latency is **70–150 ms
-one-way** — fine for Discord, Zoom, Meet and OBS monitoring; not for musical
-monitoring. Full reasoning: [`docs/01-feasibility.md`](docs/01-feasibility.md).
+| | |
+| --- | --- |
+| **PC client** | complete, 476 automated tests, type-checked, linted |
+| **Android app** | complete, compiled against a stub environment, source-audited |
+| **Protocol** | v1, frozen; wire format in [`docs/03-protocol.md`](docs/03-protocol.md) |
+| **Audio relay** | **not implemented** — Phase 2, gated on per-device measurements |
 
 ---
 
-## What works today (Phase 1)
+## What works today
 
-A real, encrypted, bidirectional channel between the PC and the phone, with:
+| Capability | State |
+| --- | --- |
+| Encrypted, authenticated PC ↔ phone channel | **works** |
+| Pairing with a six-digit code, identity pinning afterwards | **works** |
+| USB (`adb forward` or USB tethering), Wi-Fi, phone hotspot | **works** |
+| Automatic reconnection with jittered backoff | **works** |
+| Discovery beacon (no typing IP addresses) | **works** |
+| Phone information, capability and permission reporting | **works** |
+| Live session statistics, headset/routing state, RTT and throughput | **works** |
+| Binary streams (byte-exact to 1 MiB) | **works** |
+| Audio capability probe (measures what the handset can actually do) | **works** |
+| Bluetooth audio relay (the sound itself) | **Phase 2 — not implemented** |
+| Camera, sensors, file transfer, Bluetooth scan | **not in protocol v1** |
 
-* P-256 ECDH handshake, HKDF-SHA256 session keys, AES-256-GCM frames
-* SAS-verified first-time pairing, identity pinning afterwards
-* JSON RPC + events + multiplexed binary streams
-* PING/PONG latency measurement
-* Automatic reconnection with jittered exponential backoff
-* UDP discovery beacon (no typing IP addresses)
-* USB (adb forward *or* USB tethering), Wi-Fi and hotspot transports
-
-Measured on loopback with the reference phone implementation:
-application RTT **0.29–0.78 ms**, 30 MB/s encrypted payload, **210 tests passing**
-(including 39 that check the Kotlin implementation's constants and known-answer
-vectors against the Python reference, so the two cannot silently drift).
+`phonebridge capabilities` never guesses: it separates what the phone *has*
+(`hardware.*`) from what PhoneBridge can *currently deliver* (`usable`) and
+explains every "no" with the phase that will implement it. The app's own card
+does the same.
 
 ---
 
-## Quick start — PC side
+## Requirements
 
-Requires Windows 10/11 and Python 3.10+.
+**PC** — Windows 10 or 11, Python 3.10–3.13. Linux and macOS work for the PC
+client too (they are how the test suite is run), but Windows is the supported
+target.
+
+**Phone** — Android 8.0 (API 26) or newer. No root, no developer options needed
+for Wi-Fi or hotspot; USB development mode needs `adb` on the PC.
+
+---
+
+## Installation
+
+### 1. The PC client
+
+From a PowerShell window, in the repository root:
 
 ```powershell
 cd windows
 python -m venv .venv
 .venv\Scripts\activate
-pip install -e ".[dev]"
-
-phonebridge doctor          # what this PC can do (Phase 0 audit)
-phonebridge identity        # this PC's device id and pinned phones
-
-# one command that runs every check this repo can run without a phone:
-python tools\verify.py
+pip install .                # or: pip install -e ".[dev]" to work on the code
+phonebridge --version        # -> phonebridge 1.0.0 (protocol v1, Python 3.x)
 ```
 
-`python -m phonebridge ...` works identically if the `phonebridge` script is not
-on PATH.
+`pip install phonebridge` from a package index works the same way once the
+package is published. `python -m phonebridge ...` behaves identically if the
+`phonebridge` command is not on `PATH`.
 
-Also run the deeper Windows audit once and keep the output:
+Check the environment:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\diagnostics\env_report.ps1 -OutFile audit.txt
+phonebridge doctor                                     # interpreter, packages, adb, firewall notes
+powershell -ExecutionPolicy Bypass -File tools\diagnostics\env_report.ps1   # fuller audit (optional)
+python tools\verify.py                                 # tests + lint + types + vectors + CLI smoke
 ```
 
-## Quick start — phone side
+### 2. The Android app
 
-Requires Android Studio (JDK 17 + Android SDK come with it) and a phone on
-Android 8.0+.
-
-The Gradle wrapper is committed, so a fresh clone builds without installing
-Gradle. Full instructions — SDK components, phone installation, the on-device
-self-test, and connection troubleshooting — are in
-[`docs/07-device-testing-guide.md`](docs/07-device-testing-guide.md).
+Two ways, detailed in [`docs/07-device-testing-guide.md`](docs/07-device-testing-guide.md):
 
 ```powershell
-# Option A: File -> Open -> phone-bridge\android, then Build APK(s)
-# Option B: command line (needs JDK 17 + SDK Platform 34)
+# A. Android Studio: File -> Open -> android\  then Run 'app'
+# B. Command line (needs JDK 17 + Android SDK platform 34)
 cd android
 .\gradlew.bat assembleDebug
 adb install -r app\build\outputs\apk\debug\app-debug.apk
 ```
 
-Then in the app: flip **Bridge** on, and press **Run protocol self-test**. All
-checks must pass — that proves the phone's crypto matches the PC's. If any check
-fails, stop there and send me the output.
+A **signed release APK** needs your own keystore — see
+[`docs/14-release-readiness.md`](docs/14-release-readiness.md) §3. `gradlew
+assembleRelease` without `android/keystore.properties` produces an unsigned APK
+that cannot be installed.
 
-## Connecting
+### 3. First run on the phone
 
-The phone always listens on TCP 8765; the PC always dials out. Pick whichever
-path you have:
+1. Open **PhoneBridge**, read the **Start here** card, and turn **Bridge** on.
+2. The status bar shows the address to use, e.g. `ws://192.168.1.42:8765`.
+3. Press **Run protocol self-test**: all checks must pass. This proves the
+   phone's crypto matches the PC's before you trust anything else.
+4. Grant the permissions you actually want. Each one is requested at the moment
+   it is needed and the **Permissions** card explains every state, including
+   "blocked by Android" (which only the system settings app can change).
+
+---
+
+## Pairing
+
+The phone always listens; the PC always dials out.
 
 ```powershell
-# USB, development only (adb must stay running)
+# USB (development): forward the port, then connect to localhost
 adb forward tcp:8765 tcp:8765
 phonebridge info --host 127.0.0.1
 
-# USB, standalone: enable "USB tethering" on the phone, then use its new address
-phonebridge info --host 192.168.42.129
-
-# Wi-Fi or hotspot: the phone's IP on that network
-phonebridge discover                 # listen for the beacon instead of typing an IP
+# Wi-Fi or hotspot: find the phone instead of typing its address
+phonebridge discover
 phonebridge info --host 192.168.43.1
 ```
 
-First connection asks you to compare a six-digit code between the phone screen
-and the terminal. If the codes differ, someone is intercepting — answer `n`.
+On the first connection **both screens show a six-digit code**. Compare them:
 
-Then:
+* identical → press **allow** on the phone and answer `y` on the PC;
+* different → answer `n` and stop. Someone is intercepting the connection.
+
+After that the two identity keys are pinned. A later key change is refused
+outright — re-pairing is an explicit action (**Forget all paired PCs** on the
+phone, `phonebridge forget` on the PC), never an automatic one.
+
+`--auto-pair` exists for scripts and tests only: it accepts the code without
+comparing it and prints a warning when used.
+
+---
+
+## Day-to-day use
 
 ```powershell
-phonebridge ping  --host <ip> --count 20
-phonebridge bench --host <ip> --frames 3000 --size 1024
-phonebridge watch --host <ip>          # live events + auto-reconnect
+phonebridge devices                    # paired phones + live beacons
+phonebridge info --device "Pixel 7"    # no IP needed after the first connection
+phonebridge capabilities               # hardware vs usable, with reasons
+phonebridge audio status               # headset, profile, relay state
+phonebridge ping  --count 20           # application-level RTT
+phonebridge bench --frames 3000        # encrypted throughput
+phonebridge watch                      # events + automatic reconnection
+phonebridge selftest                   # every supported workflow, end to end
 ```
 
-## Verify without a phone
+Every command supports `--json`, and `capabilities --require <key>` turns the
+capability report into a gate (exit 4) for scripting. Full reference, exit codes
+and examples: [`docs/11-pc-client.md`](docs/11-pc-client.md).
 
-The reference phone implementation is part of the repo, so the whole protocol,
-pairing flow and reconnect logic can be exercised on one machine:
+---
+
+## Supported capabilities
+
+The phone reports eight capability keys. `usable` means *implemented in
+PhoneBridge v1 **and** the hardware is present **and** the Android permission is
+granted* — all three, or it is `false`.
+
+| Key | Meaning | Usable in 1.0.0 |
+| --- | --- | --- |
+| `audio.playback` | audio can be rendered to a communication device | no — Phase 2 |
+| `audio.capture` | microphone can be read | no — Phase 2 |
+| `audio.bluetooth_sco` | a bidirectional HFP/SCO headset link is available | no — Phase 2 |
+| `camera.back` | rear camera present | no — not in protocol v1 |
+| `camera.front` | front camera present | no — not in protocol v1 |
+| `sensors` | motion/environment sensors present | no — not in protocol v1 |
+| `file_transfer` | files can be moved in either direction | no — not in protocol v1 |
+| `bluetooth_scan` | nearby Bluetooth devices can be listed | no — not in protocol v1 |
+
+What *is* available in 1.0.0 is the measurement itself: the capability probe
+(`phonebridge compat run`, or **Capability probe** in the app) records what the
+handset really does — including the awkward case where Android *declares*
+off-call SCO but delivers silence — and stores it per device in a report
+([`docs/09-compat-report.md`](docs/09-compat-report.md)).
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| `cannot connect to ws://…: Connection refused` | Bridge is off in the app, or the port is wrong. Check the address on the phone's screen. |
+| `timed out connecting …` | Wrong IP (phone changed Wi-Fi), or Windows Firewall is blocking `python.exe` on Private networks. |
+| Works on USB, not on Wi-Fi | The access point uses client isolation. Use the phone's hotspot instead, or USB tethering. |
+| `discover` finds nothing | Same as above, plus: broadcast does not cross subnets. Type the IP. |
+| `phone identity key does not match the pinned key` | The phone was reflashed, or someone is substituting it. If you expect it, `phonebridge forget <id>` and re-pair. Never ignore this. |
+| Pairing prompt never appears | Pairing needs an interactive terminal — the code must be compared by a human. Run the command in a terminal window, not from a script. |
+| `pinning store … corrupt` | `%LOCALAPPDATA%\PhoneBridge\peers.json` is unreadable. PhoneBridge refuses to guess which phones you trust: fix or delete the file, then re-pair. |
+| Phone shows "no LAN address" | Wi-Fi is off and USB tethering is not enabled. Use `adb forward` or join a network. |
+| App stopped after a while | Android battery optimisation killed the service. Allow PhoneBridge to run in the background (**Settings → Apps → PhoneBridge → Battery → Unrestricted**). |
+| `adb: device unauthorized` | Accept the USB debugging prompt on the phone. |
+
+More: [`docs/11-pc-client.md`](docs/11-pc-client.md) §13 and
+[`docs/07-device-testing-guide.md`](docs/07-device-testing-guide.md).
+
+---
+
+## Known limitations
+
+Written down so nobody has to discover them:
+
+* **No audio relay yet.** The phone measures its audio routing; it does not carry
+  sound. Phase 2, gated on per-handset measurements.
+* **No camera, sensors, file transfer or Bluetooth scanning.** Protocol v1 has
+  reserved message kinds for these and no implementation, and the docs say so
+  rather than shipping dead UI.
+* **Android app not verified on a handset by this project.** See
+  [`docs/14-release-readiness.md`](docs/14-release-readiness.md).
+* **Targets Android API 34.** That runs correctly on Android 16, but Google Play
+  requires API 36 for new uploads as of August 2026 — a blocker for Play
+  distribution, not for sideloading. Upgrade path in the release checklist.
+* **Trust on first use.** The six-digit code is the only defence against an
+  active attacker on the very first connection.
+* **Identity keys are stored unencrypted** (mode 0600 on the PC, app-private
+  storage on the phone). A compromised OS can impersonate the device.
+* **Any paired PC can call every method.** There is no per-method authorization
+  or audit log beyond the in-memory log.
+* **One phone per PC at a time** in the CLI; the phone supports up to 8 sessions
+  (4 per PC).
+* **PowerShell 5.1 quirks** are documented in [`docs/11-pc-client.md`](docs/11-pc-client.md);
+  `pwsh` 7 is recommended but not required.
+
+The full list with reasoning: [`docs/13-security-review.md`](docs/13-security-review.md) §6
+and [`docs/16-known-limitations.md`](docs/16-known-limitations.md).
+
+---
+
+## Verify the installation
+
+```powershell
+cd windows
+python -m pytest -q          # 476 tests
+python tools\verify.py       # tests + lint + types + vectors + CLI smoke (7 checks)
+```
+
+The reference phone implementation is part of the repository, so the whole
+protocol — handshake, pairing, RPC, streams, reconnection — can be exercised on
+one machine, with no phone:
 
 ```powershell
 python tools\simulator\phone_sim.py --port 8765 --pair-policy auto
-# in another terminal:
-cd windows
-python -m pytest -q                    # 210 tests
+# second terminal:
+phonebridge info --host 127.0.0.1 --auto-pair
+phonebridge selftest --host 127.0.0.1
 ```
+
+A green run here says the **PC side** is correct. It says nothing about the
+Android app; that needs a device and the checklist in
+[`docs/12-end-to-end-verification.md`](docs/12-end-to-end-verification.md) §5.
 
 ---
 
 ## Repository layout
 
 ```
-docs/                       feasibility, architecture, protocol, roadmap,
-                            Phase-1 audit and connection-verification procedure
+docs/                       architecture, protocol, guides, audits, release docs
 windows/phonebridge/
   protocol/                 framing, crypto, messages  (canonical reference)
   transport/                WebSocket link, UDP discovery
   core/                     session, reconnection supervisor, device store
   cli/                      the `phonebridge` command
-windows/tests/              210 tests: framing, crypto, replay, end-to-end,
-                            regressions, Kotlin<->Python conformance, and the
-                            Kotlin source rules only a real build used to catch
+windows/tests/              476 tests
 android/app/src/main/java/dev/phonebridge/
-  protocol/                 byte-identical Kotlin port + self-test vectors
-  net/                      server, pairing store, identity, discovery, audio probe
+  protocol/                 byte-identical Kotlin port + known-answer vectors
+  net/                      server, pairing store, identity, discovery, probes
   service/                  foreground service + UI state
-tools/simulator/            phone reference implementation (testing)
+tools/simulator/            reference phone implementation (testing)
 tools/vectorgen/            generates vectors.json AND ProtocolVectors.kt
-tools/verify.py             one command: tests + lint + vectors + wrapper + CLI smoke
-tools/simulator/            reference phone; can imitate any of the three devices
-tools/diagnostics/          Windows environment audit
+tools/verify.py             one command: tests + lint + types + vectors + CLI smoke
 ```
+
+---
 
 ## Security in one paragraph
 
-Each device has a long-lived ECDH P-256 identity. Sessions mix static and
+Each device has a long-lived ECDH P-256 identity key. A session mixes static and
 ephemeral ECDH through HKDF-SHA256, so a man-in-the-middle cannot derive the
-keys. Frames are AES-256-GCM with a separate key per direction, a transmitted
-counter bound into the AEAD tag, and strict monotonic checks that reject replays.
-First pairing is trust-on-first-use hardened by a six-digit code both sides must
-match; afterwards the identity keys are pinned locally and a changed key is
-refused rather than silently accepted. Keys never leave the two machines.
-`%LOCALAPPDATA%\PhoneBridge` on the PC (files mode 0600) and app-private storage
-on the phone.
+keys; frames are AES-256-GCM with a separate key per direction, the transmitted
+counter is bound into the AEAD tag, and monotonic checks reject replays. First
+pairing is trust-on-first-use hardened by a six-digit code both sides must match;
+afterwards identity keys are pinned and a changed key is refused rather than
+silently accepted. Device ids are self-certifying (the hash of the key), browser
+origins are refused at the socket, and the pairing code is never written to a
+log. Keys never leave the two machines. Full review with severities, fixes and
+residual risk: [`docs/13-security-review.md`](docs/13-security-review.md).
 
 ## Deliberate non-goals
 
 * **Not a Bluetooth adapter emulator.** Android's A2DP *sink* is not in the
-  public SDK, so Windows will never list your headphones as a PhoneBridge
-  device. It is a relay, and the docs say so.
+  public SDK, so Windows will never list your headphones as a PhoneBridge device.
+  It is a relay, and the docs say so.
 * **No custom Windows drivers.** A virtual microphone or camera needs a signed
-  kernel driver. PhoneBridge reuses an existing one — VB-Audio Cable for audio,
-  OBS Virtual Camera / Unity Capture for video — and only where the direction
-  actually requires it. PC → phone audio needs no driver at all (WASAPI loopback).
+  kernel driver; PhoneBridge reuses existing ones (VB-Audio Cable, OBS Virtual
+  Camera) only where the direction requires it.
 * **No cloud, no telemetry, no accounts.** Nothing leaves your two machines.
 
-## Where to look next
+---
+
+## Documentation
 
 | I want to… | Read |
 | --- | --- |
-| understand what the hardware allows | [`docs/01-feasibility.md`](docs/01-feasibility.md) |
-| see the module layout and security model | [`docs/02-architecture.md`](docs/02-architecture.md) |
+| install and pair, step by step | [`docs/07-device-testing-guide.md`](docs/07-device-testing-guide.md) |
+| use the PC command line | [`docs/11-pc-client.md`](docs/11-pc-client.md) |
+| know what is verified, and how | [`docs/12-end-to-end-verification.md`](docs/12-end-to-end-verification.md) |
+| read the security review | [`docs/13-security-review.md`](docs/13-security-review.md) |
+| ship a build / see what blocks release | [`docs/14-release-readiness.md`](docs/14-release-readiness.md) |
+| know what runs where | [`docs/15-compatibility-report.md`](docs/15-compatibility-report.md) |
+| see every limitation | [`docs/16-known-limitations.md`](docs/16-known-limitations.md) |
+| understand the hardware reality | [`docs/01-feasibility.md`](docs/01-feasibility.md) |
+| see the module layout | [`docs/02-architecture.md`](docs/02-architecture.md) |
 | implement against the wire format | [`docs/03-protocol.md`](docs/03-protocol.md) |
-| know what is next | [`docs/04-roadmap.md`](docs/04-roadmap.md) |
-| **install and test on my phone** | [`docs/07-device-testing-guide.md`](docs/07-device-testing-guide.md) |
-| **measure the three phones** | [`docs/08-multi-device-test-strategy.md`](docs/08-multi-device-test-strategy.md) |
-| **see the per-device results** | [`docs/09-compat-report.md`](docs/09-compat-report.md) |
-| **verify my own setup** | [`docs/05-connection-verification.md`](docs/05-connection-verification.md) |
-| see what was audited and what is still unproven | [`docs/06-phase1-audit.md`](docs/06-phase1-audit.md) |
+| know what comes next | [`docs/04-roadmap.md`](docs/04-roadmap.md) |
+| verify my own setup | [`docs/05-connection-verification.md`](docs/05-connection-verification.md) |
+| measure my three phones | [`docs/08-multi-device-test-strategy.md`](docs/08-multi-device-test-strategy.md) |
+| see per-device audio results | [`docs/09-compat-report.md`](docs/09-compat-report.md) |
+| read the Android completion notes | [`docs/10-android-app-completion.md`](docs/10-android-app-completion.md) |
 
 ## License
 
-Personal use. MIT.
+MIT.

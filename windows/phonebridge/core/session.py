@@ -26,6 +26,8 @@ from ..protocol.crypto import (
     HandshakeError,
     HandshakeInitiator,
     Identity,
+    PeerKeyChangedError,
+    ProtocolVersionError,
     SecureCodec,
 )
 from ..protocol.framing import (
@@ -47,23 +49,48 @@ from ..protocol.messages import (
     RpcIdSource,
     control_event,
     control_request,
+    control_response_err,
     decode_control,
     handshake_msg,
     parse_ping,
     pong_payload,
 )
 from ..transport.link import LinkError, WebSocketLink, websocket_uri
-from .device_store import DeviceStore
+from .device_store import DeviceStore, StoreCorruptError
+from .sanitize import device_label, printable
 
 log = logging.getLogger("phonebridge.session")
+
+#: How many frames / bytes the phone may send before the handshake completes.
+#: Everything before that point is unauthenticated, so a peer that opens a socket
+#: and then streams thousands of junk frames costs us CPU and memory for free.
+#: A genuine phone sends exactly three frames (HELLO is ours; HELLO_ACK, the
+#: auth reply and sometimes one empty frame arrive from it).
+HANDSHAKE_FRAME_BUDGET = 32
+HANDSHAKE_BYTE_BUDGET = 256 * 1024
 
 
 class SessionError(Exception):
     """The session could not be established or was aborted by the user."""
 
 
-class PairingRejected(SessionError):
-    """The user (or the phone) refused to pair."""
+class TerminalSessionError(SessionError):
+    """A failure that retrying cannot fix.
+
+    The supervisor stops on this and reports ``closed`` instead of looping:
+    a changed identity key, a protocol-version mismatch, or the phone refusing
+    authentication. Without it, ``watch`` would reconnect forever against a
+    device that is deliberately being refused - and, worse, a substituted
+    device would keep getting handshakes.
+    """
+
+
+class PairingRejected(TerminalSessionError):
+    """The user (or the phone) refused to pair.
+
+    Terminal on purpose: retrying would re-prompt the user on every attempt for
+    a decision they already made. Re-pairing is an explicit action, not a retry.
+    """
 
 
 @dataclass
@@ -139,7 +166,7 @@ class BridgeSession:
         # PING/PONG waiters keyed by the timestamp we sent, so concurrent pings
         # cannot clobber each other (they used to share a single dict slot).
         self._pong_waiters: dict[int, asyncio.Future[Any]] = {}
-        self._blob_waiters: dict[int, asyncio.Queue[bytes]] = {}
+        self._blob_waiters: dict[int, asyncio.Queue[bytes | None]] = {}
         self._rpc_ids = RpcIdSource()
         self._closed = asyncio.Event()
         self._close_reason: str | None = None
@@ -152,12 +179,24 @@ class BridgeSession:
     # lifecycle
     # ------------------------------------------------------------------ #
     async def open(self) -> BridgeSession:
-        await self._link.open()
+        try:
+            await self._link.open()
+        except LinkError as exc:
+            # A refused TCP connection is an establishment failure like any
+            # other. It used to escape as a raw LinkError, so every caller that
+            # documented "SessionError on failure" - the CLI included - got a
+            # traceback instead of the message it already knows how to print.
+            raise SessionError(str(exc)) from exc
         try:
             await self._handshake()
-        except (PairingRejected, SessionError):
+        except TerminalSessionError:
             await self._link.close("handshake failed")
             raise
+        except (PeerKeyChangedError, ProtocolVersionError) as exc:
+            # Both are permanent disagreements with this peer, so they must
+            # survive as terminal errors instead of collapsing into SessionError.
+            await self._link.close("handshake failed")
+            raise TerminalSessionError(str(exc)) from exc
         except (HandshakeError, FramingError, LinkError) as exc:
             await self._link.close("handshake failed")
             raise SessionError(str(exc)) from exc
@@ -180,10 +219,11 @@ class BridgeSession:
         self._close_reason = reason
         self._closed.set()
         if self._codec is not None:
-            try:  # noqa: SIM105
+            try:
                 await self._link.send(encode_json_envelope(KIND_CLOSE, {"reason": reason}))
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # Expected when the link is already gone; not silent.
+                log.debug("could not send CLOSE frame: %s", exc)
         if self._read_task is not None:
             self._read_task.cancel()
             try:  # noqa: SIM105
@@ -208,7 +248,17 @@ class BridgeSession:
     async def _handshake(self) -> None:
         initiator = HandshakeInitiator(self.identity)
         await self._link.send(initiator.hello())
-        ack = decode_envelope(await self._link.recv())
+        try:
+            raw_ack = await asyncio.wait_for(self._link.recv(), self.request_timeout)
+        except asyncio.TimeoutError as exc:
+            # A peer that accepts the socket and then says nothing used to hang
+            # open() forever: there was a timeout for every later step but not
+            # for the very first one.
+            raise SessionError(
+                f"phone accepted the connection but sent no HELLO_ACK within "
+                f"{self.request_timeout:.0f}s"
+            ) from exc
+        ack = decode_envelope(raw_ack)
 
         # Pin check before any key material is derived: find the claimed device
         # id in our local peer list and require the *exact* pinned key.
@@ -216,14 +266,26 @@ class BridgeSession:
             ack_json = ack.as_json()
         except Exception as exc:  # noqa: BLE001
             raise SessionError(f"malformed HELLO_ACK from phone: {exc}") from exc
-        claimed_id = str(ack_json.get("id", ""))
-        pinned = self.store.find_peer(claimed_id) if claimed_id else None
+        claimed_id = ack_json.get("id")
+        try:
+            pinned = (
+                self.store.find_peer(claimed_id)
+                if isinstance(claimed_id, str) and claimed_id
+                else None
+            )
+        except StoreCorruptError as exc:
+            # Fail closed: without a readable pin list we cannot tell a pinned
+            # phone from a substituted one, so we do not connect at all.
+            raise TerminalSessionError(str(exc)) from exc
         expected = pinned.static_key if pinned is not None else None
 
         keys = initiator.on_hello_ack(ack, expected_peer_static=expected)
         self._peer_static_bytes = initiator.peer_static
         self._codec = SecureCodec.for_client(keys)
-        log.debug("handshake keys derived, SAS=%s", keys.sas_digits)
+        # The SAS is a value for a human to compare, not something to write into
+        # a log file: anyone who can read the log would learn the code that the
+        # comparison is supposed to be independent of.
+        log.debug("handshake keys derived (pairing code withheld from the log)")
 
         # Authenticate inside the encrypted channel: successful AEAD decryption
         # already proves the peer holds both static and ephemeral private keys
@@ -236,26 +298,70 @@ class BridgeSession:
                 proto=PROTOCOL_VERSION,
             )
         )
-        reply = await self._expect_control({"auth_ok", "pair_required", "auth_fail"})
+        reply = await self._expect_control(
+            {"auth_ok", "pair_required", "auth_fail", "pair_fail"}
+        )
+
+        if reply["k"] == "pair_fail":
+            # The phone can refuse before it ever asks to pair: too many pending
+            # requests, or pairing switched off. That is a decision, not a
+            # protocol error, and its reason belongs in front of the user.
+            raise TerminalSessionError(
+                "phone refused pairing: "
+                f"{printable(reply.get('reason'), limit=120) or 'no reason given'}"
+            )
 
         if reply["k"] == "auth_fail":
-            raise SessionError(f"phone refused authentication: {reply.get('reason')}")
+            # The phone refused this identity outright (version skew, identity
+            # mismatch, or a pin it no longer honours). Retrying is pointless.
+            raise TerminalSessionError(
+                f"phone refused authentication: {printable(reply.get('reason'), limit=120)}"
+            )
+
+        # The device id was certified by HELLO_ACK (sha256 of the key we are now
+        # talking to). Every later message must name the same device, or the
+        # phone is trying to be two devices at once.
+        peer_id = initiator.peer_device_id
+        reply_id = reply.get("id")
+        if peer_id is None or reply_id != peer_id:
+            raise SessionError(
+                "phone identified itself inconsistently: HELLO_ACK claimed "
+                f"{peer_id!r}, the authenticated reply claimed {reply_id!r}"
+            )
+        phone_name = device_label(reply.get("name"), fallback="android-phone")
 
         if reply["k"] == "auth_ok":
             self.phone = PhoneInfo(
-                device_id=str(reply.get("id", "")),
-                name=str(reply.get("name", "android-phone")),
+                device_id=peer_id,
+                name=phone_name,
                 paired=True,
                 sas_digits=keys.sas_digits,
                 capabilities=reply.get("capabilities") or {},
             )
+            # auth_ok means the phone has *us* pinned. If our own pin list does
+            # not know it (fresh profile, restored backup, deleted peers.json),
+            # that must not silently downgrade this PC to unpinned trust: the
+            # key we just proved is the phone's key, and the phone trusted us
+            # first, so recording it restores mutual pinning.
+            if pinned is None:
+                static_bytes = self._peer_static_bytes
+                if static_bytes is None:  # pragma: no cover - set just above
+                    raise SessionError("internal error: peer identity key missing")
+                try:
+                    self.store.pin_peer(peer_id, phone_name, static_bytes)
+                    log.info(
+                        "%s was already paired with this PC but not pinned here; "
+                        "re-pinned its identity key", phone_name,
+                    )
+                except (StoreCorruptError, ValueError) as exc:
+                    raise TerminalSessionError(str(exc)) from exc
             self._mark_seen()
             return
 
         # ---- first-time pairing -------------------------------------- #
         self.phone = PhoneInfo(
-            device_id=str(reply.get("id", "")),
-            name=str(reply.get("name", "android-phone")),
+            device_id=peer_id,
+            name=phone_name,
             paired=False,
             sas_digits=keys.sas_digits,
             capabilities=reply.get("capabilities") or {},
@@ -279,13 +385,27 @@ class BridgeSession:
             raise PairingRejected(
                 f"phone rejected pairing: {final.get('reason', final['k'])}"
             )
-        if self._peer_static_bytes is None:
+        static_bytes = self._peer_static_bytes
+        if static_bytes is None:
             raise SessionError("internal error: peer identity key was not captured")
-        self.store.pin_peer(
-            self.phone.device_id, self.phone.name, self._peer_static_bytes
-        )
+        try:
+            self.store.pin_peer(self.phone.device_id, self.phone.name, static_bytes)
+        except (StoreCorruptError, ValueError) as exc:
+            # The phone already stored us; without a local pin this PC would
+            # reconnect unpinned, so stop and make the user fix the store.
+            raise TerminalSessionError(str(exc)) from exc
         self._mark_seen()
         log.info("paired with %s and pinned its identity key", self.phone.name)
+
+    def _close_detail(self) -> str:
+        """Human-readable close code/reason for error messages."""
+        info = getattr(self._link, "close_info", None)
+        if info is None:
+            return "no close detail"
+        code, reason = info
+        if code is None:
+            return "no close frame"
+        return f"{code}: {reason}" if reason else str(code)
 
     def _mark_seen(self) -> None:
         if self.phone is None:
@@ -296,16 +416,45 @@ class BridgeSession:
 
     async def _expect_control(self, accepted: set[str]) -> dict[str, Any]:
         deadline = time.monotonic() + self.request_timeout
+        frames = 0
+        received = 0
         while True:
+            frames += 1
+            if frames > HANDSHAKE_FRAME_BUDGET:
+                raise SessionError(
+                    "phone sent more than "
+                    f"{HANDSHAKE_FRAME_BUDGET} frames without finishing the "
+                    "handshake; refusing (nothing is authenticated yet)"
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SessionError(
                     f"timed out waiting for {sorted(accepted)} from the phone"
                 )
-            raw = await asyncio.wait_for(self._link.recv(), remaining)
+            try:
+                raw = await asyncio.wait_for(self._link.recv(), remaining)
+            except LinkError as exc:
+                # The phone refuses a session by closing with 1008 and a reason
+                # ("too many connections from this device"). Dropping that text
+                # left the user with "phone closed the connection" and no cause.
+                raise SessionError(
+                    f"phone closed the connection during setup ({self._close_detail()}): {exc}"
+                ) from exc
+            received += len(raw)
+            if received > HANDSHAKE_BYTE_BUDGET:
+                raise SessionError(
+                    "phone sent more than "
+                    f"{HANDSHAKE_BYTE_BUDGET} bytes without finishing the "
+                    "handshake; refusing"
+                )
             env = decode_envelope(raw)
             if env.kind == KIND_CLOSE:
-                raise SessionError("phone closed the connection during setup")
+                reason = "phone closed the connection during setup"
+                try:
+                    detail = str(env.as_json().get("reason") or "")
+                except FramingError:
+                    detail = ""
+                raise SessionError(f"{reason} ({detail})" if detail else reason)
             if env.kind != KIND_SECURE or self._codec is None:
                 raise SessionError("phone sent plaintext during an encrypted session")
             msg_type, _stream, payload = self._codec.unseal(env)
@@ -328,7 +477,11 @@ class BridgeSession:
                 raw = await self._link.recv()
                 env = decode_envelope(raw)
                 if env.kind == KIND_CLOSE:
-                    reason = env.as_json().get("reason", "phone closed") if env.body else "phone closed"
+                    try:
+                        reason = str(env.as_json().get("reason") or "phone closed")
+                    except FramingError:
+                        # A malformed CLOSE body is still a clean close.
+                        reason = "phone closed"
                     break
                 if env.kind != KIND_SECURE or self._codec is None:
                     raise SessionError("received plaintext frame mid-session")
@@ -338,7 +491,10 @@ class BridgeSession:
                 self._dispatch(msg_type, stream_id, payload)
         except asyncio.CancelledError:
             raise
-        except (HandshakeError, ProtocolError, LinkError) as exc:
+        except LinkError as exc:
+            reason = f"{exc} ({self._close_detail()})"
+            log.warning("session read loop ended: %s", reason)
+        except (HandshakeError, ProtocolError) as exc:
             reason = str(exc)
             log.warning("session read loop ended: %s", exc)
         except Exception as exc:  # noqa: BLE001
@@ -375,7 +531,13 @@ class BridgeSession:
             if q is not None:
                 q.put_nowait(payload)
         elif msg_type == MSG_BYE:
-            log.info("phone said bye: %s", payload.decode("utf-8", "replace"))
+            reason = payload.decode("utf-8", "replace").strip() or "phone said bye"
+            # A BYE is the phone's clean shutdown: honour it as a close so the
+            # supervisor reconnects with the real reason in hand.
+            log.info("phone said bye: %s", reason)
+            self._close_reason = reason
+            self._closed.set()
+            self._fail_pending(SessionError(reason))
 
     def _handle_control(self, payload: bytes) -> None:
         try:
@@ -405,14 +567,16 @@ class BridgeSession:
                 except Exception:  # noqa: BLE001
                     log.exception("event handler for %r raised", name)
         elif kind == "req":
+            # The PC exposes no RPC methods yet, but a request must still get a
+            # *response*: answering with an event left the phone waiting for a
+            # reply that never came (docs/03-protocol.md §6).
             rpc_id = msg.get("id")
-            method = msg.get("method")
             asyncio.create_task(
                 self._safe_send_control(
-                    control_event(
-                        "res_unsupported",
-                        {"id": rpc_id, "method": method,
-                         "reason": "PC does not expose any RPC methods"},
+                    control_response_err(
+                        rpc_id if isinstance(rpc_id, int) else 0,
+                        "method_not_found",
+                        "the PC exposes no RPC methods",
                     )
                 )
             )
@@ -429,7 +593,8 @@ class BridgeSession:
         self._pending[rpc_id] = fut
         try:
             await self._send_control(control_request(rpc_id, method, params))
-            return await asyncio.wait_for(fut, timeout or self.request_timeout)
+            effective = self.request_timeout if timeout is None else timeout
+            return await asyncio.wait_for(fut, effective)
         except asyncio.TimeoutError as exc:
             raise SessionError(f"phone did not answer {method!r} in time") from exc
         finally:
@@ -459,8 +624,9 @@ class BridgeSession:
     async def send_blob(self, data: bytes, stream_id: int = 1) -> None:
         await self._safe_send(MSG_BLOB, stream_id, data)
 
-    def subscribe_blobs(self, stream_id: int) -> asyncio.Queue[bytes]:
-        q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
+    def subscribe_blobs(self, stream_id: int) -> asyncio.Queue[bytes | None]:
+        """Frames from `stream_id`; ``None`` once the session has ended."""
+        q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=256)
         self._blob_waiters[stream_id] = q
         return q
 
@@ -493,6 +659,26 @@ class BridgeSession:
             if not fut.done():
                 fut.set_exception(exc)
         self._pong_waiters.clear()
+        self._release_blob_streams()
+
+    def _release_blob_streams(self) -> None:
+        """Wake every blob consumer with ``None`` after the session ends.
+
+        A closed session used to leave a subscriber blocked in ``queue.get()``
+        until its own timeout expired, which is how `bench` could hang for a
+        minute after a drop. ``None`` is the documented end-of-stream marker.
+        """
+        for queue in list(self._blob_waiters.values()):
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                # Make room: the oldest frame is worthless if we are closing.
+                try:  # noqa: SIM105
+                    queue.get_nowait()
+                    queue.put_nowait(None)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):  # pragma: no cover
+                    log.warning("blob subscriber queue could not be released")
+        self._blob_waiters.clear()
 
     # ------------------------------------------------------------------ #
     # factory helpers
@@ -616,6 +802,11 @@ class ReconnectingSession:
                 self._emit("reconnecting", reason=reason)
             except asyncio.CancelledError:
                 raise
+            except TerminalSessionError as exc:
+                # A changed identity key, a protocol skew, or a refusal by the
+                # phone: retrying cannot help and would spam the peer forever.
+                self._emit("closed", reason=str(exc), terminal=True)
+                return
             except Exception as exc:  # noqa: BLE001 - never let a drop kill us
                 last_error = f"{type(exc).__name__}: {exc}"
                 # "failed" is reserved for a terminal give-up (max_attempts
