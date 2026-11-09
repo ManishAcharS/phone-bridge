@@ -17,7 +17,7 @@ Last verified: 2026-11-08.
 
 | Gate | State |
 | --- | --- |
-| Automated tests (Python) | ✅ 479 passed |
+| Automated tests (Python) | ✅ 575 passed |
 | Lint (ruff) | ✅ clean, whole repo |
 | Type check (mypy) | ✅ clean, 19 files |
 | Vectors / protocol conformance | ✅ `tools/verify.py` 7/7 |
@@ -107,6 +107,7 @@ mistyped flag fails the suite instead of the user (this caught `--no-discovery` 
 | ✅ Release metadata is pinned by tests | same file: one version across `pyproject`/
 `__init__`/`build.gradle.kts`, no license classifier alongside the SPDX string, real entry point,
 keystore patterns ignored, every `docs/*.md` relative link resolves |
+| ✅ Desktop controller (Milestone 1) | `phonebridge gui`: headless manager tested against the simulator end to end (pairing, reject, pin, drop-and-reconnect, heartbeat, runtime thread); 95 controller tests. The **window itself was not launched here** — no display, and no tkinter in this environment — so the tkinter layer is covered by typeshed-checked mypy, the view logic (14 tests) and the device checklist in `docs/17` §8. |
 | ⛔ PowerShell workflows on a real Windows shell | **B4** |
 
 ### 2.4 Documentation

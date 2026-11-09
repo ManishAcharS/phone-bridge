@@ -25,6 +25,7 @@ interpreter (`python -m phonebridge ...`).
     phonebridge info --host 127.0.0.1       # after `adb forward tcp:8765 tcp:8765`
     phonebridge capabilities --require audio.bluetooth_sco
     phonebridge selftest             # every supported workflow, end to end
+    phonebridge gui                  # the desktop controller: one Connect button
 
 Runtime dependencies are only `websockets` and `cryptography`. Anything else
 (audio, dashboard, virtual camera) is listed in `requirements-phase2plus.txt`
@@ -32,7 +33,7 @@ and is not imported by this release.
 
 ## Test
 
-    python -m pytest -q              # 479 tests
+    python -m pytest -q              # 575 tests
     python -m ruff check ..          # lint, whole repo
     python -m mypy                   # type check, package only
     python ../tools/verify.py        # all of the above + vectors + CLI smoke

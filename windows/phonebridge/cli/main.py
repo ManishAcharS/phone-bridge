@@ -2,6 +2,7 @@
 
 Inspect and drive a phone link from the PC:
 
+    phonebridge gui                      desktop controller: one Connect button
     phonebridge doctor                   inspect this PC (Phase 0 audit)
     phonebridge identity [--name NAME]   this PC's device id / config dir
     phonebridge devices                  pinned phones, saved addresses, live beacons
@@ -947,6 +948,27 @@ def cmd_forget(args: argparse.Namespace) -> int:
     return EXIT_ERROR
 
 
+def cmd_gui(args: argparse.Namespace) -> int:
+    """Open the desktop controller.
+
+    The window is a thin shell over ``phonebridge.controller``: the same session,
+    the same pinning, the same protocol. It is imported here (not at module
+    import) so a Python without tkinter can still use every other command.
+    """
+    try:
+        from ..controller.ui.app import run_gui
+    except ImportError as exc:
+        note(f"error: this Python cannot open a window: {exc}")
+        note("hint: install Python from python.org (tkinter is included), "
+             "or keep using the commands above")
+        return EXIT_USAGE
+    return run_gui(
+        config_dir=args.config_dir,
+        auto_connect=args.auto_connect,
+        discovery_timeout=args.discovery_timeout,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # parser
 # --------------------------------------------------------------------------- #
@@ -1005,6 +1027,18 @@ def build_parser() -> argparse.ArgumentParser:
                                         "also PHONEBRIDGE_CONFIG_DIR on non-Windows)")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     sub = p.add_subparsers(dest="command", required=True)
+
+    gui = sub.add_parser(
+        "gui",
+        help="open the desktop controller (one-click connect)",
+        description="Open the PhoneBridge controller window: discover, connect, "
+                    "pair and reconnect without typing a command.",
+    )
+    gui.add_argument("--auto-connect", action="store_true",
+                     help="connect as soon as the window opens")
+    gui.add_argument("--discovery-timeout", type=_float_in("--discovery-timeout", 0.5, 30.0),
+                     default=3.0, metavar="SECONDS",
+                     help="how long to listen for the phone's beacon (default 3)")
 
     doctor = sub.add_parser("doctor", help="inspect this PC's development environment")
     doctor.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1159,6 +1193,8 @@ _ASYNC_COMMANDS = {
 
 
 def _dispatch(args: argparse.Namespace) -> int:
+    if args.command == "gui":
+        return cmd_gui(args)
     if args.command == "doctor":
         return cmd_doctor(args)
     if args.command == "identity":

@@ -96,6 +96,7 @@ The build previously emitted a setuptools deprecation warning
 
 | Command | What it answers | Needs a phone |
 | --- | --- | --- |
+| `gui` | desktop controller: one Connect button, auto-reconnect | no |
 | `doctor` | is this PC set up? | no |
 | `identity` | who is this PC, which phones are pinned? | no |
 | `devices` | what do I know, and what is announcing itself? | no (beacons optional) |
@@ -113,6 +114,40 @@ The build previously emitted a setuptools deprecation warning
 
 `phonebridge <command> -h` lists that command's options;
 `phonebridge --help` prints the whole map and the exit codes.
+
+---
+
+## 2a. The desktop controller (`phonebridge gui`)
+
+The commands above are per-action. `phonebridge gui` is the product: one window,
+one Connect button, and it keeps working when the network moves underneath it.
+
+```powershell
+phonebridge gui                      # open the window
+phonebridge gui --auto-connect       # connect as soon as it opens
+python -m phonebridge.controller     # same thing, without the console script
+```
+
+What it does that the CLI does not:
+
+- **Finds the phone itself** — no `--host`. It asks three sources in this order:
+  a USB device (via an `adb forward` it creates and later removes), the phone's
+  UDP beacon, then the last address that worked (probed before use).
+- **Pairs in the window** — the six-digit code is shown next to Approve/Reject;
+  the answer is applied to that one handshake. Nothing is cached.
+- **Survives a drop** — a closed socket or two missed heartbeats put it into
+  Reconnecting and it re-discovers (the phone may have moved from Wi-Fi to USB)
+  with a jittered 0.5 s → 15 s backoff.
+- **Shows the five capability states** — present / permitted / implemented /
+  available / active — instead of a single yes/no, so "no camera" is never
+  confused with "no permission".
+- **Keeps a diagnostics pane** — every discovery decision, address and failure,
+  in order.
+
+It is a shell over the same session the CLI uses: same pinning, same SAS, same
+AES-256-GCM, same protocol v1. `docs/17-connection-controller.md` is the full
+reference; the window needs tkinter, which the python.org Windows installer
+includes, and `phonebridge gui` says so plainly if it is missing.
 
 ---
 
