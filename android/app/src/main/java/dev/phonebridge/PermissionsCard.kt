@@ -58,7 +58,10 @@ fun PermissionsCard(modifier: Modifier = Modifier) {
         // Record that we asked: that is what separates "denied" from "blocked".
         result.keys.forEach { Permissions.markAsked(context, it) }
         rows = Permissions.snapshot(context)
-        lastError = result.entries
+        // `result` is already a Map<String, Boolean>. `filterValues` is an
+        // extension on Map, so it must be called on the map itself — on
+        // `.entries` (a Set<Map.Entry<...>>) it does not resolve.
+        lastError = result
             .filterValues { !it }
             .mapNotNull { (permission, _) ->
                 Permissions.runtime.firstOrNull { it.permission == permission }

@@ -15,7 +15,7 @@ is left, item by item.
 
 | | |
 | --- | --- |
-| **PC client** | complete, 476 automated tests, type-checked, linted |
+| **PC client** | complete, 479 automated tests, type-checked, linted |
 | **Android app** | complete, compiled against a stub environment, source-audited |
 | **Protocol** | v1, frozen; wire format in [`docs/03-protocol.md`](docs/03-protocol.md) |
 | **Audio relay** | **not implemented** — Phase 2, gated on per-device measurements |
@@ -237,7 +237,7 @@ and [`docs/16-known-limitations.md`](docs/16-known-limitations.md).
 
 ```powershell
 cd windows
-python -m pytest -q          # 476 tests
+python -m pytest -q          # 479 tests
 python tools\verify.py       # tests + lint + types + vectors + CLI smoke (7 checks)
 ```
 
@@ -267,7 +267,7 @@ windows/phonebridge/
   transport/                WebSocket link, UDP discovery
   core/                     session, reconnection supervisor, device store
   cli/                      the `phonebridge` command
-windows/tests/              476 tests
+windows/tests/              479 tests
 android/app/src/main/java/dev/phonebridge/
   protocol/                 byte-identical Kotlin port + known-answer vectors
   net/                      server, pairing store, identity, discovery, probes

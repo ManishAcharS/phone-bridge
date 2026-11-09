@@ -17,7 +17,7 @@ Last verified: 2026-11-08.
 
 | Gate | State |
 | --- | --- |
-| Automated tests (Python) | ✅ 476 passed |
+| Automated tests (Python) | ✅ 479 passed |
 | Lint (ruff) | ✅ clean, whole repo |
 | Type check (mypy) | ✅ clean, 19 files |
 | Vectors / protocol conformance | ✅ `tools/verify.py` 7/7 |
@@ -65,6 +65,7 @@ Last verified: 2026-11-08.
 | ✅ Predictive back | `android:enableOnBackInvokedCallback="true"`, no custom back handling to break |
 | ✅ Android 16 API use | no API removed in 15/16 is used; no native libraries (16 KB page-size rule is moot); no implicit broadcasts; no background activity starts |
 | ✅ Kotlin sources parse; no new compiler diagnostics | stub `kotlinc` differential vs the previous baseline: only SDK-cascade noise (see B6) |
+| ✅ Two Compose-layer compile errors found and fixed | `PermissionsCard.kt` called `filterValues` on `.entries` (a `Set<Map.Entry>`; it is a `Map` extension); `ProbeCard.kt` called the local `runProbe()` above its declaration. Both reproduced with `kotlinc 1.9.24` against the real callback types, fixed, and pinned by `tests/test_kotlin_compile_guards.py` (verified to fail on the pre-fix code). No functionality changed: the probe still runs `CapabilityProbe.run(...)` and publishes its report. |
 | ⛔ Built and installed | **B2**, then **B1** |
 | ⛔ Verified on a handset (journey, recovery, dark mode, rotation, TalkBack, battery) | **B1** |
 

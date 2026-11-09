@@ -66,6 +66,36 @@ fun CapabilityProbeCard(modifier: Modifier = Modifier) {
     var pendingRun by remember { mutableStateOf(false) }
 
     /**
+     * Starts one probe run.
+     *
+     * Declared above the launcher because a local function is only visible
+     * *after* its declaration, and the launcher's result callback below has to
+     * call it once the permission dialog closes.
+     */
+    fun runProbe() {
+        running = true
+        error = null
+        scope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching {
+                    CapabilityProbe.run(
+                        context,
+                        CapabilityProbe.Config(seconds = 30, acoustic = acoustic),
+                    )
+                }
+            }
+            outcome.onSuccess {
+                report = it
+                BridgeState.publishProbe(it)
+            }
+            outcome.onFailure {
+                error = "${it.javaClass.simpleName}: ${it.message}"
+            }
+            running = false
+        }
+    }
+
+    /**
      * One launcher for the whole set.
      *
      * The old code launched two permission requests and then *immediately*
@@ -98,29 +128,6 @@ fun CapabilityProbeCard(modifier: Modifier = Modifier) {
 
     // The probe records audio; a locked screen stops recording on Android 14+.
     KeepScreenOn(enabled = running)
-
-    fun runProbe() {
-        running = true
-        error = null
-        scope.launch {
-            val outcome = withContext(Dispatchers.IO) {
-                runCatching {
-                    CapabilityProbe.run(
-                        context,
-                        CapabilityProbe.Config(seconds = 30, acoustic = acoustic),
-                    )
-                }
-            }
-            outcome.onSuccess {
-                report = it
-                BridgeState.publishProbe(it)
-            }
-            outcome.onFailure {
-                error = "${it.javaClass.simpleName}: ${it.message}"
-            }
-            running = false
-        }
-    }
 
     fun requestPermissionsThenRun() {
         val missing = Permissions.missingProbePermissions(context)
