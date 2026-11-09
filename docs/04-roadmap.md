@@ -8,7 +8,7 @@ Legend: `[x]` implemented and tested · `[~]` partially implemented ·
 | | |
 | --- | --- |
 | Version | `1.0.0` (PC package and Android app) |
-| Gate status | 476 tests, ruff, mypy, `verify.py` 7/7 — all green |
+| Gate status | 479 tests, ruff, mypy, `verify.py` 7/7 — all green |
 | Open blockers | **B1** no physical-device run · **B2** release APK not built here (plus B3–B6: Play `targetSdk`, keystore, Windows/PowerShell run, Kotlin stub compile) |
 | Ship/no-ship | **Not shippable until B1 and B2 are cleared.** See [`14-release-readiness.md`](14-release-readiness.md). |
 

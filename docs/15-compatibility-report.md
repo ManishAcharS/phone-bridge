@@ -15,7 +15,7 @@ opinion.
 | Platform | State | Evidence |
 | --- | --- | --- |
 | Windows 10 / 11 | **supported target** · *unverified in this environment* | Every Windows-specific path is exercised by the test suite (`%LOCALAPPDATA%` config dir, PowerShell command shapes, `adb forward`); the release was prepared on Linux, so no Windows host ran it. See B4 in [`14-release-readiness.md`](14-release-readiness.md). |
-| Linux (this environment) | **verified** | 476 tests, ruff, mypy, `tools/verify.py` 7/7, clean-venv install, CLI sweep |
+| Linux (this environment) | **verified** | 479 tests, ruff, mypy, `tools/verify.py` 7/7, clean-venv install, CLI sweep |
 | macOS | *expected to work, untested* | No platform-specific code paths beyond the config directory; never executed here. |
 
 | Python | State |
@@ -115,7 +115,7 @@ installation are unaffected. The upgrade path is written out as blocker B3.
 ## 6. Summary for the release notes
 
 > PhoneBridge 1.0.0 has been verified on Linux with Python 3.11 against the
-> reference phone implementation (476 tests, lint, type check, clean-venv install,
+> reference phone implementation (479 tests, lint, type check, clean-venv install,
 > CLI sweep). The Android app compiles against the protocol layer and its
 > behaviour is source-audited, but **it has not been run on a physical handset by
 > this project**, and the release APK must be built and installed by the user

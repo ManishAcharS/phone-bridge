@@ -32,7 +32,7 @@ and is not imported by this release.
 
 ## Test
 
-    python -m pytest -q              # 476 tests
+    python -m pytest -q              # 479 tests
     python -m ruff check ..          # lint, whole repo
     python -m mypy                   # type check, package only
     python ../tools/verify.py        # all of the above + vectors + CLI smoke
