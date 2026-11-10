@@ -151,6 +151,14 @@ class BackgroundRuntime:
     def reconnect(self) -> None:
         self.submit(lambda manager: manager.reconnect())
 
+    def set_endpoint(self, host: str, port: int | None = None) -> None:
+        """Point the controller at an address the user typed in by hand."""
+
+        async def apply(manager: ConnectionManager) -> None:
+            manager.set_manual_endpoint(host, port)
+
+        self.submit(apply)
+
     def resolve_pairing(self, approve: bool) -> None:
         self.manager.resolve_pairing(approve)
 

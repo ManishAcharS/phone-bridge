@@ -966,6 +966,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
         config_dir=args.config_dir,
         auto_connect=args.auto_connect,
         discovery_timeout=args.discovery_timeout,
+        endpoint=args.endpoint,
     )
 
 
@@ -1039,6 +1040,9 @@ def build_parser() -> argparse.ArgumentParser:
     gui.add_argument("--discovery-timeout", type=_float_in("--discovery-timeout", 0.5, 30.0),
                      default=3.0, metavar="SECONDS",
                      help="how long to listen for the phone's beacon (default 3)")
+    gui.add_argument("--endpoint", default=None, metavar="HOST[:PORT]",
+                     help="try this phone address first, e.g. 192.168.1.20:8765 "
+                          "(for when the beacon is blocked)")
 
     doctor = sub.add_parser("doctor", help="inspect this PC's development environment")
     doctor.add_argument("--json", action="store_true", help="machine-readable output")

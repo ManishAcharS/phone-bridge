@@ -1,31 +1,33 @@
-"""The ``adb`` command line, and the rules that decide what we may undo.
+"""Finding ``adb``, and telling a cable from a network.
 
-USB is the most reliable transport this project has — it needs no network, and
-it survives the Wi-Fi dropping mid-session — but the phone only speaks WebSocket,
-so reaching it means ``adb forward``.
+Three things this module refuses to do:
 
-Two rules make that safe to automate:
-
-1. **A rule we did not create is never removed.** Every forward this module
-   creates comes back as a :class:`ForwardLease`; rules that already existed are
-   returned with ``owned=False`` and the cleanup path skips them. A user's own
-   ``adb forward tcp:8765 tcp:8765`` is therefore left exactly as it was.
-2. **Every adb call has a timeout.** ``adb`` can block for a long time when the
-   daemon is starting or the cable is flapping; a UI thread must never wait on
-   that. The default is short and the failure is reported, not swallowed.
+1. **Assume adb is on ``PATH``.** Android Studio does not add it there on
+   Windows, so a PC with a perfectly good SDK reports "USB unavailable" while
+   ``%LOCALAPPDATA%\\Android\\Sdk\\platform-tools\\adb.exe`` sits on disk. Every
+   location below is searched, and the one that answered is reported so the user
+   can see which binary the app is driving.
+2. **Call a network device "USB".** ``adb devices`` lists a wireless-debugging
+   bridge as ``192.168.1.9:5555`` or ``adb-XXXX._adb-tls-connect._tcp``; both are
+   Wi-Fi paths. Labelling them USB would make the transport row a lie and would
+   make the USB preference meaningless.
+3. **Remove a rule it did not create.** Every forward this module creates comes
+   back as a :class:`ForwardLease`; rules that already existed are returned as
+   "reused" and never touched.
 
 Nothing here raises because adb is missing: that is a normal state on a PC that
-only uses Wi-Fi, so :meth:`Adb.available` answers instead.
+only uses Wi-Fi, so :meth:`Adb.status` answers instead.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import socket
 import subprocess  # noqa: S404 - adb is the interface; argv is never a shell string
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
@@ -38,16 +40,23 @@ REMOTE_PORT = 8765
 #: anything near a second means the daemon is unhappy.
 DEFAULT_TIMEOUT = 6.0
 
-#: ``adb devices -l`` states that can carry traffic. Everything else is reported
-#: to the user with its own explanation instead of being retried blindly.
-USABLE_STATES = frozenset({"device"})
+#: Classification of one row of ``adb devices -l``.
+CONNECTION_USB = "usb"
+CONNECTION_WIRELESS = "wireless"
+CONNECTION_EMULATOR = "emulator"
 
 _STATE_HELP = {
-    "unauthorized": "accept the USB debugging prompt on the phone",
-    "offline": "the device is not responding; replug the cable or restart adb",
-    "no permissions": "the USB device is owned by another user (Linux udev rules)",
-    "connecting": "the device is still connecting",
+    "unauthorized": "accept the USB debugging prompt on the phone, then replug",
+    "offline": "the device is not responding; replug the cable or run `adb kill-server`",
+    "no permissions": "the USB device belongs to another user (Linux udev rules)",
+    "connecting": "the device is still connecting; try again in a moment",
+    "authorizing": "confirm the RSA prompt on the phone",
 }
+
+#: Serial shapes that are a network path, never a cable.
+_IP_SERIAL = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}:\d+$")
+_MDNS_SERIAL = re.compile(r"^adb-[^.]*\._adb-tls-(?:connect|pairing)\._tcp$", re.IGNORECASE)
+_EMULATOR_SERIAL = re.compile(r"^(?:emulator-\d+|localhost:\d+)$")
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,130 @@ class AdbError(RuntimeError):
     """An adb invocation failed, or adb itself is unusable."""
 
 
+# --------------------------------------------------------------------------- #
+# where adb might be
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class AdbLocation:
+    """An adb binary that exists, and how it was found."""
+
+    path: str
+    source: str
+
+    @property
+    def directory(self) -> str:
+        return os.path.dirname(self.path)
+
+
+def _is_windows(name: str) -> bool:
+    """``os.name`` is ``"nt"`` on Windows, not ``"win32"`` — accept every spelling."""
+    lowered = name.lower()
+    return lowered.startswith("win") or lowered == "nt" or lowered == "windows"
+
+
+def _windows_candidates(env: Mapping[str, str]) -> list[tuple[str, str]]:
+    """(path, source) in the order a Windows PC is most likely to have it."""
+    out: list[tuple[str, str]] = []
+    local_appdata = env.get("LOCALAPPDATA") or ""
+    user_profile = env.get("USERPROFILE") or ""
+
+    def add(base: str, source: str) -> None:
+        if not base:
+            return
+        out.append((os.path.join(base, "platform-tools", "adb.exe"), source))
+
+    add(env.get("ANDROID_HOME", ""), "ANDROID_HOME")
+    add(env.get("ANDROID_SDK_ROOT", ""), "ANDROID_SDK_ROOT")
+    add(os.path.join(local_appdata, "Android", "Sdk") if local_appdata else "", "LOCALAPPDATA")
+    add(
+        os.path.join(user_profile, "AppData", "Local", "Android", "Sdk") if user_profile else "",
+        "user profile",
+    )
+    add(os.path.join(local_appdata, "Android", "Sdk.1") if local_appdata else "", "LOCALAPPDATA (SDK.1)")
+    add(r"C:\Android\Sdk", "C:\\Android\\Sdk")
+    add(os.path.join(env.get("ProgramFiles", r"C:\Program Files"), "Android", "Sdk"), "Program Files")
+    return out
+
+
+def _posix_candidates(env: Mapping[str, str]) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+
+    def add(base: str, source: str) -> None:
+        if base:
+            out.append((os.path.join(base, "platform-tools", "adb"), source))
+
+    add(env.get("ANDROID_HOME", ""), "ANDROID_HOME")
+    add(env.get("ANDROID_SDK_ROOT", ""), "ANDROID_SDK_ROOT")
+    add(os.path.expanduser("~/Android/Sdk"), "~/Android/Sdk")
+    add("/usr/lib/android-sdk", "/usr/lib/android-sdk")
+    add("/opt/android-sdk", "/opt/android-sdk")
+    add("/usr/local/share/android-sdk", "/usr/local/share/android-sdk")
+    return out
+
+
+def candidate_locations(
+    env: Mapping[str, str] | None = None, *, platform: str | None = None
+) -> list[tuple[str, str]]:
+    """Every place worth checking, in priority order, with its provenance."""
+    environment = dict(os.environ if env is None else env)
+    name = (platform or os.name).lower()
+    out: list[tuple[str, str]] = []
+    override = environment.get("PHONEBRIDGE_ADB")
+    if override:
+        out.append((override, "PHONEBRIDGE_ADB"))
+    if _is_windows(name):
+        out.extend(_windows_candidates(environment))
+    else:
+        out.extend(_posix_candidates(environment))
+
+    # LOCALAPPDATA and USERPROFILE name the same folder on a default Windows
+    # install; report each path once, with the first (most specific) source.
+    unique: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for path, source in out:
+        key = os.path.normcase(os.path.normpath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((path, source))
+    return unique
+
+
+def find_adb(
+    env: Mapping[str, str] | None = None,
+    *,
+    which: Callable[[str], str | None] | None = None,
+    exists: Callable[[str], bool] | None = None,
+    platform: str | None = None,
+) -> AdbLocation | None:
+    """The first usable adb: explicit override, then ``PATH``, then the SDKs."""
+    environment = dict(os.environ if env is None else env)
+    lookup = which or shutil.which
+    is_file = exists or os.path.isfile
+    name = (platform or os.name).lower()
+    executable = "adb.exe" if _is_windows(name) else "adb"
+
+    # An explicit override is an instruction, not a hint: it is honoured even if
+    # a stale adb sits earlier on PATH.
+    override = environment.get("PHONEBRIDGE_ADB")
+    if override and is_file(override):
+        return AdbLocation(override, "PHONEBRIDGE_ADB")
+
+    on_path = lookup(executable) or lookup("adb")
+    if on_path and is_file(on_path):
+        return AdbLocation(on_path, "PATH")
+
+    for path, source in candidate_locations(environment, platform=platform):
+        if source == "PHONEBRIDGE_ADB":
+            continue
+        if is_file(path):
+            return AdbLocation(path, source)
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# devices
+# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class AdbDevice:
     serial: str
@@ -73,16 +206,24 @@ class AdbDevice:
     model: str | None = None
     product: str | None = None
     transport_id: str | None = None
+    usb: str | None = None
+
+    @property
+    def connection(self) -> str:
+        """``usb``, ``wireless`` or ``emulator`` — never guessed from the state."""
+        if _EMULATOR_SERIAL.match(self.serial):
+            return CONNECTION_EMULATOR
+        if _IP_SERIAL.match(self.serial) or _MDNS_SERIAL.match(self.serial):
+            return CONNECTION_WIRELESS
+        return CONNECTION_USB
+
+    @property
+    def is_usb(self) -> bool:
+        return self.connection == CONNECTION_USB
 
     @property
     def usable(self) -> bool:
-        return self.state in USABLE_STATES
-
-    def explain(self) -> str:
-        if self.usable:
-            return f"{self.display_name} is ready over USB"
-        hint = _STATE_HELP.get(self.state, "run `adb devices` for details")
-        return f"{self.serial} is {self.state}: {hint}"
+        return self.state == "device"
 
     @property
     def display_name(self) -> str:
@@ -90,7 +231,89 @@ class AdbDevice:
             return self.model.replace("_", " ")
         return self.serial
 
+    def explain(self) -> str:
+        kind = {
+            CONNECTION_USB: "USB",
+            CONNECTION_WIRELESS: "wireless debugging",
+            CONNECTION_EMULATOR: "emulator",
+        }[self.connection]
+        if self.usable:
+            return f"{self.display_name} is ready over {kind}"
+        hint = _STATE_HELP.get(self.state, "run `adb devices` for details")
+        return f"{self.serial} ({kind}) is {self.state}: {hint}"
 
+
+@dataclass(frozen=True)
+class AdbStatus:
+    """Everything the UI needs to say about adb, in one value."""
+
+    available: bool
+    path: str | None = None
+    source: str | None = None
+    version: str | None = None
+    error: str | None = None
+
+    @property
+    def summary(self) -> str:
+        if not self.available:
+            return self.error or "adb not found (USB unavailable)"
+        where = f" ({self.source})" if self.source else ""
+        return f"{self.path}{where}"
+
+    @property
+    def detail(self) -> str:
+        if not self.available:
+            return self.error or "adb not found"
+        version = self.version or "unknown version"
+        return f"{self.summary} — {version}"
+
+
+def parse_devices(stdout: str) -> list[AdbDevice]:
+    """Parse ``adb devices -l``.
+
+    Lines look like::
+
+        R58M12345          device usb:1-2 product:x model:Redmi_Note_14_Pro transport_id:3
+        192.168.1.9:5555   device product:x model:Pixel transport_id:4
+        ABCDEF             unauthorized
+
+    The header line and blank lines are skipped rather than treated as devices.
+    """
+    devices: list[AdbDevice] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("List of devices", "*")):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        serial, state = parts[0], parts[1]
+        props: dict[str, str] = {}
+        for token in parts[2:]:
+            if ":" in token:
+                key, _, value = token.partition(":")
+                props[key] = value
+        devices.append(
+            AdbDevice(
+                serial=serial,
+                state=state,
+                model=props.get("model"),
+                product=props.get("product"),
+                transport_id=props.get("transport_id"),
+                usb=props.get("usb"),
+            )
+        )
+    return devices
+
+
+def is_wireless_serial(serial: str) -> bool:
+    """True for anything ``adb`` reached over the network."""
+    return bool(_IP_SERIAL.match(serial) or _MDNS_SERIAL.match(serial))
+
+
+# --------------------------------------------------------------------------- #
+# forwards
+# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ForwardLease:
     """A forward rule created by this controller, and therefore ours to remove."""
@@ -112,7 +335,7 @@ def _run_adb(argv: Sequence[str], timeout: float) -> AdbResult:
             timeout=timeout,
             check=False,
         )
-    except FileNotFoundError as exc:  # pragma: no cover - guarded by available()
+    except FileNotFoundError as exc:  # pragma: no cover - guarded by status()
         raise AdbError("adb is not on PATH") from exc
     except subprocess.TimeoutExpired as exc:
         raise AdbError(f"adb {' '.join(argv)} timed out after {timeout:g}s") from exc
@@ -120,12 +343,7 @@ def _run_adb(argv: Sequence[str], timeout: float) -> AdbResult:
 
 
 def free_local_port() -> int:
-    """An unused TCP port on the loopback interface.
-
-    There is an unavoidable race between closing this socket and adb binding the
-    port; :meth:`Adb.ensure_forward` retries a few times, which is the pragmatic
-    answer for a one-connection-at-a-time product.
-    """
+    """An unused TCP port on the loopback interface."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
@@ -139,18 +357,40 @@ class Adb:
         runner: Runner | None = None,
         *,
         executable: str | None = None,
+        source: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
+        locate: Callable[[], AdbLocation | None] | None = None,
     ) -> None:
         self._runner = runner or _run_adb
-        self._executable = executable
-        self.timeout = timeout
+        self._explicit = executable
+        self._source = source
+        self._timeout = timeout
+        self._locate = locate or (lambda: find_adb())
+        self._resolved = False
+        self._location: AdbLocation | None = None
 
     # ------------------------------------------------------------------ #
     # availability
     # ------------------------------------------------------------------ #
+    def locate(self, *, refresh: bool = False) -> AdbLocation | None:
+        """Where adb is, cached. ``refresh`` re-runs the search."""
+        if refresh or not self._resolved:
+            if self._explicit:
+                self._location = AdbLocation(self._explicit, self._source or "explicit")
+            else:
+                self._location = self._locate()
+            self._resolved = True
+        return self._location
+
     @property
     def path(self) -> str | None:
-        return self._executable or shutil.which("adb")
+        location = self.locate()
+        return location.path if location else None
+
+    @property
+    def source(self) -> str | None:
+        location = self.locate()
+        return location.source if location else None
 
     def available(self) -> bool:
         return self.path is not None
@@ -159,13 +399,32 @@ class Adb:
         if not self.available():
             return None
         try:
-            result = self._runner(["--version"], self.timeout)
+            result = self._runner(["--version"], self._timeout)
         except AdbError:
             return None
         if result.returncode != 0:
             return None
-        first = (result.stdout or "").strip().splitlines()
-        return first[0].strip() if first else None
+        lines = (result.stdout or "").strip().splitlines()
+        return lines[0].strip() if lines else None
+
+    def status(self) -> AdbStatus:
+        """One value the UI can show without re-running anything expensive."""
+        location = self.locate()
+        if location is None:
+            return AdbStatus(
+                available=False,
+                error=(
+                    "adb not found — USB transport needs platform-tools. Install them "
+                    "(Android Studio > SDK Manager > SDK Tools > Android SDK "
+                    "Platform-Tools) or put adb on PATH; Wi-Fi keeps working without it."
+                ),
+            )
+        return AdbStatus(
+            available=True,
+            path=location.path,
+            source=location.source,
+            version=self.version(),
+        )
 
     # ------------------------------------------------------------------ #
     # devices
@@ -174,10 +433,18 @@ class Adb:
         """Every attached device, including the ones we cannot use."""
         if not self.available():
             return []
-        result = self._runner(["devices", "-l"], self.timeout)
+        result = self._runner(["devices", "-l"], self._timeout)
         if result.returncode != 0:
             raise AdbError(result.stderr.strip() or "adb devices failed")
         return parse_devices(result.stdout)
+
+    def usb_devices(self) -> list[AdbDevice]:
+        """Only the devices on a cable (or emulator-free USB state).
+
+        Wireless debugging bridges are excluded on purpose: they are a useful
+        transport, but they are not USB, and the transport row must not lie.
+        """
+        return [d for d in self.devices() if d.is_usb and d.connection != CONNECTION_EMULATOR]
 
     # ------------------------------------------------------------------ #
     # forwards
@@ -186,7 +453,7 @@ class Adb:
         """``(serial, local, remote)`` for every existing rule."""
         if not self.available():
             return []
-        result = self._runner(["forward", "--list"], self.timeout)
+        result = self._runner(["forward", "--list"], self._timeout)
         if result.returncode != 0:
             raise AdbError(result.stderr.strip() or "adb forward --list failed")
         out: list[tuple[str, str, str]] = []
@@ -215,10 +482,10 @@ class Adb:
         self, serial: str, local_port: int, remote_port: int = REMOTE_PORT
     ) -> ForwardLease:
         if not self.available():
-            raise AdbError("adb is not on PATH; USB transport needs it")
+            raise AdbError("adb is not available; USB transport needs it")
         result = self._runner(
             ["-s", serial, "forward", f"tcp:{local_port}", f"tcp:{remote_port}"],
-            self.timeout,
+            self._timeout,
         )
         if result.returncode != 0:
             raise AdbError(result.stderr.strip() or f"could not forward to {serial}")
@@ -229,7 +496,7 @@ class Adb:
         if not self.available():  # pragma: no cover - adb cannot vanish mid-run
             return False
         try:
-            result = self._runner(lease.remove_argv(), self.timeout)
+            result = self._runner(lease.remove_argv(), self._timeout)
         except AdbError as exc:  # the daemon died with the cable: nothing to undo
             log.warning("could not remove forward %s: %s", lease, exc)
             return False
@@ -255,54 +522,6 @@ class Adb:
             port = free_local_port()
             try:
                 return self.add_forward(serial, port, remote_port)
-            except AdbError as exc:  # usually a port that was taken between bind and use
+            except AdbError as exc:  # usually a port taken between bind and use
                 last = exc
         raise AdbError(f"could not set up a USB forward for {serial}: {last}")
-
-
-def parse_devices(stdout: str) -> list[AdbDevice]:
-    """Parse ``adb devices -l``.
-
-    Lines look like::
-
-        R58M12345          device product:x model:Redmi_Note_14_Pro device:y transport_id:1
-        ABCDEF             unauthorized
-
-    The header line and blank lines are skipped rather than treated as devices.
-    """
-    devices: list[AdbDevice] = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line or line.startswith(("List of devices", "*")):
-            continue
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        serial, state = parts[0], parts[1]
-        props: dict[str, str] = {}
-        for token in parts[2:]:
-            if ":" in token:
-                key, _, value = token.partition(":")
-                props[key] = value
-        devices.append(
-            AdbDevice(
-                serial=serial,
-                state=state,
-                model=props.get("model"),
-                product=props.get("product"),
-                transport_id=props.get("transport_id"),
-            )
-        )
-    return devices
-
-
-_IP_SERIAL = re.compile(r"^\d{1,3}(\.\d{1,3}){3}:\d+$")
-
-
-def is_wireless_serial(serial: str) -> bool:
-    """True for an ``adb connect``-style serial (wireless debugging).
-
-    Those are useful — they survive a cable being unplugged — but they are not
-    the local USB link, and the UI names them differently.
-    """
-    return bool(_IP_SERIAL.match(serial))
