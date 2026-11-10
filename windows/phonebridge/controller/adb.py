@@ -326,17 +326,24 @@ class ForwardLease:
         return ["-s", self.serial, "forward", "--remove", f"tcp:{self.local_port}"]
 
 
-def _run_adb(argv: Sequence[str], timeout: float) -> AdbResult:
+def _run_adb(argv: Sequence[str], timeout: float, executable: str = "adb") -> AdbResult:
+    """Run ``adb`` — by default the *resolved* path, never a bare name.
+
+    Running ``"adb"`` here would undo the whole point of :func:`find_adb`: on the
+    PC that reported "adb not on PATH" the search finds
+    ``%LOCALAPPDATA%\\Android\\Sdk\\platform-tools\\adb.exe``, and the first
+    command would then fail with "adb is not on PATH" anyway.
+    """
     try:
         done = subprocess.run(  # noqa: S603 - argv list, no shell
-            ["adb", *argv],
+            [executable, *argv],
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
         )
     except FileNotFoundError as exc:  # pragma: no cover - guarded by status()
-        raise AdbError("adb is not on PATH") from exc
+        raise AdbError(f"adb could not be run from {executable}") from exc
     except subprocess.TimeoutExpired as exc:
         raise AdbError(f"adb {' '.join(argv)} timed out after {timeout:g}s") from exc
     return AdbResult(done.returncode, done.stdout or "", done.stderr or "")
@@ -361,7 +368,9 @@ class Adb:
         timeout: float = DEFAULT_TIMEOUT,
         locate: Callable[[], AdbLocation | None] | None = None,
     ) -> None:
-        self._runner = runner or _run_adb
+        #: ``None`` means "run whatever :func:`find_adb` located", which is the
+        #: production path; a test supplies its own callable instead.
+        self._runner = runner
         self._explicit = executable
         self._source = source
         self._timeout = timeout
@@ -395,11 +404,27 @@ class Adb:
     def available(self) -> bool:
         return self.path is not None
 
+    def _exec(self, argv: Sequence[str]) -> AdbResult:
+        """Run one adb command: through the injected runner, or the found binary.
+
+        Raises :class:`AdbError` rather than falling back to a bare ``adb`` when
+        nothing was found — a silent PATH fallback is how "USB unavailable" turns
+        into a confusing failure at the first command instead of at discovery.
+        """
+        if self._runner is not None:
+            return self._runner(argv, self._timeout)
+        path = self.path
+        if path is None:
+            raise AdbError(
+                "adb is not installed: USB is unavailable, and Wi-Fi does not need it"
+            )
+        return _run_adb(argv, self._timeout, executable=path)
+
     def version(self) -> str | None:
         if not self.available():
             return None
         try:
-            result = self._runner(["--version"], self._timeout)
+            result = self._exec(["--version"])
         except AdbError:
             return None
         if result.returncode != 0:
@@ -433,7 +458,7 @@ class Adb:
         """Every attached device, including the ones we cannot use."""
         if not self.available():
             return []
-        result = self._runner(["devices", "-l"], self._timeout)
+        result = self._exec(["devices", "-l"])
         if result.returncode != 0:
             raise AdbError(result.stderr.strip() or "adb devices failed")
         return parse_devices(result.stdout)
@@ -453,7 +478,7 @@ class Adb:
         """``(serial, local, remote)`` for every existing rule."""
         if not self.available():
             return []
-        result = self._runner(["forward", "--list"], self._timeout)
+        result = self._exec(["forward", "--list"])
         if result.returncode != 0:
             raise AdbError(result.stderr.strip() or "adb forward --list failed")
         out: list[tuple[str, str, str]] = []
@@ -483,9 +508,8 @@ class Adb:
     ) -> ForwardLease:
         if not self.available():
             raise AdbError("adb is not available; USB transport needs it")
-        result = self._runner(
-            ["-s", serial, "forward", f"tcp:{local_port}", f"tcp:{remote_port}"],
-            self._timeout,
+        result = self._exec(
+            ["-s", serial, "forward", f"tcp:{local_port}", f"tcp:{remote_port}"]
         )
         if result.returncode != 0:
             raise AdbError(result.stderr.strip() or f"could not forward to {serial}")
@@ -496,7 +520,7 @@ class Adb:
         if not self.available():  # pragma: no cover - adb cannot vanish mid-run
             return False
         try:
-            result = self._runner(lease.remove_argv(), self._timeout)
+            result = self._exec(lease.remove_argv())
         except AdbError as exc:  # the daemon died with the cable: nothing to undo
             log.warning("could not remove forward %s: %s", lease, exc)
             return False

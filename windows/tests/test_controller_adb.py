@@ -4,15 +4,26 @@ The one promise that matters here: **a rule PhoneBridge did not create is never
 removed.** Getting that wrong would silently break a user's own
 ``adb forward tcp:8765 tcp:8765``, which every earlier version of the docs told
 them to run by hand.
+
+Discovery is injected everywhere in this file (``locate=``), never mocked at the
+``shutil``/filesystem level. That is not a shortcut: on a Windows developer PC
+``%LOCALAPPDATA%\\Android\\Sdk\\platform-tools\\adb.exe`` genuinely exists, so a
+test that only stubs ``shutil.which`` still finds a real adb and passes or fails
+depending on who runs it. Injection makes "adb is missing" a *statement about the
+code path* rather than about the machine — and
+``test_controller_adb_discovery.py`` separately proves the real search still finds
+every location.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from phonebridge.controller import adb as adb_module
 from phonebridge.controller.adb import (
     Adb,
     AdbError,
+    AdbLocation,
     AdbResult,
     ForwardLease,
     is_wireless_serial,
@@ -20,6 +31,15 @@ from phonebridge.controller.adb import (
 )
 
 DEVICES_HEADER = "List of devices attached\n"
+
+
+class _Completed:
+    """The three attributes :func:`_run_adb` reads off ``subprocess.run``."""
+
+    def __init__(self, stdout: str = "", returncode: int = 0, stderr: str = "") -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
 
 
 class RecordingAdb:
@@ -137,20 +157,130 @@ def test_a_failing_forward_raises_instead_of_pretending() -> None:
 
 
 def test_missing_adb_is_a_state_not_an_exception() -> None:
-    adb = Adb(runner=RecordingAdb(), executable=None)
-    adb._executable = None  # noqa: SLF001 - force the "not installed" branch
-    import shutil
+    """Every discovery source is injected as empty, so this cannot depend on the PC.
 
-    original = shutil.which
-    shutil.which = lambda _name: None  # type: ignore[assignment]
-    try:
-        assert adb.available() is False
-        assert adb.devices() == []
-        assert adb.version() is None
-        with pytest.raises(AdbError):
-            adb.add_forward("S1", 5000)
-    finally:
-        shutil.which = original  # type: ignore[assignment]
+    ``locate=`` replaces the whole search — PATH, ANDROID_HOME, ANDROID_SDK_ROOT,
+    ``%LOCALAPPDATA%\\Android\\Sdk``, ``C:\\Android\\Sdk`` and Program Files — so the
+    test asserts the same thing on a machine with a full SDK as on one without.
+    """
+    adb = Adb(runner=RecordingAdb(), locate=lambda: None)
+
+    assert adb.locate() is None
+    assert adb.path is None
+    assert adb.source is None
+    assert adb.available() is False
+    # No exception: "not installed" is a normal state for a Wi-Fi-only PC.
+    assert adb.devices() == []
+    assert adb.usb_devices() == []
+    assert adb.list_forwards() == []
+    assert adb.version() is None
+    status = adb.status()
+    assert status.available is False
+    assert "Wi-Fi" in (status.error or ""), "the message must not imply Wi-Fi is broken too"
+    with pytest.raises(AdbError, match="not available"):
+        adb.add_forward("S1", 5000)
+
+
+def test_a_genuinely_absent_installation_is_false_not_an_exception() -> None:
+    """The real finder, told the disk is empty, must answer ``None`` — not raise."""
+
+    def empty_disk(_path: str) -> bool:
+        return False
+
+    def no_path(_name: str) -> str | None:
+        return None
+
+    adb = Adb(
+        runner=RecordingAdb(),
+        locate=lambda: adb_module.find_adb(
+            {}, which=no_path, exists=empty_disk, platform="nt"
+        ),
+    )
+    assert adb.available() is False
+    assert adb.status().available is False
+    assert adb.devices() == []
+
+
+def test_the_default_finder_is_the_real_search(monkeypatch) -> None:
+    """Production must keep using the SDK search — this is the anti-regression bit.
+
+    If someone "fixes" the missing-adb test by deleting the Windows fallback
+    lookup, this fails: ``Adb()`` with no arguments has to go through
+    :func:`phonebridge.controller.adb.find_adb`.
+    """
+    found = AdbLocation(r"C:\Users\2026\AppData\Local\Android\Sdk\platform-tools\adb.exe",
+                        "LOCALAPPDATA")
+    monkeypatch.setattr(adb_module, "find_adb", lambda *_a, **_k: found)
+
+    adb = Adb(runner=RecordingAdb())
+    assert adb.path == found.path
+    assert adb.source == "LOCALAPPDATA"
+    assert adb.available() is True
+
+
+def test_commands_run_the_discovered_binary_not_a_bare_adb(monkeypatch) -> None:
+    """The whole point of discovery: the first command must use that path."""
+    argv_seen: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):  # noqa: ANN001, ANN003
+        argv_seen.append(list(argv))
+        return _Completed(f"List of devices attached\n{DEVICES_HEADER}")
+
+    monkeypatch.setattr(adb_module.subprocess, "run", fake_run)
+    discovered = r"C:\Users\2026\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+    adb = Adb(locate=lambda: AdbLocation(discovered, "LOCALAPPDATA"))
+
+    adb.devices()
+    assert argv_seen, "adb was never invoked"
+    assert argv_seen[0][0] == discovered, "a bare `adb` would fail on a PC without PATH"
+    assert argv_seen[0][1:] == ["devices", "-l"]
+
+
+def test_a_real_sdk_on_disk_is_found_and_used(monkeypatch, tmp_path) -> None:
+    """The Windows scenario end to end: adb exists only in the SDK folder.
+
+    ``%LOCALAPPDATA%\\Android\\Sdk\\platform-tools\\adb.exe`` is what Android Studio
+    installs and what ``PATH`` never sees. Discovery must find it *and* commands
+    must run it — this is the pair of bugs the Windows test run exposed.
+    """
+    sdk = tmp_path / "Android" / "Sdk" / "platform-tools"
+    sdk.mkdir(parents=True)
+    binary = sdk / "adb.exe"
+    binary.write_text("", encoding="utf-8")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    found = adb_module.find_adb(which=lambda _name: None, platform="nt")
+    assert found is not None
+    assert found.path == str(binary)
+    assert found.source == "LOCALAPPDATA"
+
+    argv_seen: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):  # noqa: ANN001, ANN003
+        argv_seen.append(list(argv))
+        return _Completed(DEVICES_HEADER + "R58M12345 device usb:1-2 model:Redmi_Note_14_Pro\n")
+
+    monkeypatch.setattr(adb_module.subprocess, "run", fake_run)
+    adb = Adb(locate=lambda: found)
+
+    devices = adb.devices()
+    assert [d.serial for d in devices] == ["R58M12345"]
+    assert devices[0].is_usb
+    assert argv_seen[0][0] == str(binary)
+
+
+def test_no_bare_adb_fallback_when_nothing_was_found(monkeypatch) -> None:
+    """A missing binary must raise, never quietly try ``adb`` from PATH."""
+
+    def explode(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("subprocess must not run when adb was not found")
+
+    monkeypatch.setattr(adb_module.subprocess, "run", explode)
+    adb = Adb(locate=lambda: None)
+
+    with pytest.raises(AdbError):
+        adb.add_forward("S1", 5000)
+    assert adb.devices() == []
 
 
 def test_adb_timeout_is_reported_not_swallowed() -> None:

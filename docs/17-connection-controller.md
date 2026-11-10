@@ -282,6 +282,24 @@ and later identical lines only bump a counter (`12:04:31  connecting…  (x6)`).
 The pane is bounded (200 lines), so a reconnect loop cannot push the one line that
 matters out of view, and it cannot fill the window with noise.
 
+Timestamps are **local wall-clock time** (`HH:MM:SS`), not UTC — the pane is read
+beside the user's own clock, so a UTC stamp would read 05:30 next to a 00:00 event
+in India. `controller/diagnostics.py` documents this, and `Diagnostics`/`LogLine`
+take an injectable `stamp=` so tests never depend on the runner's timezone.
+
+Two Windows-only bugs found by running this milestone's tests on the real machine,
+both fixed here:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `test_missing_adb_is_a_state_not_an_exception` failed only on Windows | the test stubbed `shutil.which`, but the SDK search really does find `%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe` on a developer PC | discovery is injected (`Adb(locate=...)`) so the test states the code path, not the machine; the real search is covered by `test_controller_adb_discovery.py` |
+| the diagnostics stamp read `05:30:00` instead of `00:00:00` | the test hardcoded a UTC assumption; the code correctly shows local time (UTC+05:30 on the reporting PC) | behaviour documented and pinned by a local-vs-UTC test plus a `TZ=IST-5:30` test; expected values are derived from `localtime`, never hardcoded |
+
+A third fix came out of the same investigation: `Adb` used to run a **bare `adb`**
+even after finding `%LOCALAPPDATA%\...\adb.exe`, so on a PC without `PATH` the
+first command failed with "adb is not on PATH" despite discovery succeeding. It now
+runs the resolved binary, and a test asserts `argv[0]` is that full path.
+
 ---
 
 ## 8. Pairing, honestly
@@ -392,19 +410,19 @@ failures happened (§7) and `Phone address` is the direct fallback.
 
 ```powershell
 cd windows
-python -m pytest -q                      # 703 tests, 1 skipped (tkinter, Linux CI)
+python -m pytest -q                      # 712 tests, 1 skipped (tkinter, Linux CI)
 python -m pytest -q tests/test_controller_manager.py tests/test_controller_e2e.py
 cd .. ; python tools/verify.py           # 7 checks
 ```
 
 | File | Tests | Covers |
 | --- | --- | --- |
-| `test_controller_adb.py` | 9 | device parsing, forward ownership, cleanup, timeouts |
+| `test_controller_adb.py` | 14 | device parsing, forward ownership, cleanup, timeouts, a missing adb being a state (discovery injected), commands running the **discovered** binary rather than a bare `adb` |
 | `test_controller_adb_discovery.py` | 29 | every SDK location, override/PATH order, duplicates, cable vs `_adb-tls-connect._tcp` vs `IP:port` vs emulator, state explanations |
 | `test_controller_netprobe.py` | 20 | TCP probes, Windows/macOS/Linux route parsing, no invented gateway, Public/Private profile |
 | `test_controller_transports.py` | 20 | ranking, USB/beacon/cache providers, dead addresses dropped |
 | `test_controller_hotspot.py` | 34 | directed-broadcast beacon source, advertised hosts, gateway candidates, typed address, per-source manager diagnostics, firewall sentence |
-| `test_controller_diagnostics.py` | 8 | de-duplication, first timestamp kept, bounded pane |
+| `test_controller_diagnostics.py` | 12 | de-duplication, first timestamp kept, bounded pane, local (not UTC) timestamps, injectable stamp |
 | `test_controller_capabilities.py` | 15 | five states, contradictions, drift against Kotlin |
 | `test_controller_manager.py` | 24 | every state, pairing, duplicate connect, drop, heartbeat, backoff, cleanup |
 | `test_controller_view.py` | 21 | button enablement, tri-state cells, honest authentication line |
