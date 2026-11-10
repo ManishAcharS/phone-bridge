@@ -6,6 +6,8 @@ UI that can actually be wrong, so they live outside tkinter.
 
 from __future__ import annotations
 
+import pytest
+
 from phonebridge.controller.capabilities import build_registry
 from phonebridge.controller.manager import Snapshot, State
 from phonebridge.controller.view import (
@@ -48,13 +50,45 @@ def test_disconnected_offers_connect() -> None:
     assert view.tone == TONE_IDLE
 
 
+@pytest.mark.parametrize(
+    ("kind", "words"),
+    [
+        ("usb", "USB (adb forward)"),
+        ("adb-wireless", "adb over Wi-Fi"),
+        ("gateway", "hotspot gateway"),
+        ("manual", "typed address"),
+        ("cached", "saved address"),
+        ("hotspot", "hotspot"),
+    ],
+)
+def test_every_transport_has_a_sentence(kind: str, words: str) -> None:
+    assert transport_text(Snapshot(transport=kind)) == words
+
+
 def test_connected_offers_disconnect_and_reconnect() -> None:
-    view = build_view(snapshot(state=State.CONNECTED, transport="usb", endpoint="127.0.0.1:50001"))
+    view = build_view(
+        snapshot(
+            state=State.CONNECTED,
+            transport="usb",
+            endpoint="127.0.0.1:50001",
+            auth_ok=True,
+            server_reachable=True,
+        )
+    )
     assert not view.connect_enabled
     assert view.disconnect_enabled and view.reconnect_enabled
     assert view.tone == TONE_OK
     assert view.transport == "USB (adb forward)"
     assert "Pinned key verified" in view.authentication
+    assert view.auth_ok.startswith("yes")
+
+
+def test_connected_without_a_confirmed_handshake_does_not_claim_authentication() -> None:
+    """``state=CONNECTED`` alone is not proof the pinned key was verified."""
+    view = build_view(snapshot(state=State.CONNECTED, transport="usb"))
+    assert "Pinned key verified" not in view.authentication
+    assert "not confirmed" in view.authentication
+    assert view.auth_ok == "not authenticated"
 
 
 def test_every_busy_state_disables_connect() -> None:

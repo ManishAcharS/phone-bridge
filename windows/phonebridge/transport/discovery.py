@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import time
 from collections.abc import Callable
@@ -54,6 +55,14 @@ class DiscoveredPhone:
     port: int
     method: str
     last_seen: float = field(default_factory=time.time)
+    #: Every address the phone lists for itself, if it sends them.
+    #:
+    #: Additive and optional: a phone that is both a hotspot and on a LAN can
+    #: announce both, and a hotspot's own broadcast sometimes only leaves through
+    #: one interface. ``host`` is still the datagram's source address, which is
+    #: the one address that is known to be reachable from the PC. An older app
+    #: sends no list at all, and this stays empty.
+    hosts: tuple[str, ...] = ()
 
     @property
     def uri(self) -> str:
@@ -68,7 +77,40 @@ class DiscoveredPhone:
             "method": self.method,
             "uri": self.uri,
             "age_s": round(time.time() - self.last_seen, 1),
+            "hosts": list(self.hosts),
         }
+
+
+_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
+#: A phone has a handful of interfaces; more than this is not a phone.
+MAX_ADVERTISED_HOSTS = 8
+
+
+def parse_advertised_hosts(raw: object) -> tuple[str, ...]:
+    """Validate the optional ``hosts`` list from a beacon.
+
+    Untrusted input: only dotted-quad IPv4 literals survive, at most
+    ``MAX_ADVERTISED_HOSTS`` of them, without duplicates. Anything else - a
+    hostname, a URL, an address with a port - is dropped rather than handed to a
+    connector.
+    """
+    if not isinstance(raw, list):
+        return ()
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        candidate = item.strip()
+        if len(candidate) > 15 or not _IPV4_RE.match(candidate):
+            continue
+        if candidate.startswith(("0.", "127.", "255.")):
+            continue
+        if candidate not in out:
+            out.append(candidate)
+        if len(out) >= MAX_ADVERTISED_HOSTS:
+            break
+    return tuple(out)
 
 
 class _BeaconProtocol(asyncio.DatagramProtocol):
@@ -103,6 +145,7 @@ class _BeaconProtocol(asyncio.DatagramProtocol):
             host=host,
             port=port,
             method=device_label(msg.get("method"), limit=MAX_METHOD_LEN, fallback="wifi"),
+            hosts=parse_advertised_hosts(msg.get("hosts")),
         )
         is_new = device_id not in self.table
         self.table[device_id] = phone

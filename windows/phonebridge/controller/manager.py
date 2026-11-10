@@ -44,9 +44,20 @@ from ..core.session import (
     SessionError,
     TerminalSessionError,
 )
-from ..transport.link import websocket_uri
+from ..transport.link import DEFAULT_PORT, websocket_uri
 from .capabilities import Capability, build_registry
-from .transports import Candidate, CandidateProvider, default_providers, rank
+from .diagnostics import Diagnostics
+from .netprobe import network_profile, tcp_probe
+from .transports import (
+    BeaconCandidates,
+    Candidate,
+    CandidateProvider,
+    FixedCandidates,
+    GatewayCandidates,
+    UsbCandidates,
+    default_providers,
+    rank,
+)
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +115,14 @@ class Snapshot:
     attempts: int = 0
     last_error: str | None = None
     adb_available: bool = False
+    adb_path: str | None = None
+    adb_detail: str = ""
+    usb_available: bool = False
+    wifi_status: str = "not checked yet"
+    server_reachable: bool | None = None
+    auth_ok: bool = False
+    last_discovery_error: str | None = None
+    last_connection_error: str | None = None
     next_retry_in: float | None = None
 
     @property
@@ -118,12 +137,16 @@ class Snapshot:
         return str(name or model or "no phone")
 
     def auth_line(self) -> str:
-        if self.state is State.CONNECTED:
+        if self.state is State.CONNECTED and self.auth_ok:
             return "Pinned key verified · AES-256-GCM"
+        if self.state is State.CONNECTED:
+            return "Connected (authentication not confirmed)"
         if self.state is State.PAIRING_REQUIRED:
             return "Waiting for you to compare the code"
         if self.state is State.AUTHENTICATING:
             return "Verifying the phone's key"
+        if self.auth_ok:
+            return "Was authenticated; not connected now"
         return "Not authenticated"
 
 
@@ -182,6 +205,11 @@ class ConnectionManager:
         self._sleep = sleeper or asyncio.sleep
 
         self._snapshot = Snapshot()
+        self._diag = Diagnostics(limit=diagnostics_limit)
+        self._manual: FixedCandidates | None = None
+        self._last_found: list[Candidate] = []
+        self._profile: str | None = None
+        self._profile_at: float = 0.0
         self._session: BridgeSession | None = None
         self._task: asyncio.Task[None] | None = None
         self._heartbeat: asyncio.Task[None] | None = None
@@ -224,10 +252,9 @@ class ConnectionManager:
         log.info("state=%s %s", state.value, message)
 
     def _log(self, text: str) -> None:
-        line = f"{time.strftime('%H:%M:%S')}  {text}"
         log.info(text)
-        merged = (*self._snapshot.diagnostics, line)[-self.diagnostics_limit :]
-        self._publish(diagnostics=merged)
+        self._diag.add(text)
+        self._publish(diagnostics=self._diag.render())
 
     def subscribe(self, listener: Emitter) -> None:
         """Call ``listener(snapshot)`` on every change. Additive and idempotent."""
@@ -267,13 +294,42 @@ class ConnectionManager:
         self._ever_connected = False
         self._pairing_decision = None
         self._pairing_declined = False
-        self._set(State.DISCONNECTED, reason, transport=None, endpoint=None, pairing_code=None,
-                  next_retry_in=None)
+        self._set(
+            State.DISCONNECTED,
+            reason,
+            transport=None,
+            endpoint=None,
+            pairing_code=None,
+            next_retry_in=None,
+            auth_ok=False,
+            server_reachable=None,
+        )
 
     async def reconnect(self) -> None:
         """Force a new attempt now, even mid-backoff."""
         await self.disconnect("reconnecting on request")
         await self.connect()
+
+    @property
+    def provider_names(self) -> tuple[str, ...]:
+        """The discovery sources in the order they are asked."""
+        return tuple(getattr(provider, "name", "?") for provider in self._providers)
+
+    def set_manual_endpoint(self, host: str, port: int | None = None) -> None:
+        """Try one address the user typed, ahead of anything discovered.
+
+        Passing an empty host clears it. The provider stays in the list until
+        cleared, so a reconnect after a drop still tries it.
+        """
+        cleaned = host.strip()
+        self._providers = [p for p in self._providers if not isinstance(p, FixedCandidates)]
+        if not cleaned:
+            self._manual = None
+            self._log("manual endpoint cleared")
+            return
+        self._manual = FixedCandidates(cleaned, port or DEFAULT_PORT)
+        self._providers.append(self._manual)
+        self._log(f"manual endpoint set to {cleaned}:{port or DEFAULT_PORT}")
 
     def resolve_pairing(self, approve: bool) -> None:
         """Answer the pairing prompt (called from any thread)."""
@@ -355,7 +411,14 @@ class ConnectionManager:
 
     def _fail(self, message: str) -> None:
         self._log(f"error: {message}")
-        self._set(State.ERROR, message, last_error=message, next_retry_in=None)
+        self._set(
+            State.ERROR,
+            message,
+            last_error=message,
+            last_connection_error=message,
+            next_retry_in=None,
+            auth_ok=False,
+        )
 
     async def _wait_out(self, delay: float) -> None:
         # Either the wait elapses (normal: try again) or disconnect() sets the
@@ -376,44 +439,166 @@ class ConnectionManager:
             )
         last: Exception | None = None
         for candidate in rank(candidates):
+            reachable = await tcp_probe(candidate.host, candidate.port, timeout=0.8)
+            self._publish(server_reachable=reachable)
+            if not reachable:
+                self._log(
+                    f"no TCP answer from {candidate.endpoint} ({candidate.kind}) - "
+                    "the phone app may be stopped, or a firewall/access point is dropping it"
+                )
             self._set(
                 State.CONNECTING,
                 f"connecting over {candidate.kind}",
                 transport=candidate.kind,
                 endpoint=candidate.endpoint,
+                server_reachable=reachable,
             )
             try:
                 session = await self._open(candidate)
             except _RetryCandidate as exc:
                 last = exc
+                self._publish(last_connection_error=str(exc))
                 self._log(f"{candidate.endpoint} ({candidate.kind}): {exc}")
                 continue
             try:
                 await self._run_session(candidate, session)
             except _RetryCandidate as exc:
                 last = exc
+                self._publish(last_connection_error=str(exc))
                 self._log(f"{candidate.endpoint} ({candidate.kind}): {exc}")
                 continue
             return
         raise _RetryCandidate(str(last) if last else "every candidate failed")
 
     async def _discover(self) -> list[Candidate]:
+        """Ask every source, then record *why* each one did or did not answer.
+
+        The window must be able to separate four different failures that all used
+        to read "no phone found": adb missing, adb present with no cable, beacons
+        heard but nothing reachable, and beacons not heard at all.
+        """
         self._set(State.DISCOVERING, "looking for your phone")
         results = await asyncio.gather(
             *(self._provider_candidates(provider) for provider in self._providers),
             return_exceptions=True,
         )
         found: list[Candidate] = []
+        discovery_errors: list[str] = []
         for provider, result in zip(self._providers, results, strict=False):
             if isinstance(result, BaseException):
+                discovery_errors.append(f"{provider.name}: {result}")
                 self._log(f"{provider.name}: discovery failed: {result}")
                 continue
             found.extend(result)
+
+        statuses = self._provider_status()
+        for line in statuses["lines"]:
+            self._log(line)
+        self._last_found = list(found)
         for candidate in rank(found):
-            self._log(f"found {candidate.kind} at {candidate.endpoint} — {candidate.detail}")
+            self._log(f"found {candidate.kind} at {candidate.endpoint} - {candidate.detail}")
         if not found:
-            self._log("no candidates: no adb device, no beacon, no cached address answered")
+            self._log("no candidates: adb, the beacon, the gateway and the cache all said no")
+
+        if statuses["server_reachable"] is not None:
+            self._publish(server_reachable=statuses["server_reachable"])
+        self._publish(
+            adb_available=statuses["adb_available"],
+            adb_path=statuses["adb_path"],
+            adb_detail=statuses["adb_detail"],
+            usb_available=statuses["usb_available"],
+            wifi_status=statuses["wifi_status"],
+            last_discovery_error=(
+                statuses["discovery_error"] or (discovery_errors[0] if discovery_errors else None)
+            ),
+        )
         return found
+
+    def _firewall_hint(self) -> str:
+        """Explain a silent beacon on Windows, where Public networks drop UDP.
+
+        Cached for a minute: it costs a PowerShell call, and the answer does not
+        change between two retries half a second apart.
+        """
+        now = time.monotonic()
+        if now - self._profile_at > 60.0:
+            self._profile = network_profile()
+            self._profile_at = now
+        if (self._profile or "").lower() != "public":
+            return ""
+        return (
+            " (Windows treats this network as Public, which blocks the discovery "
+            "datagram - allow PhoneBridge through the firewall, or type the phone's "
+            "address below)"
+        )
+
+    def _provider_status(self) -> dict[str, Any]:
+        """Summarise what each provider just observed, in one place."""
+        lines: list[str] = []
+        adb_available = False
+        adb_path: str | None = None
+        adb_detail = ""
+        usb_available = False
+        wifi_status = "not checked"
+        discovery_error: str | None = None
+        server_reachable: bool | None = None
+
+        for provider in self._providers:
+            if isinstance(provider, UsbCandidates):
+                status = provider.last_status
+                if status is None:  # the provider never ran; asking is a subprocess
+                    with contextlib.suppress(Exception):
+                        status = provider.status()
+                if status is None:  # pragma: no cover - adb could not even be asked
+                    lines.append("adb has not been checked yet")
+                    continue
+                adb_available = status.available
+                adb_path = status.path
+                adb_detail = provider.summary()
+                usb_available = provider.usb_available
+                lines.append(adb_detail)
+                if not status.available:
+                    discovery_error = discovery_error or (
+                        status.error or "adb not found - USB unavailable, Wi-Fi unaffected"
+                    )
+                elif not usb_available and provider.last_error:
+                    discovery_error = discovery_error or provider.last_error
+            elif isinstance(provider, BeaconCandidates):
+                heard = len(provider.last_seen)
+                if provider.last_error_permission:
+                    wifi_status = f"listener blocked: {provider.last_error_permission}"
+                    discovery_error = discovery_error or provider.last_error_permission
+                elif heard:
+                    wifi_status = f"{heard} phone(s) announcing"
+                else:
+                    wifi_status = "no beacons heard" + self._firewall_hint()
+                lines.append(f"wifi discovery: {wifi_status}")
+            elif isinstance(provider, GatewayCandidates):
+                if provider.last_checked:
+                    # "the gateway did not answer" is a reachability fact, not a
+                    # discovery failure: the window shows them in different rows.
+                    server_reachable = bool(provider.last_answered)
+                if provider.last_error:
+                    lines.append(f"hotspot fallback: {provider.last_error}")
+                    discovery_error = discovery_error or provider.last_error
+            elif isinstance(provider, FixedCandidates) and provider.reachable is not None:
+                lines.append(
+                    f"manual endpoint {provider.host}:{provider.port} "
+                    + ("answers" if provider.reachable else "does not answer")
+                )
+
+        if not self._last_found:
+            discovery_error = discovery_error or "nothing answered on USB, beacon, gateway or cache"
+        return {
+            "lines": lines,
+            "adb_available": adb_available,
+            "adb_path": adb_path,
+            "adb_detail": adb_detail,
+            "usb_available": usb_available,
+            "wifi_status": wifi_status,
+            "discovery_error": discovery_error,
+            "server_reachable": server_reachable,
+        }
 
     async def _provider_candidates(self, provider: CandidateProvider) -> list[Candidate]:
         return await asyncio.wait_for(
@@ -533,6 +718,8 @@ class ConnectionManager:
             pairing_code=None,
             last_error=None,
             next_retry_in=None,
+            auth_ok=True,
+            server_reachable=True,
         )
         self._log(
             f"connected over {candidate.kind} at {candidate.endpoint}; "

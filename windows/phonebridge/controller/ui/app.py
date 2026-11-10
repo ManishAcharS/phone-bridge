@@ -22,7 +22,17 @@ from typing import Any
 from ...core.device_store import DeviceStore
 from ..manager import ConnectionManager, Snapshot
 from ..runtime import BackgroundRuntime
-from ..view import TONE_BUSY, TONE_ERROR, TONE_IDLE, TONE_OK, TONE_WARN, View, build_view
+from ..view import (
+    TONE_BUSY,
+    TONE_ERROR,
+    TONE_IDLE,
+    TONE_OK,
+    TONE_WARN,
+    EndpointError,
+    View,
+    build_view,
+    parse_endpoint,
+)
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +60,7 @@ class PhoneBridgeApp:
         *,
         auto_connect: bool = False,
         discovery_timeout: float = 3.0,
+        endpoint: str | None = None,
     ) -> None:
         self.root = root
         self.store = store
@@ -70,7 +81,10 @@ class PhoneBridgeApp:
         self._build()
         self.runtime.start()
         self.root.after(80, self._pump)
-        if auto_connect:
+        if endpoint:
+            self.endpoint_var.set(endpoint)
+            self._use_endpoint()
+        elif auto_connect:
             self.runtime.connect()
 
     # ------------------------------------------------------------------ #
@@ -121,6 +135,25 @@ class PhoneBridgeApp:
         self.reconnect_button = ttk.Button(buttons, text="Reconnect", command=self._reconnect)
         self.reconnect_button.pack(side="left")
 
+        manual = ttk.Frame(outer)
+        manual.pack(fill="x", pady=(10, 0))
+        ttk.Label(manual, text="Phone address").pack(side="left")
+        self.endpoint_var = tk.StringVar()
+        self.endpoint_entry = ttk.Entry(manual, textvariable=self.endpoint_var, width=22)
+        self.endpoint_entry.pack(side="left", padx=(8, 6))
+        self.endpoint_entry.bind("<Return>", lambda _event: self._use_endpoint())
+        self.endpoint_button = ttk.Button(
+            manual, text="Use this address", command=self._use_endpoint
+        )
+        self.endpoint_button.pack(side="left")
+        ttk.Button(manual, text="Clear", command=self._clear_endpoint).pack(side="left", padx=6)
+        tk.Label(
+            manual,
+            text="for when the beacon is blocked — IP, or IP:port",
+            bg=BACKGROUND,
+            fg="#8a929c",
+        ).pack(side="left", padx=(6, 0))
+
         self.pairing_frame = tk.Frame(outer, bg="#fff4d6", highlightthickness=1,
                                       highlightbackground="#e2c274")
         tk.Label(
@@ -152,12 +185,19 @@ class PhoneBridgeApp:
             ("connected_for", "Connected for"),
             ("attempts", "Attempts"),
             ("adb", "adb"),
+            ("adb_path", "adb path"),
+            ("usb", "Physical USB"),
+            ("wifi", "Wi-Fi discovery"),
+            ("server", "Phone server reachable"),
+            ("authentication_ok", "Authenticated"),
+            ("discovery_error", "Last discovery error"),
+            ("connection_error", "Last connection error"),
         )
         for column, (key, label) in enumerate(fields):
             row, col = divmod(column, 4)
             ttk.Label(details, text=label).grid(row=row * 2, column=col, sticky="w", padx=(0, 12))
             value = tk.Label(
-                details, text="—", bg=CARD, anchor="w", justify="left", wraplength=200
+                details, text="—", bg=CARD, anchor="w", justify="left", wraplength=210
             )
             value.grid(row=row * 2 + 1, column=col, sticky="w", padx=(0, 12), pady=(0, 6))
             self.detail_values[key] = value
@@ -221,6 +261,22 @@ class PhoneBridgeApp:
     def _reconnect(self) -> None:
         self.runtime.reconnect()
 
+    def _use_endpoint(self) -> None:
+        typed = self.endpoint_var.get().strip()
+        if not typed:
+            return
+        try:
+            host, port = parse_endpoint(typed)
+        except EndpointError as exc:
+            self.message_label.configure(text=str(exc))
+            return
+        self.runtime.set_endpoint(host, port)
+        self.runtime.connect()
+
+    def _clear_endpoint(self) -> None:
+        self.endpoint_var.set("")
+        self.runtime.set_endpoint("")
+
     def _pair(self, approve: bool) -> None:
         self.runtime.resolve_pairing(approve)
 
@@ -257,6 +313,13 @@ class PhoneBridgeApp:
             ("connected_for", view.connected_for),
             ("attempts", view.attempts),
             ("adb", view.adb),
+            ("adb_path", view.adb_path),
+            ("usb", view.usb),
+            ("wifi", view.wifi),
+            ("server", view.server),
+            ("authentication_ok", view.auth_ok),
+            ("discovery_error", view.discovery_error),
+            ("connection_error", view.connection_error),
         ):
             widget = self.detail_values.get(key)
             if widget is not None:
@@ -308,6 +371,7 @@ def run_gui(
     config_dir: str | None = None,
     auto_connect: bool = False,
     discovery_timeout: float = 3.0,
+    endpoint: str | None = None,
 ) -> int:
     """Open the controller window. Returns a process exit code."""
     try:
@@ -317,7 +381,11 @@ def run_gui(
         return 2
     store = DeviceStore(Path(config_dir)) if config_dir else DeviceStore()
     app = PhoneBridgeApp(
-        root, store, auto_connect=auto_connect, discovery_timeout=discovery_timeout
+        root,
+        store,
+        auto_connect=auto_connect,
+        discovery_timeout=discovery_timeout,
+        endpoint=endpoint,
     )
     try:
         root.mainloop()

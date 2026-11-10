@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..transport.link import DEFAULT_PORT
 from .capabilities import Capability
 from .manager import Snapshot, State
 
@@ -34,8 +35,11 @@ _TONES: dict[State, str] = {
 _TRANSPORT_WORDS = {
     "usb": "USB (adb forward)",
     "usb-wireless": "USB debugging over Wi-Fi",
+    "adb-wireless": "adb over Wi-Fi",
     "wifi": "Wi-Fi",
     "hotspot": "hotspot",
+    "gateway": "hotspot gateway",
+    "manual": "typed address",
     "cached": "saved address",
 }
 
@@ -73,6 +77,95 @@ class View:
     error_text: str
     capabilities: tuple[CapabilityRow, ...]
     diagnostics: str
+    # Milestone 2: the window has to separate the failures that all used to
+    # read "no phone found".
+    adb_path: str = "—"
+    usb: str = "—"
+    wifi: str = "—"
+    server: str = "—"
+    auth_ok: str = "—"
+    discovery_error: str = "—"
+    connection_error: str = "—"
+
+
+def tri(value: bool | None, yes: str, no: str, unknown: str = "not checked yet") -> str:
+    """Spell a yes/no/unknown honestly — ``None`` is never rendered as "no"."""
+    if value is None:
+        return unknown
+    return yes if value else no
+
+
+def adb_text(snapshot: Snapshot) -> str:
+    """What adb is, where it came from, and whether it can see anything."""
+    if not snapshot.adb_available:
+        detail = f" ({snapshot.adb_detail})" if snapshot.adb_detail else ""
+        return f"not found — USB unavailable, Wi-Fi unaffected{detail}"
+    return snapshot.adb_detail or "ready"
+
+
+def adb_path_text(snapshot: Snapshot) -> str:
+    return snapshot.adb_path or "not found in PATH, ANDROID_HOME, ANDROID_SDK_ROOT or the usual SDK folders"
+
+
+def usb_text(snapshot: Snapshot) -> str:
+    if not snapshot.adb_available:
+        return "unavailable — adb is not installed"
+    if snapshot.usb_available:
+        return "yes — a cable-attached device is listed"
+    return "no device on USB — plug in the cable and accept the debugging prompt"
+
+
+def server_text(snapshot: Snapshot) -> str:
+    return tri(
+        snapshot.server_reachable,
+        "yes — the phone app answered on TCP",
+        "no — nothing is listening at that address",
+    )
+
+
+def auth_text(snapshot: Snapshot) -> str:
+    return tri(
+        snapshot.auth_ok,
+        "yes — pinned key verified, AES-256-GCM in use",
+        "not authenticated",
+        "not yet",
+    )
+
+
+def discovery_text(snapshot: Snapshot) -> str:
+    return snapshot.last_discovery_error or "none"
+
+
+def connection_text(snapshot: Snapshot) -> str:
+    return snapshot.last_connection_error or "none"
+
+
+class EndpointError(ValueError):
+    """What the user typed is not an address we can try."""
+
+
+def parse_endpoint(text: str, default_port: int = DEFAULT_PORT) -> tuple[str, int]:
+    """``"10.0.0.5"`` or ``"10.0.0.5:8765"`` -> ``(host, port)``.
+
+    Deliberately strict about the port and permissive about the host: a hostname
+    is a valid thing to type, a nonsense port is not.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        raise EndpointError("type the phone's address, for example 192.168.1.20:8765")
+    host, separator, port_text = cleaned.partition(":")
+    host = host.strip()
+    if not host or " " in host:
+        raise EndpointError(f"'{text.strip()}' is not a host address")
+    if not separator or not port_text.strip():
+        return host, default_port
+    port_text = port_text.strip()
+    if not port_text.isdigit():
+        raise EndpointError(f"'{port_text}' is not a port number")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise EndpointError(f"port {port} is outside 1-65535")
+    return host, port
 
 
 def cell(value: bool | None, *, not_required: bool = False) -> str:
@@ -152,7 +245,7 @@ def build_view(snapshot: Snapshot) -> View:
         transport=transport_text(snapshot),
         endpoint=snapshot.endpoint or "—",
         authentication=snapshot.auth_line(),
-        adb="found" if snapshot.adb_available else "not on PATH (USB unavailable)",
+        adb=adb_text(snapshot),
         attempts=str(snapshot.attempts) if snapshot.attempts else "—",
         connected_for=connected_for(snapshot),
         summary=summary(snapshot),
@@ -165,6 +258,13 @@ def build_view(snapshot: Snapshot) -> View:
         error_text=snapshot.message if state is State.ERROR else "",
         capabilities=tuple(capability_row(c) for c in snapshot.capabilities),
         diagnostics="\n".join(snapshot.diagnostics) or "Nothing logged yet.",
+        adb_path=adb_path_text(snapshot),
+        usb=usb_text(snapshot),
+        wifi=snapshot.wifi_status or "not checked yet",
+        server=server_text(snapshot),
+        auth_ok=auth_text(snapshot),
+        discovery_error=discovery_text(snapshot),
+        connection_error=connection_text(snapshot),
     )
 
 

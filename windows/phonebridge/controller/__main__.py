@@ -22,6 +22,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="how long to listen for the phone's beacon (default 3)")
     parser.add_argument("--config-dir", default=None,
                         help="override the config directory (portable mode)")
+    parser.add_argument("--endpoint", default=None, metavar="HOST[:PORT]",
+                        help="try this phone address first, e.g. 192.168.1.20:8765 "
+                             "(useful when the beacon is blocked)")
     return parser
 
 
@@ -38,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
         config_dir=args.config_dir,
         auto_connect=args.auto_connect,
         discovery_timeout=args.discovery_timeout,
+        endpoint=args.endpoint,
     )
 
 

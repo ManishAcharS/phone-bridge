@@ -47,11 +47,18 @@ def test_gui_passes_its_arguments_to_the_window(monkeypatch, tmp_path) -> None:
             "--auto-connect",
             "--discovery-timeout",
             "1.5",
+            "--endpoint",
+            "10.0.0.5:8765",
         ]
     )
     assert code == 0
     assert calls == [
-        {"config_dir": str(tmp_path), "auto_connect": True, "discovery_timeout": 1.5}
+        {
+            "config_dir": str(tmp_path),
+            "auto_connect": True,
+            "discovery_timeout": 1.5,
+            "endpoint": "10.0.0.5:8765",
+        }
     ]
 
 

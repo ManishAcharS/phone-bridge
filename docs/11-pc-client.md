@@ -96,7 +96,7 @@ The build previously emitted a setuptools deprecation warning
 
 | Command | What it answers | Needs a phone |
 | --- | --- | --- |
-| `gui` | desktop controller: one Connect button, auto-reconnect | no |
+| `gui` | desktop controller: one Connect button, auto-reconnect (`--auto-connect`, `--endpoint HOST[:PORT]`, `--discovery-timeout`, `--config-dir`) | no |
 | `doctor` | is this PC set up? | no |
 | `identity` | who is this PC, which phones are pinned? | no |
 | `devices` | what do I know, and what is announcing itself? | no (beacons optional) |
@@ -126,13 +126,25 @@ one Connect button, and it keeps working when the network moves underneath it.
 phonebridge gui                      # open the window
 phonebridge gui --auto-connect       # connect as soon as it opens
 python -m phonebridge.controller     # same thing, without the console script
+python -m phonebridge.controller --endpoint 10.0.0.5:8765   # try this address first
 ```
+
+On Windows the shortest path is double-clicking **`PhoneBridge-Start.bat`** in the
+repository root: it updates the checkout, builds `.venv`, installs the dev extras
+and opens the window, keeping your uncommitted work. Arguments pass through
+(`PhoneBridge-Start.bat --endpoint 10.0.0.5`).
 
 What it does that the CLI does not:
 
-- **Finds the phone itself** — no `--host`. It asks three sources in this order:
-  a USB device (via an `adb forward` it creates and later removes), the phone's
-  UDP beacon, then the last address that worked (probed before use).
+- **Finds the phone itself** — no `--host`. It asks, in rank order: a USB device
+  (via an `adb forward` it creates and later removes), an address you typed, adb
+  over Wi-Fi, the phone's UDP beacon (including any extra interface it
+  advertises), the default gateway — because on a hotspot the gateway *is* the
+  phone — and finally the last address that worked (probed before use). The
+  gateway is one TCP connect to one address per interface, not a scan.
+- **Finds `adb` anywhere** — `PATH`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`,
+  `%LOCALAPPDATA%\Android\Sdk` and the other usual SDK folders. `adb` is not
+  required for Wi-Fi, and a wireless-debugging bridge is never labelled USB.
 - **Pairs in the window** — the six-digit code is shown next to Approve/Reject;
   the answer is applied to that one handshake. Nothing is cached.
 - **Survives a drop** — a closed socket or two missed heartbeats put it into
@@ -142,7 +154,12 @@ What it does that the CLI does not:
   available / active — instead of a single yes/no, so "no camera" is never
   confused with "no permission".
 - **Keeps a diagnostics pane** — every discovery decision, address and failure,
-  in order.
+  in order, de-duplicated: a repeat bumps a counter instead of pushing the reason
+  out of view.
+- **Tells the failures apart** — adb missing vs no cable vs unauthorised, no
+  beacon heard vs a Public network where Windows drops UDP, and "nothing is
+  listening at that address" vs "the beacon never arrived". A `Phone address`
+  field is the manual fallback when discovery is blocked.
 
 It is a shell over the same session the CLI uses: same pinning, same SAS, same
 AES-256-GCM, same protocol v1. `docs/17-connection-controller.md` is the full

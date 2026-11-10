@@ -15,7 +15,7 @@ is left, item by item.
 
 | | |
 | --- | --- |
-| **PC client** | complete, 575 automated tests, type-checked, linted |
+| **PC client** | complete, 703 automated tests, type-checked, linted |
 | **Android app** | complete, compiled against a stub environment, source-audited |
 | **Protocol** | v1, frozen; wire format in [`docs/03-protocol.md`](docs/03-protocol.md) |
 | **Audio relay** | **not implemented** — Phase 2, gated on per-device measurements |
@@ -24,15 +24,28 @@ is left, item by item.
 
 ## The one-click controller
 
+**Windows: double-click `PhoneBridge-Start.bat` in this folder.** It checks Git
+and Python, saves and restores any local changes around a fast-forward-only
+update, builds `.venv`, installs the dev extras and opens the window. Safe to run
+repeatedly; it never resets, cleans or drops a stash.
+
 ```powershell
-phonebridge gui          # Windows: one window, one Connect button
+phonebridge gui          # or, from a terminal: one window, one Connect button
 ```
 
-The window finds the phone by itself — USB first (it sets up and later removes
-its own `adb forward`), then the phone's UDP beacon, then the last address that
-worked — pairs with the six-digit code, shows the five capability states, keeps
-a diagnostics pane, and reconnects with backoff when the network moves. No IP
-addresses, no ports, no repeated terminal commands.
+The window finds the phone by itself — a USB cable first (it sets up and later
+removes its own `adb forward`), then an address you typed, then adb over Wi-Fi,
+then the phone's UDP beacon, then the default gateway (on a hotspot the gateway
+*is* the phone), then the last address that worked — pairs with the six-digit
+code, shows the five capability states, keeps a de-duplicated diagnostics pane,
+and reconnects with backoff when the network moves. No IP addresses, no ports, no
+repeated terminal commands.
+
+`adb` does **not** have to be on `PATH`: `PATH`, `ANDROID_HOME`,
+`ANDROID_SDK_ROOT` and the usual `%LOCALAPPDATA%\Android\Sdk` folders are all
+searched, and a wireless-debugging bridge is never labelled USB. If discovery is
+blocked (a Public network, or a hotspot that drops UDP) the window says so and
+the `Phone address` field takes an IP directly.
 
 It is a shell over the same authenticated session as the CLI (protocol v1,
 unchanged). Requires tkinter, which the python.org Windows installer includes.
@@ -253,7 +266,7 @@ and [`docs/16-known-limitations.md`](docs/16-known-limitations.md).
 
 ```powershell
 cd windows
-python -m pytest -q          # 575 tests
+python -m pytest -q          # 703 tests
 python tools\verify.py       # tests + lint + types + vectors + CLI smoke (7 checks)
 ```
 
@@ -277,13 +290,15 @@ Android app; that needs a device and the checklist in
 ## Repository layout
 
 ```
+PhoneBridge-Start.bat       Windows one-click launcher (update, venv, install, run)
 docs/                       architecture, protocol, guides, audits, release docs
 windows/phonebridge/
   protocol/                 framing, crypto, messages  (canonical reference)
   transport/                WebSocket link, UDP discovery
   core/                     session, reconnection supervisor, device store
   cli/                      the `phonebridge` command
-windows/tests/              575 tests
+  controller/               discovery, USB/hotspot reliability, the desktop window
+windows/tests/              703 tests
 android/app/src/main/java/dev/phonebridge/
   protocol/                 byte-identical Kotlin port + known-answer vectors
   net/                      server, pairing store, identity, discovery, probes
