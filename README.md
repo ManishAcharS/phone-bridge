@@ -15,12 +15,28 @@ is left, item by item.
 
 | | |
 | --- | --- |
-| **PC client** | complete, 479 automated tests, type-checked, linted |
+| **PC client** | complete, 575 automated tests, type-checked, linted |
 | **Android app** | complete, compiled against a stub environment, source-audited |
 | **Protocol** | v1, frozen; wire format in [`docs/03-protocol.md`](docs/03-protocol.md) |
 | **Audio relay** | **not implemented** — Phase 2, gated on per-device measurements |
 
 ---
+
+## The one-click controller
+
+```powershell
+phonebridge gui          # Windows: one window, one Connect button
+```
+
+The window finds the phone by itself — USB first (it sets up and later removes
+its own `adb forward`), then the phone's UDP beacon, then the last address that
+worked — pairs with the six-digit code, shows the five capability states, keeps
+a diagnostics pane, and reconnects with backoff when the network moves. No IP
+addresses, no ports, no repeated terminal commands.
+
+It is a shell over the same authenticated session as the CLI (protocol v1,
+unchanged). Requires tkinter, which the python.org Windows installer includes.
+Full reference: [`docs/17-connection-controller.md`](docs/17-connection-controller.md).
 
 ## What works today
 
@@ -237,7 +253,7 @@ and [`docs/16-known-limitations.md`](docs/16-known-limitations.md).
 
 ```powershell
 cd windows
-python -m pytest -q          # 479 tests
+python -m pytest -q          # 575 tests
 python tools\verify.py       # tests + lint + types + vectors + CLI smoke (7 checks)
 ```
 
@@ -267,7 +283,7 @@ windows/phonebridge/
   transport/                WebSocket link, UDP discovery
   core/                     session, reconnection supervisor, device store
   cli/                      the `phonebridge` command
-windows/tests/              479 tests
+windows/tests/              575 tests
 android/app/src/main/java/dev/phonebridge/
   protocol/                 byte-identical Kotlin port + known-answer vectors
   net/                      server, pairing store, identity, discovery, probes

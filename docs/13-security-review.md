@@ -37,7 +37,7 @@ Reproduce:
 ```powershell
 cd windows
 pytest -q tests/test_security_hardening.py      # 37 tests
-pytest -q                                        # 479 tests
+pytest -q                                        # 575 tests
 cd .. ; ruff check . ; python tools/verify.py
 ```
 
@@ -382,8 +382,8 @@ parametrised coverage:
 * phone-side behaviour (origin, oversize, busy, expiry, cap): 5
 * Android source guards: 5
 
-Total suite: **479 passed** (was 425; 37 from this pass, 14 release-metadata
-tests and 3 Kotlin compile guards added later), `ruff` clean, `tools/verify.py` 7/7.
+Total suite: **575 passed** (was 425; 37 from this pass, 14 release-metadata
+tests, 3 Kotlin compile guards and 95 connection-controller tests added later), `ruff` clean, `tools/verify.py` 7/7.
 
 One non-security flake was found and removed while verifying the above: the
 self-test's timeout row armed its deadline *after* awaiting the send, so on a

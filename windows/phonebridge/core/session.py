@@ -131,6 +131,9 @@ class PhoneInfo:
 
 
 PairingConfirm = Callable[[str], Awaitable[bool] | bool]
+#: Optional progress hook: "handshake" once the socket is open, "ready" when
+#: the phone has accepted us. Purely observational - it cannot change the flow.
+PhaseHandler = Callable[[str], None]
 EventHandler = Callable[[str, dict[str, Any]], None]
 BlobHandler = Callable[[int, bytes], None]
 
@@ -147,6 +150,7 @@ class BridgeSession:
         confirm_pairing: PairingConfirm | None = None,
         on_event: EventHandler | None = None,
         on_blob: BlobHandler | None = None,
+        on_phase: PhaseHandler | None = None,
         request_timeout: float = 15.0,
         link: WebSocketLink | None = None,
     ) -> None:
@@ -156,6 +160,7 @@ class BridgeSession:
         self.confirm_pairing = confirm_pairing
         self.on_event = on_event
         self.on_blob = on_blob
+        self.on_phase = on_phase
         self.request_timeout = request_timeout
 
         self._link = link or WebSocketLink(uri)
@@ -187,6 +192,7 @@ class BridgeSession:
             # documented "SessionError on failure" - the CLI included - got a
             # traceback instead of the message it already knows how to print.
             raise SessionError(str(exc)) from exc
+        self._phase("handshake")
         try:
             await self._handshake()
         except TerminalSessionError:
@@ -205,6 +211,7 @@ class BridgeSession:
             raise
         self._read_task = asyncio.create_task(self._read_loop(), name="phonebridge-read")
         self.opened_at = time.time()
+        self._phase("ready")
         log.info(
             "session established with %s (%s) over %s",
             self.phone.name if self.phone else "?",
@@ -212,6 +219,16 @@ class BridgeSession:
             self.uri,
         )
         return self
+
+    def _phase(self, phase: str) -> None:
+        """Tell an observer which step we are on. Never lets it change the flow."""
+        handler = self.on_phase
+        if handler is None:
+            return
+        try:
+            handler(phase)
+        except Exception:  # noqa: BLE001 - a broken observer must not break a session
+            log.exception("on_phase(%s) raised", phase)
 
     async def close(self, reason: str = "closed by PC") -> None:
         if self._closed.is_set():

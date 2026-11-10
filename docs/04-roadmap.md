@@ -8,9 +8,14 @@ Legend: `[x]` implemented and tested · `[~]` partially implemented ·
 | | |
 | --- | --- |
 | Version | `1.0.0` (PC package and Android app) |
-| Gate status | 479 tests, ruff, mypy, `verify.py` 7/7 — all green |
+| Gate status | 575 tests, ruff, mypy, `verify.py` 7/7 — all green |
 | Open blockers | **B1** no physical-device run · **B2** release APK not built here (plus B3–B6: Play `targetSdk`, keystore, Windows/PowerShell run, Kotlin stub compile) |
 | Ship/no-ship | **Not shippable until B1 and B2 are cleared.** See [`14-release-readiness.md`](14-release-readiness.md). |
+
+Milestone 1 of the hardware roadmap (the one-click Windows controller) is in
+[`docs/17`](17-connection-controller.md): connection manager, transport choice,
+pairing in the window, reconnection and the five-state capability registry.
+Phases 2–5 (audio, camera, Bluetooth, files) are still ahead.
 
 Scope delivered in 1.0.0: Phase 0 (feasibility, architecture, protocol), Phase 1
 (encrypted PC ↔ phone channel, CLI, Android app), the end-to-end verification
