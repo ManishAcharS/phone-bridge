@@ -249,5 +249,11 @@ def test_an_unknown_state_still_explains_itself() -> None:
 # the module must import on a machine with no SDK at all
 # --------------------------------------------------------------------------- #
 def test_discovery_runs_without_adb_installed() -> None:
-    assert find_adb(env={}, which=lambda _n: None) is None
+    # Every source is injected: on a Windows PC with an SDK on disk, the default
+    # ``exists`` would find a real adb.exe and this assertion would depend on the
+    # machine rather than on the code.
+    found = find_adb(
+        env={}, which=lambda _n: None, exists=lambda _p: False, platform="nt"
+    )
+    assert found is None
     assert Path(__file__).exists()

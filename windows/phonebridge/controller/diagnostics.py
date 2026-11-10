@@ -10,6 +10,12 @@ timestamp, later identical lines only bump a counter. Different text is a new
 line. That keeps the order of *events* while collapsing the order of *repetition*.
 
 Nothing here is UI-specific; ``controller/view.py`` renders the result.
+
+**Timestamps are the PC's local wall-clock time**, formatted ``HH:MM:SS`` with
+``time.localtime``. That is deliberate: the user reads this pane next to their own
+clock ("I plugged the cable in at 9:41"), so a UTC stamp would be off by the UTC
+offset — 05:30 instead of 00:00 in India, for example. The format is injectable
+(``stamp=``) so tests do not depend on the machine's timezone either.
 """
 
 from __future__ import annotations
@@ -19,6 +25,20 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 
+#: ``float`` epoch seconds -> ``HH:MM:SS``. Swappable so a test never depends on
+#: the runner's timezone; the default is the local clock, which is what the window
+#: should show.
+Stamp = Callable[[float], str]
+
+
+def local_stamp(at: float) -> str:
+    """``HH:MM:SS`` in the PC's own timezone — **not** UTC.
+
+    The pane is read beside the user's wall clock, so local time is the only
+    useful answer: a UTC stamp would read 05:30 on a 00:00 event in India.
+    """
+    return time.strftime("%H:%M:%S", time.localtime(at))
+
 
 @dataclass(frozen=True)
 class LogLine:
@@ -27,19 +47,26 @@ class LogLine:
     count: int = 1
     last_at: float = 0.0
 
-    def render(self) -> str:
-        stamp = time.strftime("%H:%M:%S", time.localtime(self.at))
+    def render(self, stamp: Stamp = local_stamp) -> str:
+        head = stamp(self.at)
         if self.count > 1:
-            return f"{stamp}  {self.text}  (x{self.count})"
-        return f"{stamp}  {self.text}"
+            return f"{head}  {self.text}  (x{self.count})"
+        return f"{head}  {self.text}"
 
 
 class Diagnostics:
     """Bounded, de-duplicated, ordered log."""
 
-    def __init__(self, limit: int = 200, clock: Callable[[], float] | None = None) -> None:
+    def __init__(
+        self,
+        limit: int = 200,
+        clock: Callable[[], float] | None = None,
+        stamp: Stamp | None = None,
+    ) -> None:
         self._limit = max(1, limit)
         self._clock = clock or time.time
+        #: Local time by default; a test passes a fixed formatter instead.
+        self._stamp: Stamp = stamp or local_stamp
         self._lines: OrderedDict[str, LogLine] = OrderedDict()
 
     def add(self, text: str) -> None:
@@ -62,7 +89,7 @@ class Diagnostics:
         return tuple(self._lines.values())
 
     def render(self) -> tuple[str, ...]:
-        return tuple(line.render() for line in self._lines.values())
+        return tuple(line.render(self._stamp) for line in self._lines.values())
 
     def __len__(self) -> int:
         return len(self._lines)

@@ -153,16 +153,17 @@ async def test_usb_reuses_the_users_own_rule_without_owning_it() -> None:
 
 
 async def test_usb_provider_is_quiet_when_adb_is_absent() -> None:
-    provider = UsbCandidates(Adb(runner=RecordingAdb(), executable=None))
-    provider.adb._executable = None  # noqa: SLF001
-    import shutil
+    """Discovery is injected as empty, so a real SDK on this PC cannot change it.
 
-    original = shutil.which
-    shutil.which = lambda _name: None  # type: ignore[assignment]
-    try:
-        assert await provider.candidates(timeout=0.1) == []
-    finally:
-        shutil.which = original  # type: ignore[assignment]
+    Stubbing ``shutil.which`` was not enough: a Windows developer machine really
+    does have ``%LOCALAPPDATA%\\Android\\Sdk\\platform-tools\\adb.exe``, and the
+    SDK search would find it whatever ``PATH`` says.
+    """
+    provider = UsbCandidates(Adb(runner=RecordingAdb(), locate=lambda: None))
+    assert await provider.candidates(timeout=0.1) == []
+    assert provider.last_devices == []
+    assert provider.usb_available is False
+    assert "not found" in provider.summary() or "adb" in provider.summary()
 
 
 async def test_a_failing_forward_does_not_offer_a_broken_candidate() -> None:
