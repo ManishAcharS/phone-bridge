@@ -47,6 +47,20 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!--
+        Phase 5. Scanning for Bluetooth LE peripherals is a runtime permission on
+        Android 12+ and was folded into location before that. Only scanning needs
+        BLUETOOTH_SCAN; opening a GATT link needs BLUETOOTH_CONNECT (above), which
+        Phase 1 already declared for headset facts. `neverForLocation` is honest:
+        the app does not use scan results to derive a location.
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="30" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
     <uses-permission
         android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />

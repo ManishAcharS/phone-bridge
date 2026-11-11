@@ -124,6 +124,9 @@ private fun DashboardScreen() {
     val port by BridgeState.port.collectAsState()
     val lastError by BridgeState.lastError.collectAsState()
     val cameraState by BridgeState.camera.collectAsState()
+    val sensorState by BridgeState.sensors.collectAsState()
+    val fileState by BridgeState.files.collectAsState()
+    val bluetoothState by BridgeState.bluetooth.collectAsState()
 
     val identityStore = remember { IdentityStore(context) }
     val pairingStore = remember { PairingStore(context) }
@@ -166,6 +169,57 @@ private fun DashboardScreen() {
         context.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_CAMERA_ANY)
     }
 
+    // --- Phase 5 ---------------------------------------------------------- //
+    // Bluetooth permissions are asked for when the user taps "Grant", never at
+    // launch, and each one is asked for separately because scanning and connecting
+    // are different powers on Android 12+.
+    val bluetoothPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* the card re-reads the real status; a refusal stays a refusal */ }
+
+    // The SAF pickers are the only way this app touches storage. Both results are
+    // persisted so a later transfer needs no new prompt.
+    val folderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val uri = result.data?.data
+        if (result.resultCode == android.app.Activity.RESULT_OK && uri != null) {
+            runCatching {
+                val label = dev.phonebridge.net.SafStore.rememberDestination(context, uri)
+                BridgeState.setDestination(label)
+            }.onFailure {
+                BridgeState.note("WARN", "could not use that folder: ${it.message}")
+            }
+        }
+    }
+    val filePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == android.app.Activity.RESULT_OK && data != null) {
+            val uris = ArrayList<android.net.Uri>()
+            val clip = data.clipData
+            if (clip != null) {
+                for (index in 0 until clip.itemCount) uris.add(clip.getItemAt(index).uri)
+            }
+            data.data?.let { uris.add(it) }
+            if (uris.isEmpty()) {
+                BridgeState.note("WARN", "no file was selected")
+            } else {
+                BridgeState.addSelection(uris)
+            }
+        }
+    }
+
+    val sensorCatalogue = remember(sensorState) {
+        // The catalogue is read from the phone's own SensorManager: a list that a
+        // PC (or a screenshot) cannot mistake for live data.
+        BridgeState.sensorCatalogue(context)
+    }
+    val bluetoothSupported = bluetoothState["supported"] as? Boolean ?: false
+    val bluetoothEnabled = bluetoothState["enabled"] as? Boolean ?: false
+    val bluetoothPermitted = bluetoothState["permitted"] as? Boolean
+
     // Poll the audio route and the LAN address: AudioManager has no callback for
     // "headset changed profile", and the address changes when Wi-Fi does.
     LaunchedEffect(Unit) {
@@ -175,6 +229,7 @@ private fun DashboardScreen() {
             devices = AudioProbe.describeCommunicationDevices(context)
             lanIp = DeviceFacts.lanIpv4()
             cameraPermitted = Permissions.granted(context, android.Manifest.permission.CAMERA)
+            BridgeState.refreshBluetooth()
             delay(2000)
         }
     }
@@ -295,6 +350,50 @@ private fun DashboardScreen() {
                         // STOP frame only if it asked for one.
                         BridgeState.stopCameraLocally()
                     },
+                )
+            }
+
+            item {
+                BluetoothCard(
+                    supported = bluetoothSupported,
+                    enabled = bluetoothEnabled,
+                    permitted = bluetoothPermitted,
+                    detail = bluetoothState["detail"] as? String ?: "",
+                    scanning = (bluetoothState["scanning"] as? Boolean) ?: false,
+                    links = BridgeState.bluetoothLinks(),
+                    onGrantScan = {
+                        val permission = Permissions.effective(
+                            context,
+                            android.Manifest.permission.BLUETOOTH_SCAN,
+                        )
+                        Permissions.markAsked(context, permission)
+                        if (permission != android.Manifest.permission.BLUETOOTH) {
+                            bluetoothPermission.launch(permission)
+                        }
+                    },
+                    onStop = { BridgeState.disconnectBluetoothLocally() },
+                )
+            }
+
+            item {
+                SensorsCard(
+                    state = sensorState,
+                    catalogue = sensorCatalogue,
+                    connected = peers.isNotEmpty(),
+                    onStop = { BridgeState.stopSensorsLocally() },
+                )
+            }
+
+            item {
+                FilesCard(
+                    state = fileState,
+                    onChooseFolder = { folderPicker.launch(dev.phonebridge.net.SafStore.pickFolderIntent()) },
+                    onChooseFiles = { filePicker.launch(dev.phonebridge.net.SafStore.pickFilesIntent()) },
+                    onForgetFolder = {
+                        dev.phonebridge.net.SafStore.forgetDestination(context)
+                        BridgeState.setDestination("")
+                    },
+                    onCancelAll = { BridgeState.cancelTransfersLocally() },
                 )
             }
 

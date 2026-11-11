@@ -150,7 +150,117 @@ class BridgeServer(
         log = { level, message -> addLog(level, message) },
     )
 
+    /**
+     * Phase 5 sensors. Listeners are registered only when a paired PC asks, and
+     * released when the last session ends, exactly like the microphone and the
+     * lens.
+     */
+    private val sensors = SensorEngine(
+        context = context,
+        sendFrame = { streamId, body -> sendSensorFrame(streamId, body) },
+        log = { level, message -> addLog(level, message) },
+    )
+
+    /**
+     * Phase 5 file transfer. The user's chosen SAF folder is the only place it
+     * writes; the user's picked files are the only things it sends.
+     */
+    private val files = FileTransferEngine(
+        context = context,
+        send = { streamId, body -> sendFileFrame(streamId, body) },
+        log = { level, message -> addLog(level, message) },
+    )
+
+    /**
+     * Phase 5 Bluetooth. The phone is the radio; nothing is scanned for or
+     * connected to without an authenticated PC asking for it by name.
+     */
+    private val bluetooth = BleEngine(
+        context = context,
+        emit = { event, data -> broadcastEvent(event, data) },
+        log = { level, message -> addLog(level, message) },
+    )
+
+    private val phase5Executor = Executors.newFixedThreadPool(3) { runnable ->
+        Thread(runnable, "phonebridge-phase5").apply { isDaemon = true }
+    }
+
     fun cameraState() = camera.state
+    fun sensorState() = sensors.state
+    fun fileState() = files.state
+    fun bluetoothStatus(): Map<String, Any?> = bluetooth.status()
+
+    fun bluetoothLinks(): List<Map<String, Any?>> = bluetooth.linkMaps()
+
+    fun sensorCatalogue(): List<SensorEngine.Entry> = sensors.entries()
+
+    fun filesDestination(label: String) {
+        files.setDestination(label)
+    }
+
+    fun filesClearDestination() {
+        files.setDestination("")
+    }
+
+    fun filesAddSelection(uris: List<android.net.Uri>) {
+        files.appendedSelection(uris)
+    }
+
+    /** Stop streaming from the phone's own UI (privacy beats protocol). */
+    fun stopSensorsLocally() {
+        sensors.stop("stopped on the phone")
+    }
+
+    fun cancelTransfersLocally() {
+        files.onSessionClosed("cancelled on the phone")
+    }
+
+    fun disconnectBluetoothLocally() {
+        bluetooth.onSessionClosed("disconnected on the phone")
+    }
+
+    private fun sendSensorFrame(streamId: Int, body: ByteArray) {
+        val session = sessions.firstOrNull { it.isReady }
+        if (session == null) {
+            // No session: the engine is being told to stop; dropping is correct,
+            // and a single line here is what makes a stuck stream visible.
+            addLog("WARN", "dropping sensor frames: no authenticated session")
+            return
+        }
+        session.sendSecure(Messages.MSG_SENSOR, streamId, body)
+    }
+
+    private fun sendFileFrame(streamId: Int, body: ByteArray) {
+        val session = sessions.firstOrNull { it.isReady }
+        if (session == null) {
+            addLog("WARN", "dropping a file frame: no authenticated session")
+            return
+        }
+        session.sendSecure(Messages.MSG_FILE, streamId, body)
+    }
+
+    /**
+     * Answer a request from a worker thread.
+     *
+     * GATT and file operations block by design (a peripheral may take seconds to
+     * answer, a file may be hashed), so they must not run on the connection's read
+     * loop: heartbeats would starve and the very link the answer travels on would
+     * drop. The reply goes through the normal send path, which is thread-safe.
+     */
+    private fun answerLater(peer: PeerSession, id: Any?, block: () -> Map<String, Any?>) {
+        phase5Executor.execute {
+            val payload = try {
+                Messages.responseOk(id, block())
+            } catch (e: RpcFailure) {
+                addLog("INFO", "RPC refused off-thread: ${e.code} - ${e.message}")
+                Messages.responseErr(id, e.code, e.message ?: e.code)
+            } catch (e: Exception) {
+                addLog("ERROR", "RPC failed off-thread: ${e.message}")
+                Messages.responseErr(id, "internal", "${e.javaClass.simpleName}: ${e.message}")
+            }
+            peer.sendControl(payload)
+        }
+    }
 
     /**
      * Stop the camera because the *phone's owner* asked, not the PC.
@@ -363,6 +473,12 @@ class BridgeServer(
             }
         }
         impl = null
+        // Phase 5: no listener, no GATT link and no half-written file may outlive
+        // the server that started them.
+        sensors.release()
+        files.release()
+        bluetooth.release()
+        phase5Executor.shutdownNow()
         _running.value = false
         _peers.value = emptyList()
         addLog("INFO", "server stopped")
@@ -728,6 +844,111 @@ class BridgeServer(
                     )
                 }
 
+                // --- Phase 5: Bluetooth --------------------------------- //
+                "bluetooth.adapter.status" -> Messages.responseOk(id, bluetooth.status())
+
+                "bluetooth.scan.start" -> Messages.responseOk(id, bluetooth.startScan(params))
+
+                "bluetooth.scan.stop" -> Messages.responseOk(id, bluetooth.stopScan())
+
+                "bluetooth.scan.results" -> Messages.responseOk(id, bluetooth.results())
+
+                "bluetooth.gatt.connect" -> {
+                    // Blocking: the phone waits for the platform's connect callback
+                    // (bounded by GATT_TIMEOUT_MS) and must not hold the read loop.
+                    answerLater(peer, id) { bluetooth.connect(params) }
+                    null
+                }
+
+                "bluetooth.gatt.services" -> Messages.responseOk(id, bluetooth.services(params))
+
+                "bluetooth.gatt.read" -> {
+                    answerLater(peer, id) { bluetooth.read(params) }
+                    null
+                }
+
+                "bluetooth.gatt.write" -> {
+                    answerLater(peer, id) { bluetooth.write(params) }
+                    null
+                }
+
+                "bluetooth.gatt.subscribe" -> {
+                    answerLater(peer, id) { bluetooth.subscribe(params) }
+                    null
+                }
+
+                "bluetooth.gatt.disconnect" -> Messages.responseOk(id, bluetooth.disconnect(params))
+
+                "bluetooth.gatt.status" -> Messages.responseOk(id, bluetooth.connections())
+
+                // --- Phase 5: sensors ----------------------------------- //
+                "sensor.list" -> Messages.responseOk(
+                    id,
+                    mapOf(
+                        "sensors" to sensors.entries().map { it.asMap() },
+                        "permitted" to true,
+                        "interval_us" to SensorFrames.DEFAULT_INTERVAL_US,
+                        "detail" to if (sensors.entries().isEmpty()) {
+                            "this phone reported no sensors"
+                        } else {
+                            ""
+                        },
+                    ),
+                )
+
+                "sensor.start" -> {
+                    val ids = SensorFrames.parseIds(params)
+                    val interval = (params["interval_us"] as? Number)?.toInt()
+                        ?: SensorFrames.DEFAULT_INTERVAL_US
+                    val applied = sensors.start(ids, interval)
+                    Messages.responseOk(
+                        id,
+                        mapOf(
+                            "ok" to true,
+                            "active" to sensors.state.value.active,
+                            "interval_us" to applied,
+                        ),
+                    )
+                }
+
+                "sensor.stop" -> {
+                    val stopped = sensors.state.value.active
+                    sensors.stop("stopped by the PC")
+                    Messages.responseOk(
+                        id,
+                        mapOf("ok" to true, "stopped" to stopped, "active" to emptyList<Int>()),
+                    )
+                }
+
+                "sensor.status" -> Messages.responseOk(id, sensors.status())
+
+                // --- Phase 5: file transfer ----------------------------- //
+                "file.offer" -> {
+                    answerLater(peer, id) { files.offer(params) }
+                    null
+                }
+
+                "file.request" -> {
+                    answerLater(peer, id) { files.request(params) }
+                    null
+                }
+
+                "file.complete" -> {
+                    answerLater(peer, id) { files.complete(params) }
+                    null
+                }
+
+                "file.progress" -> Messages.responseOk(id, files.progress(params))
+
+                "file.cancel" -> {
+                    answerLater(peer, id) { files.cancel(params) }
+                    null
+                }
+
+                "file.pause" -> Messages.responseOk(id, files.pause(params))
+
+                "file.resume" -> Messages.responseOk(id, files.resume(params))
+
                 "bluetooth.headset.status" -> Messages.responseOk(
                     id,
                     mapOf(
@@ -1077,6 +1298,12 @@ class BridgeServer(
             // A camera held open for a session that has gone is a privacy bug,
             // so it is closed on the same edge as the microphone.
             camera.onSessionClosed("last session ended")
+            // Phase 5: a sensor listener, a GATT link or a half-written file held
+            // open for a PC that is gone is a privacy and battery bug, so all three
+            // are released on the same edge as the microphone and the lens.
+            sensors.onSessionClosed("last session ended")
+            files.onSessionClosed("last session ended")
+            bluetooth.onSessionClosed("last session ended")
         }
     }
 
@@ -1126,6 +1353,14 @@ class BridgeServer(
                 // Video is one-way (phone -> PC) in protocol v1. A frame arriving
                 // here is a peer doing something v1 does not define: say so.
                 Messages.MSG_VIDEO -> addLog("WARN", "ignoring video frame from the PC (one-way in v1)")
+
+                // Sensors are one-way (phone -> PC) in protocol v1.
+                Messages.MSG_SENSOR ->
+                    addLog("WARN", "ignoring sensor frame from the PC (one-way in v1)")
+
+                // File chunks are two-way: data, acks and control frames all arrive
+                // here. The engine routes by the header, not by the stream id.
+                Messages.MSG_FILE -> files.onChunk(opened.payload)
 
                 Messages.MSG_BLOB -> sendSecure(Messages.MSG_BLOB, opened.streamId, opened.payload)
                 else -> addLog("WARN", "ignoring msg type 0x%02x".format(opened.msgType))

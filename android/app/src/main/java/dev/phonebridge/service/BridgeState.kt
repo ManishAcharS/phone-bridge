@@ -2,6 +2,9 @@ package dev.phonebridge.service
 
 import dev.phonebridge.net.BridgeServer
 import dev.phonebridge.net.CameraEngine
+import dev.phonebridge.net.FileTransferEngine
+import dev.phonebridge.net.SafStore
+import dev.phonebridge.net.SensorEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -51,13 +54,36 @@ object BridgeState {
     private val _camera = MutableStateFlow(CameraEngine.State())
     val camera: StateFlow<CameraEngine.State> = _camera.asStateFlow()
 
+    /**
+     * Phase 5. Three more mirrors, for the same reason: the phone's own screen must
+     * never guess whether a sensor listener, a file transfer or a GATT link is
+     * running. Each flow is fed by the engine that owns the resource.
+     */
+    private val _sensors = MutableStateFlow(SensorEngine.State())
+    val sensors: StateFlow<SensorEngine.State> = _sensors.asStateFlow()
+
+    private val _files = MutableStateFlow(FileTransferEngine.State())
+    val files: StateFlow<FileTransferEngine.State> = _files.asStateFlow()
+
+    private val _bluetooth = MutableStateFlow<Map<String, Any?>>(emptyMap())
+    val bluetooth: StateFlow<Map<String, Any?>> = _bluetooth.asStateFlow()
+
     @Volatile
     private var server: BridgeServer? = null
 
+    /** Set while the service is bound, so the SAF helpers can resolve names. */
+    @Volatile
+    private var appContext: android.content.Context? = null
+
     private var mirrors: List<Job> = emptyList()
 
-    fun bind(server: BridgeServer, scope: CoroutineScope) {
+    fun bind(
+        server: BridgeServer,
+        scope: CoroutineScope,
+        context: android.content.Context? = null,
+    ) {
         this.server = server
+        this.appContext = context
         unbindMirrors()
         _deviceId.value = server.identity.deviceId
         _deviceName.value = server.identity.name
@@ -69,12 +95,86 @@ object BridgeState {
             scope.launch { server.stats.collect { _stats.value = it } },
             scope.launch { server.lastError.collect { _lastError.value = it } },
             scope.launch { server.cameraState().collect { _camera.value = it } },
+            scope.launch { server.sensorState().collect { _sensors.value = it } },
+            scope.launch { server.fileState().collect { _files.value = it } },
         )
+        refreshBluetooth()
     }
 
     /** Stop the camera from the phone's own UI. */
     fun stopCameraLocally() {
         server?.stopCameraLocally()
+    }
+
+    /** Stop every sensor listener from the phone's own UI. */
+    fun stopSensorsLocally() {
+        server?.stopSensorsLocally()
+    }
+
+    /** Cancel every running transfer (the file on the phone is not written). */
+    fun cancelTransfersLocally() {
+        server?.cancelTransfersLocally()
+    }
+
+    /** Drop every GATT link and stop scanning. */
+    fun disconnectBluetoothLocally() {
+        server?.disconnectBluetoothLocally()
+        refreshBluetooth()
+    }
+
+    /** Remember the SAF folder the user picked (label only; the URI is in SafStore). */
+    fun setDestination(label: String) {
+        if (label.isBlank()) {
+            server?.filesClearDestination()
+        } else {
+            server?.filesDestination(label)
+        }
+        _files.value = _files.value.copy(destination = label)
+    }
+
+    /** Add files the user picked to what the PC may pull. */
+    fun addSelection(uris: List<android.net.Uri>) {
+        server?.filesAddSelection(uris)
+        refreshSelections(uris)
+    }
+
+    private fun refreshSelections(uris: List<android.net.Uri>) {
+        if (uris.isEmpty()) return
+        _files.value = _files.value.copy(
+            selection = _files.value.selection + uris.mapNotNull { resolveName(it) },
+        )
+    }
+
+    private fun resolveName(uri: android.net.Uri): String? = try {
+        appContext?.let { SafStore.displayName(it, uri) }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** The phone's own sensor catalogue, for the card (never a PC's report). */
+    fun sensorCatalogue(context: android.content.Context): List<SensorEngine.Entry> =
+        server?.sensorCatalogue() ?: SensorEngine(context, { _, _ -> }, { _, _ -> }).entries()
+
+    /** Connected GATT links, for the card. */
+    fun bluetoothLinks(): List<Map<String, Any?>> = server?.bluetoothLinks() ?: emptyList()
+
+    /**
+     * Re-read the adapter state.
+     *
+     * The platform has no callback for "the user turned Bluetooth off in Settings",
+     * so the UI polls this while the Bluetooth card is visible. It is a cheap
+     * query: no scan, no connection, no permission prompt.
+     */
+    fun refreshBluetooth() {
+        _bluetooth.value = server?.bluetoothStatus() ?: mapOf(
+            "supported" to false,
+            "enabled" to false,
+            "le_supported" to false,
+            "name" to "",
+            "address" to "",
+            "permitted" to null,
+            "detail" to "the bridge is not running",
+        )
     }
 
     fun setPort(port: Int) {
@@ -87,8 +187,10 @@ object BridgeState {
         _running.value = false
         _peers.value = emptyList()
         _pairingRequest.value = null
-        // The engine was released with the server; the badge must not linger.
+        // The engines were released with the server; no badge may linger.
         _camera.value = CameraEngine.State()
+        _sensors.value = SensorEngine.State()
+        _files.value = FileTransferEngine.State()
     }
 
     private fun unbindMirrors() {
