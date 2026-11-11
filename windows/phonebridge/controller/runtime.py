@@ -172,6 +172,31 @@ class BackgroundRuntime:
     def set_audio_volume(self, percent: int) -> None:
         self.submit(lambda manager: manager.set_audio_volume(percent))
 
+    # ---- Phase 4 camera -------------------------------------------------- #
+    def start_camera(self) -> None:
+        """Start streaming. Never called automatically: a camera needs a user."""
+        self.submit(lambda manager: manager.start_camera())
+
+    def stop_camera(self) -> None:
+        self.submit(lambda manager: manager.stop_camera())
+
+    def switch_camera(self) -> None:
+        self.submit(lambda manager: manager.switch_to_other_lens())
+
+    def choose_camera_config(self, width: int, height: int, fps: int) -> None:
+        """Apply a resolution/rate choice; it takes effect on the next start."""
+        manager = self.manager
+        if manager is not None:
+            manager.set_camera_config(width=width, height=height, fps=fps)
+
+    def camera_frame(self) -> object:
+        manager = self.manager
+        return manager.camera_frame() if manager is not None else None
+
+    def camera_status(self) -> dict[str, object]:
+        manager = self.manager
+        return manager.camera_status() if manager is not None else {}
+
     def audio_status(self) -> dict[str, object]:
         """A snapshot the Audio section can redraw without touching the loop."""
         manager = self._manager

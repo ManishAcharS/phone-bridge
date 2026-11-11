@@ -206,21 +206,23 @@ object DeviceFacts {
                 phase = 2,
                 note = "an HFP/SCO link can only be opened by the relay (Phase 2)",
             ),
+            // Phase 4. `available` is hardware AND granted CAMERA AND implemented;
+            // a lens the phone has but the user never allowed stays unavailable.
             CapabilityRow(
                 key = "camera.back",
                 label = "rear camera",
                 hardware = cameras.back,
-                implemented = false,
-                phase = 4,
-                note = "camera streaming is Phase 4",
+                implemented = true,
+                note = "streams JPEG frames to a paired PC on request",
+                permission = android.Manifest.permission.CAMERA,
             ),
             CapabilityRow(
                 key = "camera.front",
                 label = "front camera",
                 hardware = cameras.front,
-                implemented = false,
-                phase = 4,
-                note = "camera streaming is Phase 4",
+                implemented = true,
+                note = "streams JPEG frames to a paired PC on request",
+                permission = android.Manifest.permission.CAMERA,
             ),
             CapabilityRow(
                 key = "sensors",
@@ -260,16 +262,29 @@ object DeviceFacts {
         val granted = android.Manifest.permission.RECORD_AUDIO.let { permission ->
             context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
         }
+        val cameraGranted = android.Manifest.permission.CAMERA.let { permission ->
+            context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+        }
         val out = linkedMapOf<String, Any?>()
         for (row in capabilityRows(context)) {
-            out[row.key] = row.available(granted)
+            val allowed = if (row.permission == android.Manifest.permission.CAMERA) {
+                cameraGranted
+            } else {
+                granted
+            }
+            out[row.key] = row.available(allowed)
             out["hardware.${row.key}"] = row.hardware
-            out["detail.${row.key}"] = row.summary(granted)
+            out["detail.${row.key}"] = row.summary(allowed)
         }
         // Phase 2: the PC can now tell "not implemented" apart from "no hardware"
         // instead of inferring it, because this build says so explicitly.
         out["implemented.audio.playback"] = true
         out["implemented.audio.capture"] = true
+        // Phase 4: hardware and implementation are now separate facts for the
+        // camera too, so a phone with a lens and no permission cannot look ready.
+        out["implemented.camera.back"] = true
+        out["implemented.camera.front"] = true
+        out["permitted.camera"] = cameraGranted
         // Existing string-valued key (the PC prints it as the active profile).
         out["audio.bluetooth_profile"] = AudioProbe.bluetoothProfileName(context)
         out["protocol_version"] = Framing.PROTOCOL_VERSION

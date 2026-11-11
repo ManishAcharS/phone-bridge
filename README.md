@@ -15,10 +15,11 @@ is left, item by item.
 
 | | |
 | --- | --- |
-| **PC client** | complete, 854 automated tests, type-checked, linted |
+| **PC client** | complete, 927 automated tests, type-checked, linted |
 | **Android app** | complete, compiled against a stub environment, source-audited |
 | **Protocol** | v1, frozen; wire format in [`docs/03-protocol.md`](docs/03-protocol.md) |
-| **Audio relay** | **not implemented** — Phase 2, gated on per-device measurements |
+| **Audio relay** | implemented (Phase 2); the phone microphone reaches the PC's speakers, not a virtual mic |
+| **Camera streaming** | implemented (Phase 4); verified against the reference phone, **not yet on a handset** |
 
 ---
 
@@ -64,8 +65,9 @@ Full reference: [`docs/17-connection-controller.md`](docs/17-connection-controll
 | Live session statistics, headset/routing state, RTT and throughput | **works** |
 | Binary streams (byte-exact to 1 MiB) | **works** |
 | Audio capability probe (measures what the handset can actually do) | **works** |
-| Bluetooth audio relay (the sound itself) | **Phase 2 — not implemented** |
-| Camera, sensors, file transfer, Bluetooth scan | **not in protocol v1** |
+| Bluetooth audio relay (the sound itself) | **works** (Phase 2, monitor only — no virtual microphone) |
+| Camera streaming to the Windows preview (Phase 4) | **works** — synthetic frames in tests, real CameraX on the phone |
+| Sensors, file transfer, Bluetooth scan | **not in protocol v1** |
 
 `phonebridge capabilities` never guesses: it separates what the phone *has*
 (`hardware.*`) from what PhoneBridge can *currently deliver* (`usable`) and
@@ -198,8 +200,8 @@ granted* — all three, or it is `false`.
 | `audio.playback` | audio can be rendered to a communication device | no — Phase 2 |
 | `audio.capture` | microphone can be read | no — Phase 2 |
 | `audio.bluetooth_sco` | a bidirectional HFP/SCO headset link is available | no — Phase 2 |
-| `camera.back` | rear camera present | no — not in protocol v1 |
-| `camera.front` | front camera present | no — not in protocol v1 |
+| `camera.back` | rear camera present and permitted | yes — Phase 4 (lens + `CAMERA` permission + built) |
+| `camera.front` | front camera present and permitted | yes — Phase 4 |
 | `sensors` | motion/environment sensors present | no — not in protocol v1 |
 | `file_transfer` | files can be moved in either direction | no — not in protocol v1 |
 | `bluetooth_scan` | nearby Bluetooth devices can be listed | no — not in protocol v1 |
@@ -236,11 +238,14 @@ More: [`docs/11-pc-client.md`](docs/11-pc-client.md) §13 and
 
 Written down so nobody has to discover them:
 
-* **No audio relay yet.** The phone measures its audio routing; it does not carry
-  sound. Phase 2, gated on per-handset measurements.
-* **No camera, sensors, file transfer or Bluetooth scanning.** Protocol v1 has
-  reserved message kinds for these and no implementation, and the docs say so
-  rather than shipping dead UI.
+* **The camera has never run on a real handset.** Phase 4 implements it end to end
+  and tests it against the reference phone (synthetic frames); the manual hardware
+  checklist in [`docs/20-camera.md`](docs/20-camera.md) §9 is still outstanding.
+* **The camera preview needs Pillow on the PC.** Without it the stream is still
+  received, validated and counted; the GUI prints "pip install pillow".
+* **No sensors, file transfer or Bluetooth scanning.** Protocol v1 reserves message
+  kinds for these and implements none, and the docs say so rather than shipping
+  dead UI.
 * **Android app not verified on a handset by this project.** See
   [`docs/14-release-readiness.md`](docs/14-release-readiness.md).
 * **Targets Android API 34.** That runs correctly on Android 16, but Google Play
@@ -266,8 +271,8 @@ and [`docs/16-known-limitations.md`](docs/16-known-limitations.md).
 
 ```powershell
 cd windows
-python -m pytest -q          # 854 tests
-python tools\verify.py       # tests + lint + types + vectors + CLI smoke (7 checks)
+python -m pytest -q          # 927 tests
+python tools\verify.py       # tests + lint + types + vectors + camera path + CLI smoke (8 checks)
 ```
 
 The reference phone implementation is part of the repository, so the whole
@@ -298,7 +303,7 @@ windows/phonebridge/
   core/                     session, reconnection supervisor, device store
   cli/                      the `phonebridge` command
   controller/               discovery, USB/hotspot reliability, the desktop window
-windows/tests/              854 tests
+windows/tests/              927 tests
 android/app/src/main/java/dev/phonebridge/
   protocol/                 byte-identical Kotlin port + known-answer vectors
   net/                      server, pairing store, identity, discovery, probes
@@ -353,6 +358,7 @@ residual risk: [`docs/13-security-review.md`](docs/13-security-review.md).
 | verify my own setup | [`docs/05-connection-verification.md`](docs/05-connection-verification.md) |
 | measure my three phones | [`docs/08-multi-device-test-strategy.md`](docs/08-multi-device-test-strategy.md) |
 | see per-device audio results | [`docs/09-compat-report.md`](docs/09-compat-report.md) |
+| stream the phone camera | [`docs/20-camera.md`](docs/20-camera.md) |
 | read the Android completion notes | [`docs/10-android-app-completion.md`](docs/10-android-app-completion.md) |
 
 ## License

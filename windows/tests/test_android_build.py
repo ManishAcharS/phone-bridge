@@ -307,6 +307,7 @@ def test_declared_permissions_are_exactly_the_ones_the_code_uses():
         "android.permission.RECORD_AUDIO",
         "android.permission.BLUETOOTH_CONNECT",
         "android.permission.BLUETOOTH",
+        "android.permission.CAMERA",
     }
     declared = permissions()
     assert declared == expected, (
@@ -315,9 +316,13 @@ def test_declared_permissions_are_exactly_the_ones_the_code_uses():
     )
 
 
-def test_storage_and_camera_permissions_are_not_requested():
+def test_storage_and_scanning_permissions_are_not_requested():
+    """CAMERA left this list in Phase 4, when a feature started using it.
+
+    Every remaining entry is a permission the app has no feature for: holding one
+    would be the same false capability claim the matrix is supposed to prevent.
+    """
     forbidden = {
-        "android.permission.CAMERA",
         "android.permission.MANAGE_EXTERNAL_STORAGE",
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.WRITE_EXTERNAL_STORAGE",
@@ -325,7 +330,7 @@ def test_storage_and_camera_permissions_are_not_requested():
         "android.permission.ACCESS_FINE_LOCATION",
     }
     declared = permissions() & forbidden
-    assert not declared, f"these are not needed for audio work: {sorted(declared)}"
+    assert not declared, f"these are not needed for any implemented feature: {sorted(declared)}"
 
 
 def test_legacy_bluetooth_permission_is_capped_at_api_30():

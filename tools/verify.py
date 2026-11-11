@@ -129,6 +129,43 @@ def check_wrapper() -> tuple[str, str]:
     return OK, f"jar {jar.stat().st_size}B, scripts present, {url.strip()}"
 
 
+def check_camera_path() -> tuple[str, str]:
+    """The camera path must be provable without a phone.
+
+    Two things are checked: the frame header round-trips (so the PC and the phone
+    cannot drift apart silently), and the preview decoder reports honestly whether
+    it exists. A missing Pillow is a *finding*, not a failure - the GUI must say so.
+    """
+    script = """
+import json
+from phonebridge.camera.frames import VideoFrame, decode_frame
+from phonebridge.camera import preview
+
+body = VideoFrame(seq=1, timestamp_ms=66, payload=b"\\xff\\xd8hi\\xff\\xd9",
+                  width=640, height=480, rotation=270).encode()
+frame = decode_frame(body)
+assert frame.encode() == body, "header does not round-trip"
+assert frame.rotation == 270, "rotation lost"
+print(json.dumps({"ok": True, "preview": preview.preview_status()}))
+"""
+    proc = _run([sys.executable, "-c", script], WINDOWS)
+    if proc.returncode != 0:
+        return FAIL, f"camera frame path broken:\n{_tail(proc.stdout + proc.stderr)}"
+    try:
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return FAIL, f"unexpected output: {proc.stdout.strip()[:200]}"
+    preview_state = report["preview"]
+    if preview_state.get("available"):
+        detail = f"14-byte header round-trips; preview via {preview_state.get('library')}"
+    else:
+        detail = (
+            "14-byte header round-trips; preview decoder missing "
+            "(pip install pillow) - the GUI reports this instead of showing a blank frame"
+        )
+    return OK, detail
+
+
 def check_cli_smoke() -> tuple[str, str]:
     """Start the reference phone, talk to it over the real CLI, then stop it."""
     port = _free_port()
@@ -194,6 +231,9 @@ Not verifiable without hardware - run these on your own PC and phone:
   2. adb install -r app\\build\\outputs\\apk\\debug\\app-debug.apk
   3. app -> "Run protocol self-test"                   (expect 8/8)
   4. phonebridge info --host <phone-ip>                (Wi-Fi / USB / hotspot)
+  5. GUI -> Camera -> start                            (a live preview, no fake frames)
+     Nothing here proves the camera: the simulator's frames are synthetic.
+     The manual hardware checklist is docs/20-camera.md section 9.
 
 Step-by-step instructions and expected output: docs/07-device-testing-guide.md"""
 
@@ -210,6 +250,7 @@ def main() -> int:
         ("Unit + integration tests", check_tests),
         ("Lint", check_lint),
         ("Type check", check_types),
+        ("Camera frame path", check_camera_path),
     ]
     if not args.quick:
         steps.append(("CLI end-to-end smoke", check_cli_smoke))

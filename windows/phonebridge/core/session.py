@@ -45,6 +45,7 @@ from ..protocol.messages import (
     MSG_CONTROL,
     MSG_PING,
     MSG_PONG,
+    MSG_VIDEO,
     STREAM_CONTROL,
     ProtocolError,
     RpcIdSource,
@@ -660,9 +661,24 @@ class BridgeSession:
         """
         await self._safe_send(MSG_AUDIO, stream_id, body)
 
-    def subscribe_blobs(self, stream_id: int) -> asyncio.Queue[bytes | None]:
-        """Frames from `stream_id`; ``None`` once the session has ended."""
-        q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=256)
+    async def send_video(self, body: bytes, stream_id: int = 3) -> None:
+        """Send one encoded camera frame on ``stream_id`` (Phase 4).
+
+        Protocol v1 video is one-way (phone -> PC); this exists so a test or a
+        diagnostic can still exercise the reverse direction deliberately.
+        """
+        await self._safe_send(MSG_VIDEO, stream_id, body)
+
+    def subscribe_blobs(
+        self, stream_id: int, maxsize: int = 256
+    ) -> asyncio.Queue[bytes | None]:
+        """Frames from `stream_id`; ``None`` once the session has ended.
+
+        ``maxsize`` lets a media consumer pick its own latency budget: the video
+        stream asks for a handful of frames and drops the oldest when the UI is
+        behind, where a diagnostic blob stream would rather keep more.
+        """
+        q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=maxsize)
         self._blob_waiters[stream_id] = q
         return q
 

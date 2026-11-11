@@ -31,11 +31,13 @@ over USB with no adb and no extra protocol.
 │      ├── phonebridge.transport.discovery (UDP beacon)   │  │
 │      └── phonebridge.protocol            (framing/crypto) │  │
 │                                                            │
-│  Phase 2+ sinks/sources:                                   │
-│    audio/capture_loopback.py  (WASAPI loopback, no driver) │
-│    audio/capture_mic.py       (virtual cable mic → PC)     │
-│    audio/opus_codec.py        (PyAV, bundles libopus)      │
-│    video/camera_sink.py       (H.264/VP8 → pyvirtualcam)   │
+│  Shipped media planes:                                     │
+│    phonebridge.audio.*        (Phase 2: PCM16 relay)       │
+│    phonebridge.camera.frames  (Phase 4: JPEG wire format)  │
+│    phonebridge.camera.stream  (Phase 4: start/stop/preview)│
+│    phonebridge.camera.preview (Phase 4: optional Pillow)   │
+│  Not yet written:                                          │
+│    video/camera_sink.py       (pyvirtualcam virtual camera)│
 └────────────────────────────────────────────────────────────┘
                             ▲  │
               encrypted WebSocket (control + media)
@@ -120,7 +122,10 @@ hardware-accelerated. The design does not depend on the curve choice.
 
 ## 7. What is deliberately *not* here yet
 
-* No PySide6 window — Phase 3. The CLI exercises every command path first.
-* No audio/video modules — Phase 2 and 4. Their interfaces are described in the
+* No PySide6 window: the GUI is Tk (`controller/ui/app.py`), which needs no extra
+  dependency on a stock Windows Python.
+* No virtual camera device — the preview is a window, not a webcam. Audio and
+  camera modules exist (Phases 2 and 4); the *sinks* for third-party apps do not.
+  Their interfaces are described in the
   roadmap so the protocol does not need to change to accommodate them.
 * No UDP media transport — added in Phase 2 only if measurements justify it.

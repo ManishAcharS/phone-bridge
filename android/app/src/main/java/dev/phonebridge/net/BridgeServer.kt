@@ -140,6 +140,49 @@ class BridgeServer(
         log = { level, message -> addLog(level, message) },
     )
 
+    /**
+     * Phase 4 camera. Same lifetime rules as audio: it can only run while a
+     * paired session exists, and it is released when the last one goes away.
+     */
+    private val camera = CameraEngine(
+        context = context,
+        sendFrame = { streamId, body -> sendVideoFrame(streamId, body) },
+        log = { level, message -> addLog(level, message) },
+    )
+
+    fun cameraState() = camera.state
+
+    /**
+     * Stop the camera because the *phone's owner* asked, not the PC.
+     *
+     * The lens closes first (privacy beats protocol), then a STOP frame is sent so
+     * the PC's preview clears immediately instead of waiting for its own poll. If
+     * there is no session the frame is simply dropped.
+     */
+    fun stopCameraLocally() {
+        val wasActive = camera.status()["streaming"] as? Boolean ?: false
+        camera.stop()
+        if (wasActive) {
+            try {
+                sendVideoFrame(VideoFrames.VIDEO_STREAM, VideoFrames.stopFrame(0))
+            } catch (e: Exception) {
+                addLog("WARN", "could not send camera stop frame: ${e.message}")
+            }
+            addLog("INFO", "camera stopped by the phone owner")
+        }
+    }
+
+    private fun sendVideoFrame(streamId: Int, body: ByteArray) {
+        val session = sessions.firstOrNull { it.isReady }
+        if (session == null) {
+            // No session: the engine is about to be told to stop; dropping is
+            // correct, but silence would hide a stuck camera, so say it once.
+            addLog("WARN", "dropping camera frame: no authenticated session")
+            return
+        }
+        session.sendSecure(Messages.MSG_VIDEO, streamId, body)
+    }
+
     private fun sendAudioFrame(streamId: Int, body: ByteArray) {
         val session = sessions.firstOrNull { it.isReady }
         if (session == null) {
@@ -620,6 +663,71 @@ class BridgeServer(
                     )
                 }
 
+                // --- Phase 4 camera ------------------------------------ //
+                "camera.start" -> {
+                    val requested = try {
+                        VideoFrames.Config.fromParams(params)
+                    } catch (e: IllegalArgumentException) {
+                        throw RpcFailure("bad_config", e.message ?: "unsupported camera config")
+                    }
+                    // Result maps are built here, not in CameraEngine, so the wire
+                    // contract sits next to the method name (docs/03 §6).
+                    val started = camera.start(requested)
+                    Messages.responseOk(
+                        id,
+                        mapOf(
+                            "ok" to (started["ok"] as? Boolean ?: false),
+                            "config" to started["config"],
+                        ),
+                    )
+                }
+
+                "camera.stop" -> {
+                    camera.stop()
+                    Messages.responseOk(
+                        id,
+                        mapOf("ok" to true, "streaming" to false),
+                    )
+                }
+
+                "camera.switch" -> {
+                    val facing = params["facing"] as? String
+                    if (facing != "back" && facing != "front") {
+                        throw RpcFailure("bad_config", "facing must be 'back' or 'front'")
+                    }
+                    val next = VideoFrames.Config(
+                        width = camera.status()["width"] as? Int ?: 1280,
+                        height = camera.status()["height"] as? Int ?: 720,
+                        fps = camera.status()["fps"] as? Int ?: 15,
+                        facing = facing,
+                    )
+                    val streaming = camera.status()["streaming"] as? Boolean ?: false
+                    if (streaming) camera.start(next) else camera.stop()
+                    Messages.responseOk(
+                        id,
+                        mapOf("ok" to true, "facing" to facing, "streaming" to streaming),
+                    )
+                }
+
+                "camera.status" -> {
+                    val s = camera.status()
+                    Messages.responseOk(
+                        id,
+                        mapOf(
+                            "streaming" to s["streaming"],
+                            "facing" to s["facing"],
+                            "width" to s["width"],
+                            "height" to s["height"],
+                            "fps" to s["fps"],
+                            "frames_sent" to s["frames_sent"],
+                            "dropped" to s["dropped"],
+                            "permitted" to s["permitted"],
+                            "hardware" to s["hardware"],
+                            "last_error" to s["last_error"],
+                        ),
+                    )
+                }
+
                 "bluetooth.headset.status" -> Messages.responseOk(
                     id,
                     mapOf(
@@ -965,6 +1073,10 @@ class BridgeServer(
     private fun releaseAudioIfIdle() {
         if (sessions.none { it.isReady }) {
             audio.release()
+            camera.release()
+            // A camera held open for a session that has gone is a privacy bug,
+            // so it is closed on the same edge as the microphone.
+            camera.onSessionClosed("last session ended")
         }
     }
 
@@ -1010,6 +1122,10 @@ class BridgeServer(
                 }
 
                 Messages.MSG_AUDIO -> audio.onFrame(opened.streamId, opened.payload)
+
+                // Video is one-way (phone -> PC) in protocol v1. A frame arriving
+                // here is a peer doing something v1 does not define: say so.
+                Messages.MSG_VIDEO -> addLog("WARN", "ignoring video frame from the PC (one-way in v1)")
 
                 Messages.MSG_BLOB -> sendSecure(Messages.MSG_BLOB, opened.streamId, opened.payload)
                 else -> addLog("WARN", "ignoring msg type 0x%02x".format(opened.msgType))

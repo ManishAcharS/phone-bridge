@@ -123,6 +123,7 @@ private fun DashboardScreen() {
     val deviceName by BridgeState.deviceName.collectAsState()
     val port by BridgeState.port.collectAsState()
     val lastError by BridgeState.lastError.collectAsState()
+    val cameraState by BridgeState.camera.collectAsState()
 
     val identityStore = remember { IdentityStore(context) }
     val pairingStore = remember { PairingStore(context) }
@@ -152,6 +153,19 @@ private fun DashboardScreen() {
         ActivityResultContracts.RequestPermission()
     ) { /* the bridge runs either way; only the notification is hidden */ }
 
+    // Camera permission is asked for at the moment the user opens the camera card,
+    // never at launch: an app that asks for the camera before it needs it is the
+    // exact behaviour this phase must not reproduce.
+    val cameraPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* the card re-reads the real status; a refusal simply stays refused */ }
+    var cameraPermitted by remember {
+        mutableStateOf(Permissions.granted(context, android.Manifest.permission.CAMERA))
+    }
+    val cameraHardware = remember {
+        context.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_CAMERA_ANY)
+    }
+
     // Poll the audio route and the LAN address: AudioManager has no callback for
     // "headset changed profile", and the address changes when Wi-Fi does.
     LaunchedEffect(Unit) {
@@ -160,6 +174,7 @@ private fun DashboardScreen() {
             profile = AudioProbe.bluetoothProfileName(context)
             devices = AudioProbe.describeCommunicationDevices(context)
             lanIp = DeviceFacts.lanIpv4()
+            cameraPermitted = Permissions.granted(context, android.Manifest.permission.CAMERA)
             delay(2000)
         }
     }
@@ -264,6 +279,24 @@ private fun DashboardScreen() {
             }
 
             item { PermissionsCard() }
+
+            item {
+                CameraCard(
+                    state = cameraState,
+                    permitted = cameraPermitted,
+                    hardware = cameraHardware,
+                    onGrant = {
+                        Permissions.markAsked(context, android.Manifest.permission.CAMERA)
+                        cameraPermission.launch(android.Manifest.permission.CAMERA)
+                    },
+                    onStop = {
+                        // Stopping from the phone is local and immediate; the PC is
+                        // told through camera.status on its next poll and sees the
+                        // STOP frame only if it asked for one.
+                        BridgeState.stopCameraLocally()
+                    },
+                )
+            }
 
             item {
                 Section("This device") {
