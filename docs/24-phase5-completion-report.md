@@ -226,4 +226,4 @@ file, and a revoked SAF grant.
 ## 11. Pull request
 
 <https://github.com/ManishAcharS/phone-bridge/pull/12> — open against `main`,
-six commits, **not merged**.
+seven commits, **not merged**.
