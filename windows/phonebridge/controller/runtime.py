@@ -151,6 +151,10 @@ class BackgroundRuntime:
     def reconnect(self) -> None:
         self.submit(lambda manager: manager.reconnect())
 
+    def diagnose_usb(self) -> None:
+        """Run the whole USB chain in the controller thread and log the report."""
+        self.submit(lambda manager: manager.diagnose_usb())
+
     def set_endpoint(self, host: str, port: int | None = None) -> None:
         """Point the controller at an address the user typed in by hand."""
 

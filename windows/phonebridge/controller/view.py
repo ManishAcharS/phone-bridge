@@ -87,6 +87,7 @@ class View:
     usb: str = "—"
     usb_diagnosis: str = "—"
     usb_action: str = "—"
+    usb_stage: str = "—"
     wifi: str = "—"
     server: str = "—"
     auth_ok: str = "—"
@@ -240,6 +241,7 @@ def build_view(snapshot: Snapshot) -> View:
         usb=usb_text(snapshot),
         usb_diagnosis=snapshot.usb_diagnosis or "not checked yet",
         usb_action=snapshot.usb_action or "—",
+        usb_stage=snapshot.usb_stage or "—",
         wifi=snapshot.wifi_status or "not checked yet",
         server=server_text(snapshot),
         auth_ok=auth_text(snapshot),

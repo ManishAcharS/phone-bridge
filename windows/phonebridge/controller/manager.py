@@ -46,6 +46,7 @@ from ..core.session import (
     TerminalSessionError,
 )
 from ..transport.link import DEFAULT_PORT, websocket_uri
+from .adb import Adb
 from .capabilities import Capability, build_registry
 from .diagnostics import Diagnostics
 from .endpoints import is_loopback
@@ -64,7 +65,10 @@ from .usbcheck import (
     USB_UNKNOWN,
     PnpDevice,
     UsbDiagnosis,
+    UsbReport,
+    build_report,
     diagnose,
+    format_report,
     query_pnp,
 )
 
@@ -129,6 +133,7 @@ class Snapshot:
     usb_available: bool = False
     usb_diagnosis: str = ""
     usb_action: str = ""
+    usb_stage: str = ""
     wifi_status: str = "not checked yet"
     server_reachable: bool | None = None
     auth_ok: bool = False
@@ -197,6 +202,7 @@ class ConnectionManager:
         sleeper: Callable[[float], Awaitable[None]] | None = None,
         usb_probe: Callable[[], list[PnpDevice]] | None = None,
         system: str | None = None,
+        adb: Any | None = None,
         gateways: Callable[[], list[Gateway]] | None = None,
         probe: Callable[[str, int, float], Awaitable[bool]] | None = None,
     ) -> None:
@@ -228,6 +234,10 @@ class ConnectionManager:
         #: Windows' device tree is a subprocess; ask it at most every 30 s.
         self._usb_probe = usb_probe or query_pnp
         self._system = system or platform.system()
+        #: Only the manual "Diagnose USB" path drives adb directly; discovery goes
+        #: through the providers so there is still one place that talks to devices.
+        self._adb = adb if adb is not None else Adb()
+        self._usb_report: UsbReport | None = None
         self._pnp: list[PnpDevice] = []
         self._pnp_at: float = 0.0
         #: Network fingerprint at the moment the session came up, so a drop can
@@ -571,6 +581,7 @@ class ConnectionManager:
             wifi_status=statuses["wifi_status"],
             usb_diagnosis=statuses["usb_diagnosis"].headline,
             usb_action=statuses["usb_diagnosis"].action,
+            usb_stage=getattr(statuses["usb_diagnosis"], "stage", "") or "",
             last_discovery_error=(
                 statuses["discovery_error"] or (discovery_errors[0] if discovery_errors else None)
             ),
@@ -595,10 +606,10 @@ class ConnectionManager:
             "address below)"
         )
 
-    def _device_tree(self) -> list[PnpDevice]:
+    def _device_tree(self, *, force: bool = False) -> list[PnpDevice]:
         """Windows' USB device tree, cached; a subprocess per discovery is waste."""
         now = time.monotonic()
-        if now - self._pnp_at > 30.0:
+        if force or now - self._pnp_at > 30.0:
             try:
                 self._pnp = list(self._usb_probe())
             except Exception as exc:  # noqa: BLE001 - a diagnosis must never break discovery
@@ -623,6 +634,53 @@ class ConnectionManager:
             pnp=self._device_tree(),
             system=self._system,
         )
+
+    async def diagnose_usb(self) -> UsbReport:
+        """Run the whole USB chain on demand, and say where it stopped.
+
+        This is the button a user presses *after* changing something (another
+        cable, a driver, the USB mode on the phone). It bypasses every cache, so
+        two presses separated by a replug can report different stages. Nothing
+        here kills the adb server, deletes a key, or installs anything.
+        """
+        devices: list[Any] = []
+        error = ""
+        server = "not checked"
+        available = False
+        path = ""
+        version = ""
+        try:
+            available = bool(self._adb.available())
+            path = self._adb.path or ""
+            if available:
+                version = self._adb.version() or ""
+                devices, error, server = self._adb.probe_devices()
+        except Exception as exc:  # noqa: BLE001 - a diagnosis must not raise at the user
+            error = f"adb could not be run: {exc}"
+        report = build_report(
+            adb_devices=devices,
+            pnp=self._device_tree(force=True),
+            adb_available=available,
+            adb_path=path,
+            adb_version=version,
+            adb_server=server,
+            adb_error=error,
+            system=self._system,
+        )
+        self._usb_report = report
+        for line in format_report(report).splitlines():
+            self._log(line)
+        self._publish(
+            usb_diagnosis=report.headline,
+            usb_action=report.action or "—",
+            usb_stage=report.stage or "—",
+        )
+        return report
+
+    @property
+    def usb_report(self) -> UsbReport | None:
+        """The last on-demand report, or ``None`` if nobody pressed the button."""
+        return self._usb_report
 
     def _network_fingerprint(self) -> str:
         """The set of default gateways — i.e. which networks this PC is on."""

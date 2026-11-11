@@ -133,6 +133,10 @@ class PhoneBridgeApp:
         self.connect_button.pack(side="left")
         self.disconnect_button = ttk.Button(buttons, text="Disconnect", command=self._disconnect)
         self.disconnect_button.pack(side="left", padx=6)
+        self.diagnose_button = ttk.Button(
+            buttons, text="Diagnose USB", command=self._diagnose_usb
+        )
+        self.diagnose_button.pack(side="left", padx=6)
         self.reconnect_button = ttk.Button(buttons, text="Reconnect", command=self._reconnect)
         self.reconnect_button.pack(side="left")
 
@@ -188,6 +192,7 @@ class PhoneBridgeApp:
             ("adb", "adb"),
             ("adb_path", "adb path"),
             ("usb", "Physical USB"),
+            ("usb_stage", "USB stops at"),
             ("usb_diagnosis", "USB diagnosis"),
             ("usb_action", "USB next step"),
             ("wifi", "Wi-Fi discovery"),
@@ -264,6 +269,15 @@ class PhoneBridgeApp:
     def _reconnect(self) -> None:
         self.runtime.reconnect()
 
+    def _diagnose_usb(self) -> None:
+        """Re-run the whole USB chain now, and print it to the diagnostics pane.
+
+        Pressed after a replug or a driver change: the automatic diagnosis is
+        cached for 30 s, and the whole point is to see the new answer.
+        """
+        self.message_label.configure(text="checking USB (Windows devices, driver, adb)...")
+        self.runtime.diagnose_usb()
+
     def _use_endpoint(self) -> None:
         typed = self.endpoint_var.get().strip()
         if not typed:
@@ -319,6 +333,7 @@ class PhoneBridgeApp:
             ("adb", view.adb),
             ("adb_path", view.adb_path),
             ("usb", view.usb),
+            ("usb_stage", view.usb_stage),
             ("usb_diagnosis", view.usb_diagnosis),
             ("usb_action", view.usb_action),
             ("wifi", view.wifi),

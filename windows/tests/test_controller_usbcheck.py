@@ -28,6 +28,7 @@ from phonebridge.controller.usbcheck import (
     USB_WIRELESS_ONLY,
     PnpDevice,
     UsbDiagnosis,
+    build_report,
     diagnose,
     parse_pnp_csv,
     query_pnp,
@@ -172,6 +173,13 @@ def test_every_kind_is_in_the_published_list() -> None:
         verdict([], []).kind,
         verdict([], [pnp(problem=28, status="Error")]).kind,
         verdict([], [pnp()]).kind,
+        # MTP without an ADB interface, and a dead adb server: the two stages the
+        # first version of this module could not name.
+        verdict([], [PnpDevice(instance_id="USB\\VID_2717&PID_FF48\\4a2b",
+                               friendly_name="Redmi Note 14 Pro+",
+                               status="OK", class_name="WPD")]).kind,
+        build_report(adb_devices=[], pnp=[pnp()], system="Windows",
+                     adb_error="cannot connect to daemon").kind,
         diagnose(adb_devices=[], pnp=[], adb_available=False, system="Windows").kind,
         diagnose(adb_devices=[], pnp=[], system="Linux").kind,
     }
