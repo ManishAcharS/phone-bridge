@@ -240,10 +240,11 @@ exactly 16 bytes is dropped rather than treated as an error.
   | `sensor_failed` | the platform refused to register a listener |
   | `bad_params` | an id, interval, chunk size or offset outside the documented range |
   | `unknown_transfer` | a `file.*` call named a transfer this phone does not have |
+  | `no_file` | the phone's picker returned nothing, or the chosen document could not be opened |
   | `hash_mismatch` | the assembled file did not match the offered SHA-256, so it was discarded |
   | `storage_denied` | the user has not granted a storage location (SAF) or the write failed |
   | `cancelled` | the user cancelled the transfer on the phone |
-  | `busy` | another file transfer is already running (`file.offer` while one is active) |
+  | `busy` | another file transfer is already running (`file.offer` while one is active), or the phone's bounded worker queue is full |
 
   All of them leave the session open: a refused operation is never a reason to
   drop the control channel.
@@ -307,7 +308,28 @@ keys are additive and must be ignored by a client. Types are JSON types.
 | `file.progress` | `transfer_id` int, `state` str, `bytes` int, `chunks` int, `sha256` str, `error` str |
 | `file.cancel` | `ok` bool, `state` str (`cancelled`) |
 | `file.pause` | `ok` bool, `state` str (`paused`) |
-| `file.resume` | `ok` bool, `from_bytes` int, `state` str (`active`) |
+| `file.resume` | `ok` bool, `from_bytes` int, `state` str (`active`). Params: `transfer_id` int, `from_bytes` int |
+
+#### 5.2 Resume offsets (normative)
+
+`from_bytes` is a byte offset, and it is only meaningful on a **chunk boundary**:
+a sender can seek, a chunk cannot be split. Both directions enforce that, and both
+must behave the same way:
+
+* `file.offer` answers `resume_from` = the whole chunks the phone already holds
+  (never a partial chunk). The PC validates it — a multiple of the negotiated
+  chunk size, strictly inside the file — and treats anything else as zero, saying
+  why in its log.
+* `file.resume` answers the offset the phone will *actually* start streaming from.
+  It may differ from the request (an older phone that cannot resume answers `0`,
+  and a stream that has already begun answers where it began). The PC believes
+  the answer and truncates its `.part` to it, because the alternative is a file
+  with a hole in it.
+* An offset that is negative, past the end of the file, or not a multiple of the
+  chunk size is `bad_params` — refused, not clamped. Clamping a misaligned offset
+  would silently duplicate or skip bytes.
+* `file.resume` is optional for the phone: a `method_not_found`/`bad_params`
+  refusal means "cannot resume", and the PC starts over from zero.
 
 The scan results are pushed as events as well (see §6.1), so a GUI can update a
 device list while the scan runs instead of polling.
@@ -349,7 +371,7 @@ phone that can connect, and the two carry different Android permissions.
 {"address":"C4:7F:51:00:00:01","name":"Heart Rate Band","rssi":-54,
  "service_uuids":["0000180d-0000-1000-8000-00805f9b34fb"],
  "connectable":true,"first_seen_ms":0,"last_seen_ms":412,
- "sightings":2,"address_type":"public"}
+ "sightings":2,"address_type":""}
 ```
 
 `name` is `""` when the peripheral advertises none (or when the phone may not

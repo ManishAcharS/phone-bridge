@@ -113,25 +113,50 @@ Interval: microseconds, 1 000..10 000 000. The PC offers 200, 100, 50, 15, 5 and
 at its own `min_delay_us` — the PC shows the applied value, not the requested
 one.
 
-**Error codes**: `sensor_denied` (permission or a restricted sensor),
-`sensor_unavailable` (the phone has no sensors at all), `sensor_failed`
-(registration refused, or nothing could be started), `bad_params` (unknown id,
-interval outside the range).
+**Error codes**: `sensor_denied` (permission missing, or a restricted sensor),
+`sensor_failed` (registration refused, nothing could be started, or the phone
+reported no sensors at all — the message says which), `bad_params` (unknown id,
+interval outside the range). There is no separate `sensor_unavailable` code: "no
+sensors at all" is a `sensor_failed` with a sentence, which is what the phone
+sends and what `docs/03` documents.
 
 ---
 
 ## 4. Permissions
 
-Sensors need **no runtime permission**. They are the phone's own hardware and
-Android grants access to an app reading from the foreground service. The one
-documented exception — `BODY_SENSORS`, needed for heart-rate and similar
-health sensors on some builds — is deliberately **not** declared: this release
-streams the motion and environment sensors, and adding a body-sensor permission
-to read an accelerometer would be a capability claim the app cannot back
-(`Permissions.kt` keeps it in `futurePermissions` with that reason).
+Two different permissions matter here, and Phase 5.1 stopped pretending neither
+did.
 
-`DeviceFacts.kt` still reports `permitted.sensors`, so the shape is there for a
-future build that gains a body sensor; today it is `true`.
+**`HIGH_SAMPLING_RATE_SENSORS` (declared, normal).** Android 12+ gates sampling
+faster than 200 Hz behind this permission, and some vendors gate lower rates as
+well. It is a *normal* permission: granted at install, never prompted, no user
+friction. The app declares it in `AndroidManifest.xml` and *reads* it with
+`checkSelfPermission` — that is the only way `sensor.list` can report a measured
+answer instead of a constant. It is deliberately **not** in `Permissions.kt`'s
+runtime request list, because asking for it would be a dialog that cannot appear.
+
+**`BODY_SENSORS` (not declared).** Heart rate, heart beat and the other
+`TYPE_*` health sensors need it. This release does not declare it, so those
+sensors are refused with `sensor_denied` and a reason that says which permission
+a future build would need (`Permissions.kt` keeps it in `futurePermissions`).
+Declaring a body-sensor permission to read an accelerometer would be a capability
+claim the app cannot back, and asking for it at launch would be worse.
+
+What the app reports, and what it never does:
+
+| field | where | truth |
+| --- | --- | --- |
+| `permitted` | `sensor.list`, `sensor.status`, `system.info.capabilities` | `checkSelfPermission` for the *specific* sensor's gate, or `true` for a sensor with no gate |
+| `detail` | same | the permission name and what to grant, when `permitted` is false |
+| `state` | `sensor.list` | `available`, `permission_denied`, `unavailable` (hardware), or `unimplemented` — four different answers, never collapsed |
+| `reason` | `sensor.list` | one sentence for a refused sensor, e.g. "needs `BODY_SENSORS`, which this build does not declare" |
+
+The permission is **never** requested automatically: `sensor.start` on an
+unpermitted sensor answers `sensor_denied` and the session stays open. A denial
+is a fact to report, not a dialog to spring on somebody who was streaming.
+
+`DeviceFacts.kt` reports `permitted.sensors` from the same probe, so the PC's
+capability card and the sensors tab cannot disagree.
 
 ---
 
@@ -222,7 +247,19 @@ simulator run cannot be presented as hardware evidence.
 | `lost` climbs | frames were dropped because the PC was behind | expected at very high rates over Wi-Fi; the oldest sample is the one dropped |
 | `out_of_order` climbs | the phone's sequence wrapped after a restart | harmless; stop and start to reset the counter |
 | readings stop but state is "active" | the phone-side service was killed | Stop then Start; the session must still be up |
-| `sensor_denied` | a restricted sensor on that build | not granted by design; use the motion sensors |
+| `sensor_denied` | a restricted sensor on that build, or a revoked permission | the `detail` names the permission; motion sensors keep working |
+
+---
+
+## 9.1 Phase 5.1: measured permissions
+
+`tests/test_phase51_android_contract.py` pins the source-level half: the sensor
+catalogue no longer contains a hardcoded `permitted`, `checkSelfPermission` is
+what feeds `permitted`/`detail`, heart-rate kinds are refused with a reason, and
+`HIGH_SAMPLING_RATE_SENSORS` is declared in the manifest but absent from the
+runtime request list. `tests/test_sensors.py` covers the PC side (denied,
+revoked, malformed frames, the phantom-sensor fix). Neither runs a sensor: the
+`SensorManager` half is §10.
 
 ---
 

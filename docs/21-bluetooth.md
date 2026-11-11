@@ -59,15 +59,48 @@ Five properties are structural:
    from a scan *the user started*. There is no code path that connects because a
    device was seen, and no auto-reconnect after a drop: a peripheral that comes
    back on its own is a peripheral the user did not ask for.
-3. **Operations are serialised per connection.** `BluetoothGatt` allows one
-   outstanding operation; `BleEngine` queues them with a 15 s deadline instead of
-   interleaving callbacks into each other's answers.
+3. **Operations are serialised per connection, and confirmed by the platform.**
+   `BluetoothGatt` allows one outstanding operation, so `BleEngine` holds a
+   per-address monitor for the whole exchange — issue *and* callback — and a
+   write is only reported as done when `onCharacteristicWrite` arrives with
+   `status == GATT_SUCCESS`. A timeout is reported as a timeout, with the real
+   GATT status when there is one; it is never dressed up as success.
 4. **Bounded buffers.** ≤200 devices per scan, 32 subscriptions per connection,
    200 notifications per connection, 512-byte values. Overflow drops the oldest
    notification and is counted, never silently grows.
-5. **Nothing for location.** `BLUETOOTH_SCAN` is declared with
+5. **Bounded events, applied filters.** Scan sightings are coalesced to at most
+   20 published events a second (the newest state per address is kept, so the
+   device list stays complete), and `name_prefix` is applied on the phone *and*
+   on the PC — a phone that predates the parameter cannot turn `--name` into a
+   no-op.
+6. **Nothing for location.** `BLUETOOTH_SCAN` is declared with
    `android:usesPermissionFlags="neverForLocation"`; scan results are never used
    to infer position and the app does not request location on Android 12+.
+
+---
+
+### 2.1 Phase 5.1: the review findings, and what changed
+
+The Phase 5 review found that §2 above described intentions the code did not
+implement. What changed, and what now pins it:
+
+| finding | before Phase 5.1 | now | pinned by |
+| --- | --- | --- | --- |
+| writes were "pending" until a timeout | `bluetooth.gatt.write` succeeded without waiting for `onCharacteristicWrite` | the write completes only on the callback, and the reply carries the real GATT status | `test_write_completion_comes_from_the_platform_callback` |
+| no serialisation | two callers could interleave callbacks on one link | one monitor per address, held for issue and callback; `failLink` aborts waiting operations | `test_gatt_operations_on_one_link_are_serialised` |
+| a read timeout was reported as the result | 15 s of silence looked like a refusal with no status | the callback's status is reported; a timeout says it timed out | `test_read_reports_the_real_status_instead_of_a_timeout` |
+| a failed connect leaked its `BluetoothGatt` | connect/discovery failures left the object open | every failure, timeout, disconnect and cancel goes through `failLink`, which disconnects, closes and forgets the link | `test_a_failed_link_closes_its_gatt_object` |
+| `Link.state` was read across threads unsafely | a stale state could outlive a connect | `@Volatile` | `test_the_connection_state_is_volatile` |
+| scan events were unbounded | a crowded room meant one publish per sighting | 20 published events a second, newest state per address kept | `test_a_burst_of_sightings_publishes_at_a_bounded_rate` |
+| `name_prefix` was dead | the parameter was sent and ignored | applied on the phone and on the PC, case-insensitively | `test_the_name_filter_drops_events_that_do_not_match` |
+
+A GATT connect also requests an MTU of 517 now, and `bluetooth.gatt.status`
+reports the negotiated value rather than leaving the GUI to guess. A scan that is
+already running is stopped before a new one starts, so repeated start/stop cannot
+stack callbacks.
+
+None of this has been run against a peripheral: there is no radio in this
+environment. §10 is the checklist that remains.
 
 ---
 
@@ -102,7 +135,7 @@ A device object (scan result) is:
 | `service_uuids` | advertised service UUIDs, normalised to 128-bit lowercase |
 | `connectable` | whether the advertisement said connectable |
 | `first_seen_ms`, `last_seen_ms`, `sightings` | lifecycle of this entry in the scan |
-| `address_type` | `public` / `random` / `unknown` |
+| `address_type` | `public` / `random` / `unknown` — reserved: this build's phone does not send it, so the PC shows `""` rather than guessing |
 
 **Events** (`MSG_CONTROL`, `event` name + data):
 
@@ -260,7 +293,9 @@ reports *unavailable with a reason*, not *missing*.
 | Self-test | `cli/selftest.py` | "bluetooth scan lifecycle" and "bluetooth GATT lifecycle" rows, run against the connected phone |
 | Android | — | **not compiled**; no JDK/SDK in this environment (§10) |
 
-`tools/verify.py` runs the self-test against the simulator and reports 17/17 rows.
+`phonebridge selftest` reports 17 of 17 supported workflows against a connected
+phone or the simulator; `windows/tests/test_cli.py::test_selftest_runs_every_supported_workflow`
+pins that count, and `tools/verify.py` runs the whole matrix as its check 8.
 
 ---
 
