@@ -42,10 +42,21 @@ questions separately:
 | `<key>` | Can PhoneBridge **use** it today? | `hardware && implemented && permissionGranted` |
 | `detail.<key>` | Why not, in one sentence | e.g. "present, not implemented yet (Phase 4) — camera streaming is Phase 4" |
 
-Every `implemented` flag is `false` in this phase, and a test fails if one is ever
-set to `true` without the feature. The keys are unchanged
+> **Phase 5 update.** This section records the Phase 1 audit, when every
+> `implemented` flag was `false`. Since then Phases 2, 4 and 5 have landed:
+> `audio.playback`, `audio.capture`, `audio.bluetooth_sco`, `camera.back`,
+> `camera.front`, `sensors`, `file_transfer`, `bluetooth_scan` and
+> `bluetooth_gatt` are all implemented, and every one has an engine behind it
+> (`AudioEngine.kt`, `CameraEngine.kt`, `SensorEngine.kt`,
+> `FileTransferEngine.kt`, `BleEngine.kt`) — `test_android_completion.py` fails if
+> a flag says `true` while its engine is missing. The rule did not change: a
+> `true` flag must be backed by a feature.
+
+Every `implemented` flag was `false` in that phase, and a test fails if one is
+ever set to `true` without the feature. The keys are unchanged
 (`audio.playback`, `audio.capture`, `audio.bluetooth_sco`, `camera.back`,
-`camera.front`, `sensors`, `file_transfer`, `bluetooth_scan`), so an older PC
+`camera.front`, `sensors`, `file_transfer`, `bluetooth_scan`, `bluetooth_gatt`),
+so an older PC
 still reads them — it just stops being told a comforting lie.
 
 `audio.bluetooth_sco` keeps its meaning at the hardware level (an HFP/SCO-capable

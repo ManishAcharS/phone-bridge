@@ -184,8 +184,8 @@ plaintext = msg_type(1) ‖ stream_id(4, BE) ‖ payload
 | `0x21` | BLOB | opaque bytes (throughput test; echo stream) |
 | `0x30` | AUDIO | `u8 codec ‖ u8 flags ‖ u16 seq ‖ u32 ts_ms ‖ frame` (Phase 2, implemented) |
 | `0x40` | VIDEO | `u8 codec ‖ u8 flags ‖ u16 seq ‖ u32 ts_ms ‖ u16 w ‖ u16 h ‖ u16 rot ‖ jpeg` (Phase 4, implemented) |
-| `0x50` | FILE | Phase 5 |
-| `0x60` | SENSOR | Phase 5 |
+| `0x50` | FILE | `u32 transfer_id ‖ u32 chunk_index ‖ u32 chunk_len ‖ u8 flags ‖ u8 reserved ‖ chunk` (Phase 5, implemented) |
+| `0x60` | SENSOR | `u16 sensor_id ‖ u16 seq ‖ u32 ts_ms ‖ u8 kind ‖ u8 count ‖ u16 reserved ‖ count × f32` (Phase 5, implemented) |
 | `0x7F` | BYE | UTF-8 reason |
 
 A request may be answered **later than the read loop**: `audio.capabilities.run`
@@ -226,6 +226,27 @@ exactly 16 bytes is dropped rather than treated as an error.
   `no_camera` (this phone has no such lens), `camera_busy` (another app holds the
   camera, or the camera service refused to bind) and `bad_config` (the requested
   resolution/rate/quality/facing is outside the documented ranges).
+* Phase 5 adds one code per refusal a user can act on, so the PC never has to
+  parse a message to know what happened:
+
+  | code | meaning |
+  | --- | --- |
+  | `no_bluetooth` | this device has no usable Bluetooth LE radio |
+  | `bluetooth_off` | the radio is present but switched off |
+  | `bluetooth_denied` | the scan/connect permission is not granted |
+  | `gatt_failed` | the GATT operation failed on the phone (peripheral gone, timeout, refused) |
+  | `not_connected` | the named peripheral is not connected (GATT calls need `bluetooth.gatt.connect` first) |
+  | `sensor_denied` | the sensor permission is missing (only on Android versions that gate the requested sensor) |
+  | `sensor_failed` | the platform refused to register a listener |
+  | `bad_params` | an id, interval, chunk size or offset outside the documented range |
+  | `unknown_transfer` | a `file.*` call named a transfer this phone does not have |
+  | `hash_mismatch` | the assembled file did not match the offered SHA-256, so it was discarded |
+  | `storage_denied` | the user has not granted a storage location (SAF) or the write failed |
+  | `cancelled` | the user cancelled the transfer on the phone |
+  | `busy` | another file transfer is already running (`file.offer` while one is active) |
+
+  All of them leave the session open: a refused operation is never a reason to
+  drop the control channel.
 
 ### Implemented RPC methods (phone side)
 
@@ -265,10 +286,173 @@ keys are additive and must be ignored by a client. Types are JSON types.
 | `camera.stop` | `ok` bool, `streaming` bool (always false) |
 | `camera.switch` | `ok` bool, `facing` str, `streaming` bool |
 | `camera.status` | `streaming` bool, `facing` str, `width` int, `height` int, `fps` int, `frames_sent` int, `dropped` int, `permitted` bool, `hardware` bool, `last_error` str |
+| `bluetooth.adapter.status` | `supported` bool, `enabled` bool, `le_supported` bool, `name` str, `address` str, `permitted` bool, `detail` str |
+| `bluetooth.scan.start` | `ok` bool, `scanning` bool, `started_at_ms` int, `duration_ms` int. Params: `duration_ms` (0 = until stopped), `filter_uuids` array, `name_prefix` str |
+| `bluetooth.scan.stop` | `ok` bool, `scanning` bool (always false), `devices` array |
+| `bluetooth.scan.results` | `scanning` bool, `state` str, `devices` array of the device object below, `detail` str |
+| `bluetooth.gatt.connect` | `address` str, `state` str (`connected`/`failed`), `services` array, `mtu` int |
+| `bluetooth.gatt.services` | `address` str, `mtu` int, `services` array |
+| `bluetooth.gatt.read` | `value_b64` str (standard base64), `bytes` int, `hex` str |
+| `bluetooth.gatt.write` | `ok` bool, `bytes` int. Params: `value_b64`, `with_response` bool |
+| `bluetooth.gatt.subscribe` | `ok` bool, `subscribed` bool. Params: `enable` bool (default true) |
+| `bluetooth.gatt.disconnect` | `ok` bool, `state` str (`disconnected`) |
+| `bluetooth.gatt.status` | `connections` array of `{address str, state str, subscriptions str[], error str}`, `scanning` bool |
+| `sensor.list` | `sensors` array of the sensor object below, `permitted` bool, `interval_us` int, `detail` str |
+| `sensor.start` | `ok` bool, `active` int[] (the ids the phone started), `interval_us` int (as applied). Params: `ids` int[], `interval_us` int |
+| `sensor.stop` | `ok` bool, `stopped` int[], `active` int[] (always empty) |
+| `sensor.status` | `active` int[], `interval_us` int, `frames_sent` int, `permitted` bool |
+| `file.offer` | `transfer_id` int, `chunk_size` int, `window` int, `resume_from` int. Params: `name` str, `size` int, `sha256` str, `chunk_size` int |
+| `file.request` | `transfer_id` int, `name` str, `size` int, `sha256` str, `chunk_size` int. Params: `name` str (optional hint) |
+| `file.complete` | `ok` bool, `verified` bool, `sha256` str, `bytes` int, `path_hint` str (`""` when the phone will not describe its storage) |
+| `file.progress` | `transfer_id` int, `state` str, `bytes` int, `chunks` int, `sha256` str, `error` str |
+| `file.cancel` | `ok` bool, `state` str (`cancelled`) |
+| `file.pause` | `ok` bool, `state` str (`paused`) |
+| `file.resume` | `ok` bool, `from_bytes` int, `state` str (`active`) |
 
-`capabilities` (from `system.info`) has, for each of the eight keys, a bool
+The scan results are pushed as events as well (see §6.1), so a GUI can update a
+device list while the scan runs instead of polling.
+
+#### 6.1 Events (phone -> PC)
+
+Events ride the control channel as `{"k":"evt","event":str,"data":object}`. They
+are **hints, not state**: a PC that misses one must be able to recover the truth
+with `bluetooth.scan.results`, `bluetooth.gatt.status` or `sensor.status`. No
+event carries anything the PC could not have asked for.
+
+| event | data | when |
+| --- | --- | --- |
+| `bluetooth.headset` | `connected` bool | Phase 1: headset attached/detached |
+| `bluetooth.device` | the device object above | a peripheral was seen or seen again during a scan |
+| `bluetooth.scan` | `state` str (`scanning`/`stopped`/`error`), `detail` str | scan lifecycle |
+| `bluetooth.gatt` | `address` str, `state` str, `error` str | a GATT link connected, failed or dropped (including the peripheral going out of range) |
+| `bluetooth.notification` | `address` str, `service` str, `characteristic` str, `value_b64` str, `hex` str, `bytes` int, `ts_ms` int | a subscribed characteristic notified |
+| `camera.state` | `streaming` bool, `facing` str, ... | Phase 4 camera lifecycle |
+| `audio.state` | `playback` str, `mic` str, ... | Phase 2 relay lifecycle |
+
+Sensor readings are **not** events: they are `MSG_SENSOR` messages on stream 4,
+because a 50 Hz reading through the JSON control channel would be both slower and
+larger. File chunks are `MSG_FILE` messages for the same reason.
+
+A notification value is capped at 512 bytes in the event (`value_b64` empty beyond
+that, `hex` truncated with `bytes` still telling the truth); the PC keeps at most
+200 per connection for its viewer.
+
+`capabilities` (from `system.info`) has, for each of the **nine** keys, a bool
 `<key>`, a bool `hardware.<key>` and a string `detail.<key>`; the strings
-`audio.bluetooth_profile` and int `protocol_version` may also appear.
+`audio.bluetooth_profile` and int `protocol_version` may also appear. Phase 5
+adds `bluetooth_gatt` beside `bluetooth_scan`: a radio that can scan is not a
+phone that can connect, and the two carry different Android permissions.
+
+#### Bluetooth device object
+
+```json
+{"address":"C4:7F:51:00:00:01","name":"Heart Rate Band","rssi":-54,
+ "service_uuids":["0000180d-0000-1000-8000-00805f9b34fb"],
+ "connectable":true,"first_seen_ms":0,"last_seen_ms":412,
+ "sightings":2,"address_type":"public"}
+```
+
+`name` is `""` when the peripheral advertises none (or when the phone may not
+read it). `address` may be `""` on Android 12+ if the user denied the scan
+permission — the device still appears, unnamed and unaddressable, rather than
+being hidden. `sightings` counts how often the same address was reported, so a
+client can show a stable list while `rssi` keeps updating.
+
+GATT service object: `{"uuid":str,"short":str,"characteristics":[{"uuid","short","properties":str[],"descriptors":str[]}]}`.
+`properties` uses the standard names (`read`, `write`, `write_no_response`,
+`notify`, `indicate`, `signed_write`, `broadcast`, `extended_props`).
+
+#### Sensor object
+
+```json
+{"id":1,"kind":1,"name":"BMI160 Accelerometer","vendor":"Bosch",
+ "min_delay_us":5000,"max_delay_us":200000,"max_range":39.2,
+ "resolution":0.0012,"power_ma":0.13}
+```
+
+`kind` is the Android `Sensor.TYPE_*` integer: `1` accelerometer, `2`
+magnetometer, `4` gyroscope, `5` light, `8` proximity, `9` gravity, `10` linear
+acceleration, `11` rotation vector, `15` game rotation vector, `3` orientation,
+`19` step counter, `18` step detector (the full table lives in
+`windows/phonebridge/sensors/frames.py`). A sensor the phone offers but
+PhoneBridge has no name for is still listed with kind `0`-style numbering; the PC
+shows the vendor name and the raw numbers rather than pretending it is absent.
+
+#### `MSG_SENSOR` body (normative, Phase 5)
+
+One message carries **one reading from one sensor**. Stream id is fixed: **4 =
+phone to PC**. It is one-way in protocol v1.
+
+| offset | size | field |
+| --- | --- | --- |
+| 0 | 2 | `sensor_id` — the `id` from `sensor.list` |
+| 2 | 2 | `seq` — big-endian, per sensor, wraps at 65535 |
+| 4 | 4 | `ts_ms` — big-endian, phone's monotonic ms since the stream started |
+| 8 | 1 | `kind` — Android `Sensor.TYPE_*` |
+| 9 | 1 | `count` — 1..16 values in this frame |
+| 10 | 2 | reserved, must be zero |
+| 12 | 4×count | float32 big-endian values |
+
+Rules both sides enforce:
+
+* `seq` is **per sensor**: the accelerometer at 50 Hz and the light sensor at 1 Hz
+  share a stream but not a counter, so a gap in one says nothing about another;
+* `ts_ms` is the phone's clock, never the PC's, and never a wall-clock date — a PC
+  with a wrong clock still shows correct intervals;
+* a frame with an unknown `kind`, `count` outside 1..16, a truncated body, or a
+  NaN/Inf value is **dropped and counted**, never fatal;
+* readings travel through a bounded queue (64 frames) on the PC; when a consumer
+  is behind the *oldest* reading is discarded and counted, because a stale sample
+  is worth less than a current one;
+* `sensor.stop`, a closed session, a phone-side release and
+  `BridgeService.onDestroy` all unregister every listener. Stop really stops: the
+  phone reports `active: []` and the PC shows the stream as idle.
+
+Sampling intervals are in microseconds and must be 1 000..10 000 000. The PC's
+offered choices are 5, 10, 20, 66 667 (15 Hz), 200 and 1000 ms; the phone's reply
+is authoritative because a sensor may floor the interval at its own
+`min_delay_us`.
+
+#### `MSG_FILE` body (normative, Phase 5)
+
+| offset | size | field |
+| --- | --- | --- |
+| 0 | 4 | `transfer_id` — the id `file.offer`/`file.request` returned |
+| 4 | 4 | `chunk_index` — 0-based |
+| 8 | 4 | `chunk_len` — payload bytes that follow (0 for a pure control frame) |
+| 12 | 1 | `flags` — bit0 `START`, bit1 `END`, bit2 `ACK`, bit3 `CANCEL`, bit4 `PAUSE`, bit5 `RESUME` |
+| 13 | 1 | reserved, must be zero |
+| 14 | chunk_len | payload |
+
+Stream ids are fixed and named from the sender's point of view: **5 = PC to
+phone** (the PC sends data, the phone acknowledges on stream 5), **6 = phone to
+PC** (the phone sends data, the PC acknowledges on stream 6). Acknowledgements
+travel in the same direction as the data they acknowledge, on the same stream id,
+and carry no payload.
+
+Rules both sides enforce:
+
+* the header is 14 bytes; `chunk_len` is 32-bit because a 64 KiB chunk is 65 536
+  bytes and does not fit in 16 bits;
+* chunk size is 1 KiB..256 KiB (default 64 KiB); a transfer is at most 4 GiB;
+* the sender keeps at most **8** unacknowledged chunks in flight and expects an
+  `ACK` at least every 4 chunks; a sender that gets no ack for 15 s fails the
+  transfer with a message naming the last acknowledged chunk;
+* the receiver writes to `<name>.part` and renames it to `<name>` **only after**
+  the SHA-256 of the whole file matches the value in the offer; a mismatch
+  deletes the part file and answers `hash_mismatch`;
+* resume is byte-offset based: the receiver may ask to continue from any offset it
+  reports, and the sender truncates the part file down to the last whole chunk
+  before continuing, so no byte is ever written twice;
+* a name that is empty, absolute, contains a path separator, a Windows reserved
+  device name, a control character or more than 255 bytes is **refused** before
+  anything is written (`bad_params`), and the receiver also refuses to place a
+  file outside the directory the user chose;
+* `PAUSE` stops sending without closing anything; `RESUME` continues; `CANCEL`
+  drops the part file on both sides. None of them close the session.
+* nothing is reported as complete before the hash verifies: `file.complete` is the
+  phone's *verification* answer, and a PC that never receives `verified: true`
+  must treat the transfer as failed.
 
 #### `MSG_AUDIO` body (normative, Phase 2)
 
@@ -346,12 +530,12 @@ Error replies are `{"k":"res","id":<id>,"ok":false,"error":{"code":str,"message"
 with one of the codes listed above. An unknown method **must** be answered with
 `method_not_found` and must not close the session.
 
-**There is no other operation.** File transfer (both directions) and sensor
-retrieval have no method in this protocol: the message kinds `0x50 FILE` and `0x60
-SENSOR` are reserved numbers for later phases with no body format defined and no
-handler on either side. (`0x30 AUDIO` and `0x40 VIDEO` are implemented, as
-described above.) A client that invents a method name will receive
-`method_not_found`, which is the correct answer.
+**Every operation this document lists is implemented on both sides.** Phase 5
+closed the last gaps: file transfer (both directions), sensors and Bluetooth now
+have methods, events and body formats as described above, and the reference phone
+(`tools/simulator/phone_sim.py`) answers all of them. A client that invents a
+method name still receives `method_not_found`, which is the correct answer: an
+unknown method never closes the session, and adding one is additive.
 
 #### `system.info` device block
 
@@ -373,11 +557,17 @@ Two separate questions, deliberately kept apart:
 * `detail.<key>` — one sentence explaining why a capability is not available.
 
 Keys: `audio.playback`, `audio.capture`, `audio.bluetooth_sco`, `camera.back`,
-`camera.front`, `sensors`, `file_transfer`, `bluetooth_scan`, plus the
-string-valued `audio.bluetooth_profile` and the integer `protocol_version`.
+`camera.front`, `sensors`, `file_transfer`, `bluetooth_scan`, `bluetooth_gatt`,
+plus the string-valued `audio.bluetooth_profile` and the integer
+`protocol_version`.
 
-In this phase every bare capability key is `false` on a real phone: the audio
-relay is Phase 2, camera streaming Phase 4, file transfer and sensors Phase 5.
+A bare key is `true` only when the feature is implemented **and** the hardware is
+present **and** the runtime permission is granted. Phase 5 makes `sensors`,
+`file_transfer`, `bluetooth_scan` and `bluetooth_gatt` implemented, so on a phone
+that granted the permissions they can be `true`; a phone without a radio, or with
+the permission denied, still reports `false` with the reason in `detail.<key>`.
+That is the point of keeping the inputs separate: "the sensor exists" is not "the
+stream runs", and "there is a radio" is not "GATT works".
 A PC must treat `hardware.*` as "what the device has" and the bare key as "what
 works now"; showing the former as if it were the latter is the bug this contract
 exists to prevent. The simulator (`tools/simulator/phone_sim.py`) reports

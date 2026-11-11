@@ -15,11 +15,12 @@ is left, item by item.
 
 | | |
 | --- | --- |
-| **PC client** | complete, 927 automated tests, type-checked, linted |
+| **PC client** | complete, 1132 automated tests, type-checked, linted |
 | **Android app** | complete, compiled against a stub environment, source-audited |
 | **Protocol** | v1, frozen; wire format in [`docs/03-protocol.md`](docs/03-protocol.md) |
 | **Audio relay** | implemented (Phase 2); the phone microphone reaches the PC's speakers, not a virtual mic |
 | **Camera streaming** | implemented (Phase 4); verified against the reference phone, **not yet on a handset** |
+| **Bluetooth LE, sensors, file transfer** | implemented (Phase 5); verified against the reference phone, **no real peripheral, sensor or storage has been exercised** |
 
 ---
 
@@ -67,7 +68,9 @@ Full reference: [`docs/17-connection-controller.md`](docs/17-connection-controll
 | Audio capability probe (measures what the handset can actually do) | **works** |
 | Bluetooth audio relay (the sound itself) | **works** (Phase 2, monitor only — no virtual microphone) |
 | Camera streaming to the Windows preview (Phase 4) | **works** — synthetic frames in tests, real CameraX on the phone |
-| Sensors, file transfer, Bluetooth scan | **not in protocol v1** |
+| Bluetooth LE scan, GATT read/write/subscribe (Phase 5) | **works** — the phone is the radio, the PC drives it over the same session |
+| Sensors: 13 kinds, per-sensor rate, live values (Phase 5) | **works** — no reading is ever invented; a sensor with no frame says so |
+| File transfer both ways, hashed and resumable (Phase 5) | **works** — SAF on the phone, `.part` + SHA-256 + atomic rename on the PC |
 
 `phonebridge capabilities` never guesses: it separates what the phone *has*
 (`hardware.*`) from what PhoneBridge can *currently deliver* (`usable`) and
@@ -191,20 +194,23 @@ and examples: [`docs/11-pc-client.md`](docs/11-pc-client.md).
 
 ## Supported capabilities
 
-The phone reports eight capability keys. `usable` means *implemented in
+The phone reports nine capability keys. `usable` means *implemented in
 PhoneBridge v1 **and** the hardware is present **and** the Android permission is
-granted* — all three, or it is `false`.
+granted* — all three, or it is `false`. `active` is a fourth, separate fact: a
+radio that scanned a minute ago is not active, and a sensor that exists is not
+streaming.
 
-| Key | Meaning | Usable in 1.0.0 |
+| Key | Meaning | Usable now |
 | --- | --- | --- |
-| `audio.playback` | audio can be rendered to a communication device | no — Phase 2 |
-| `audio.capture` | microphone can be read | no — Phase 2 |
-| `audio.bluetooth_sco` | a bidirectional HFP/SCO headset link is available | no — Phase 2 |
+| `audio.playback` | audio can be rendered to a communication device | yes — Phase 2 |
+| `audio.capture` | microphone can be read | yes — Phase 2 (needs `RECORD_AUDIO`) |
+| `audio.bluetooth_sco` | a bidirectional HFP/SCO headset link is available | yes — Phase 2 |
 | `camera.back` | rear camera present and permitted | yes — Phase 4 (lens + `CAMERA` permission + built) |
 | `camera.front` | front camera present and permitted | yes — Phase 4 |
-| `sensors` | motion/environment sensors present | no — not in protocol v1 |
-| `file_transfer` | files can be moved in either direction | no — not in protocol v1 |
-| `bluetooth_scan` | nearby Bluetooth devices can be listed | no — not in protocol v1 |
+| `sensors` | motion/environment sensors present and streamable | yes — Phase 5 |
+| `file_transfer` | files can be moved in either direction | yes — Phase 5 (needs a granted SAF folder to receive) |
+| `bluetooth_scan` | nearby Bluetooth LE devices can be listed | yes — Phase 5 (`BLUETOOTH_SCAN`, or location on Android ≤11) |
+| `bluetooth_gatt` | a peripheral can be connected and read/written | yes — Phase 5 (`BLUETOOTH_CONNECT`, or `BLUETOOTH` ≤11) |
 
 What *is* available in 1.0.0 is the measurement itself: the capability probe
 (`phonebridge compat run`, or **Capability probe** in the app) records what the
@@ -238,6 +244,12 @@ More: [`docs/11-pc-client.md`](docs/11-pc-client.md) §13 and
 
 Written down so nobody has to discover them:
 
+* **Bluetooth, sensors and file transfer have never run on a real handset.** Phase 5
+  implements all three end to end and verifies them against the reference phone,
+  but no real peripheral, real sensor or real storage has been touched. The
+  checklists in [`docs/21-bluetooth.md`](docs/21-bluetooth.md) §10,
+  [`docs/22-sensors.md`](docs/22-sensors.md) §10 and
+  [`docs/23-file-transfer.md`](docs/23-file-transfer.md) §11 are outstanding.
 * **The camera has never run on a real handset.** Phase 4 implements it end to end
   and tests it against the reference phone (synthetic frames); the manual hardware
   checklist in [`docs/20-camera.md`](docs/20-camera.md) §9 is still outstanding.
@@ -359,6 +371,9 @@ residual risk: [`docs/13-security-review.md`](docs/13-security-review.md).
 | measure my three phones | [`docs/08-multi-device-test-strategy.md`](docs/08-multi-device-test-strategy.md) |
 | see per-device audio results | [`docs/09-compat-report.md`](docs/09-compat-report.md) |
 | stream the phone camera | [`docs/20-camera.md`](docs/20-camera.md) |
+| scan Bluetooth LE and talk GATT | [`docs/21-bluetooth.md`](docs/21-bluetooth.md) |
+| stream the phone's sensors | [`docs/22-sensors.md`](docs/22-sensors.md) |
+| send and receive files | [`docs/23-file-transfer.md`](docs/23-file-transfer.md) |
 | read the Android completion notes | [`docs/10-android-app-completion.md`](docs/10-android-app-completion.md) |
 
 ## License
