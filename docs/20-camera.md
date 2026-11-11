@@ -5,7 +5,9 @@ exists. No second socket, no unencrypted media path, no separate application
 window, and no frames when nobody asked.
 
 Status: **implemented on both sides; verified against the reference phone and the
-PC's own tests; not yet run on a physical handset** (see §9).
+PC's own tests; not yet run on a physical handset** (see §9). Pull request:
+[#11](https://github.com/ManishAcharS/phone-bridge/pull/11), based on `main`
+`7f7349d` (Phase 2 audio, PR #10 — already merged).
 
 ---
 
