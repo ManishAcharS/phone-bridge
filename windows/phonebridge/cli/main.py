@@ -10,6 +10,9 @@ Inspect and drive a phone link from the PC:
     phonebridge info                     device information (JSON by default)
     phonebridge capabilities             capability table, honest about today
     phonebridge audio status|last        headset state and the last audio probe
+    phonebridge bluetooth scan|gatt      BLE scan, services, read/write/watch
+    phonebridge sensors list|stream      sensor discovery and live readings
+    phonebridge files send|receive       hashed, resumable file transfer
     phonebridge ping                     RTT histogram
     phonebridge bench                    encrypted binary throughput + latency
     phonebridge watch                    phone -> PC events, auto-reconnect
@@ -1209,6 +1212,10 @@ def build_parser() -> argparse.ArgumentParser:
     csub.add_parser("show", help="print stored records with their findings")
     csub.add_parser("compare", help="print the comparison table only")
 
+    from . import planes
+
+    planes.add_parsers(sub)
+
     crep = csub.add_parser("report", help="write the Markdown compatibility report")
     crep.add_argument("--out", default=str(Path("docs") / "09-compat-report.md"),
                       help="output path (default: docs/09-compat-report.md)")
@@ -1251,6 +1258,10 @@ def _dispatch(args: argparse.Namespace) -> int:
         if args.compat_command == "report":
             return _compat_report(args)
         raise CliError(f"unknown compat command {args.compat_command!r}")
+    if args.command in ("bluetooth", "sensors", "files"):
+        from . import planes
+
+        return planes.run(args)
     if args.command == "audio":
         if args.audio_command == "status":
             return asyncio.run(_audio_status(args))
