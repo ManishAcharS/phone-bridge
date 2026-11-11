@@ -49,6 +49,7 @@ from phonebridge.protocol.messages import (
     MSG_CONTROL,
     MSG_PING,
     MSG_PONG,
+    MSG_VIDEO,
     STREAM_CONTROL,
     ProtocolError,
     RpcError,
@@ -98,8 +99,8 @@ _DETAIL = {
     "audio.playback": "simulated: no audio device behind this value",
     "audio.capture": "simulated: no microphone behind this value",
     "audio.bluetooth_sco": "simulated: no Bluetooth radio",
-    "camera.back": "simulated: no camera",
-    "camera.front": "simulated: no camera",
+    "camera.back": "simulated: no camera behind these synthetic JPEG frames",
+    "camera.front": "simulated: no camera behind these synthetic JPEG frames",
     "sensors": "simulated: no sensors",
     "file_transfer": "no file method in protocol v1 (Phase 5)",
     "bluetooth_scan": "no scan method in protocol v1 (Phase 5)",
@@ -116,7 +117,25 @@ _PERMISSION_FOR: dict[str, str] = {
 # declared hardware row with `usable = false`, exactly like the real app. A test
 # may override this to model a phone that implements one more feature.
 _IMPLEMENTED: frozenset[str] = frozenset(
-    {"audio.bluetooth_sco", "audio.playback", "audio.capture"}
+    {"audio.bluetooth_sco", "audio.playback", "audio.capture", "camera.back", "camera.front"}
+)
+
+#: A real, decodable 1x1 JPEG — the simulator has no camera, and says so in the
+#: frame's `detail`, but a synthetic picture still exercises the whole receive
+#: path (header, validation, gate, preview bookkeeping) end to end.
+_SYNTHETIC_JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffdb004300"
+    "080606070605080707070909080a0c140d0c0b0b0c1912130f141d1a1f1e"
+    "1d1a1c1c20242e2720222c231c1c2837292c30313434341f27393d38323c"
+    "2e333432ffc0000b080001000101011100ffc4001f000001050101010101"
+    "0100000000000000000102030405060708090a0bffc400b5100002010303"
+    "020403050504040000017d01020300041105122131410613516107227114"
+    "328191a1082342b1c11552d1f02433627282090a161718191a2526272829"
+    "2a3435363738393a434445464748494a535455565758595a636465666768"
+    "696a737475767778797a838485868788898a92939495969798999aa2a3a4"
+    "a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6"
+    "d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda00080101"
+    "0000003f00fbfe8a28a2803fffd9"
 )
 
 # The runtime permission snapshot the app would report (docs/03 §6).
@@ -217,6 +236,19 @@ class SimulatedPhone:
     audio_bad_frames: int = 0
     mic_permission: bool = True
     echo_playback_as_mic: bool = True
+    #: Phase 4 camera. Simulated: frames are synthetic, and the reply says so.
+    camera: dict[str, Any] = field(
+        default_factory=lambda: {
+            "streaming": False,
+            "facing": "back",
+            "width": 1280,
+            "height": 720,
+            "fps": 15,
+        }
+    )
+    camera_permission: bool = True
+    camera_frames_sent: int = 0
+    camera_seq: int = 0
     started_at: float = field(default_factory=time.time)
 
     # ------------------------------------------------------------------ #
@@ -390,6 +422,62 @@ class SimulatedPhone:
         def _mic_stop(_params: dict[str, Any]) -> dict[str, Any]:
             self.audio["mic"] = "idle"
             return {"ok": True, "mic": "idle"}
+
+        # --- Phase 4 camera -------------------------------------------------- #
+        @r.register("camera.start")
+        def _camera_start(params: dict[str, Any]) -> dict[str, Any]:
+            if not self.camera_permission:
+                raise RpcError(
+                    "camera_denied",
+                    "camera permission is not granted on the phone: open "
+                    "PhoneBridge on the phone and grant Camera, then try again",
+                )
+            cfg = (params or {}).get("config") or {}
+            facing = str(cfg.get("facing", "back"))
+            if facing not in ("back", "front"):
+                raise RpcError("bad_params", f"unknown camera facing {facing!r}")
+            width = int(cfg.get("width", 1280))
+            height = int(cfg.get("height", 720))
+            fps = int(cfg.get("fps", 15))
+            if not 320 <= width <= 3840 or not 240 <= height <= 2160 or not 1 <= fps <= 60:
+                raise RpcError("bad_params", f"unsupported camera configuration {width}x{height}@{fps}")
+            self.camera.update(
+                {"streaming": True, "facing": facing, "width": width, "height": height, "fps": fps}
+            )
+            self.camera_seq = 0
+            return {
+                "ok": True,
+                "config": dict(self.camera),
+                "simulated": "no camera hardware; frames are synthetic",
+            }
+
+        @r.register("camera.stop")
+        def _camera_stop(_params: dict[str, Any]) -> dict[str, Any]:
+            self.camera["streaming"] = False
+            return {"ok": True, "streaming": False}
+
+        @r.register("camera.switch")
+        def _camera_switch(params: dict[str, Any]) -> dict[str, Any]:
+            facing = (params or {}).get("facing")
+            if facing not in ("back", "front"):
+                raise RpcError("bad_params", f"unknown camera facing {facing!r}")
+            if not self.camera_permission:
+                raise RpcError("camera_denied", "camera permission is not granted on the phone")
+            self.camera["facing"] = facing
+            self.camera_seq = 0
+            return {"ok": True, "facing": facing, "streaming": self.camera["streaming"]}
+
+        @r.register("camera.status")
+        def _camera_status(_params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "streaming": self.camera["streaming"],
+                "facing": self.camera["facing"],
+                "width": self.camera["width"],
+                "height": self.camera["height"],
+                "fps": self.camera["fps"],
+                "frames_sent": self.camera_frames_sent,
+                "permitted": self.camera_permission,
+            }
 
         @r.register("audio.status")
         def _audio_status(_params: dict[str, Any]) -> dict[str, Any]:
@@ -694,6 +782,11 @@ class SimulatedPhone:
         finally:
             self.connections = [c for c in self.connections if c[1] is not codec]
             self._peer_by_connection.pop(ws, None)
+            # The Android service releases the camera when the last session goes
+            # (BridgeServer.releaseAudioIfIdle). The simulator must behave the same
+            # way, or a test would pass here and leak a lens on a real phone.
+            if not self.connections:
+                self.camera["streaming"] = False
 
     async def _authenticate(
         self,
@@ -963,6 +1056,70 @@ class SimulatedPhone:
     # ------------------------------------------------------------------ #
     # test/automation helpers
     # ------------------------------------------------------------------ #
+    async def emit_camera_frames(self, count: int = 3) -> int:
+        """Send synthetic camera frames to every connected PC.
+
+        The simulator has no camera; this exists so an integration test can prove
+        the *receive* path (header, validation, gate, newest-frame policy) over a
+        real authenticated WebSocket. The frame's bytes are a real JPEG, and the
+        `camera.start` reply says "simulated" so nothing claims hardware.
+        """
+        from phonebridge.camera.frames import FLAG_KEY, FLAG_START, VideoFrame  # noqa: PLC0415
+        from phonebridge.camera.stream import VIDEO_STREAM  # noqa: PLC0415
+
+        sent = 0
+        for ws, codec in list(self.connections):
+            for _ in range(count):
+                flags = FLAG_KEY | (FLAG_START if self.camera_seq == 0 else 0)
+                body = VideoFrame(
+                    seq=self.camera_seq & 0xFFFF,
+                    timestamp_ms=self.camera_seq * 66,
+                    payload=_SYNTHETIC_JPEG,
+                    width=self.camera["width"],
+                    height=self.camera["height"],
+                    flags=flags,
+                ).encode()
+                self.camera_seq = (self.camera_seq + 1) & 0xFFFF
+                self.camera_frames_sent += 1
+                try:
+                    await self._send_frame(ws, _seal(codec, body, MSG_VIDEO, VIDEO_STREAM))
+                    sent += 1
+                except Exception:  # noqa: BLE001 - one dead peer must not block others
+                    pass
+        return sent
+
+    async def emit_camera_body(self, body: bytes) -> int:
+        """Put one raw `MSG_VIDEO` body on the wire, valid or not.
+
+        Used by the tests that prove the *receiver* rejects a malformed frame
+        instead of dying: a sender that can only send good frames cannot test that.
+        """
+        from phonebridge.protocol.messages import MSG_VIDEO  # noqa: PLC0415
+
+        sent = 0
+        for ws, codec in list(self.connections):
+            try:
+                await self._send_frame(ws, _seal(codec, body, MSG_VIDEO, 3))
+                sent += 1
+            except Exception:  # noqa: BLE001 - one dead peer must not block others
+                pass
+        return sent
+
+    async def emit_camera_stop(self) -> int:
+        """Send the documented STOP frame and mark the simulated camera idle."""
+        from phonebridge.camera.frames import FLAG_STOP, VideoFrame  # noqa: PLC0415
+
+        self.camera["streaming"] = False
+        body = VideoFrame(
+            seq=self.camera_seq & 0xFFFF,
+            timestamp_ms=0,
+            payload=b"",
+            width=16,
+            height=16,
+            flags=FLAG_STOP,
+        ).encode()
+        return await self.emit_camera_body(body)
+
     async def push_event(self, name: str, data: dict[str, Any]) -> int:
         """Send an unsolicited event to every connected PC.  Returns the count.
 

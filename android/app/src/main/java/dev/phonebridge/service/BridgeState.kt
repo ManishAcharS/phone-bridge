@@ -1,6 +1,7 @@
 package dev.phonebridge.service
 
 import dev.phonebridge.net.BridgeServer
+import dev.phonebridge.net.CameraEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -43,6 +44,13 @@ object BridgeState {
     private val _port = MutableStateFlow(BridgeServer.DEFAULT_PORT)
     val port: StateFlow<Int> = _port.asStateFlow()
 
+    /**
+     * Phase 4. The single source for "is the camera on right now", mirrored from
+     * the engine so the badge and the red banner cannot disagree with reality.
+     */
+    private val _camera = MutableStateFlow(CameraEngine.State())
+    val camera: StateFlow<CameraEngine.State> = _camera.asStateFlow()
+
     @Volatile
     private var server: BridgeServer? = null
 
@@ -60,7 +68,13 @@ object BridgeState {
             scope.launch { server.log.collect { _log.value = it } },
             scope.launch { server.stats.collect { _stats.value = it } },
             scope.launch { server.lastError.collect { _lastError.value = it } },
+            scope.launch { server.cameraState().collect { _camera.value = it } },
         )
+    }
+
+    /** Stop the camera from the phone's own UI. */
+    fun stopCameraLocally() {
+        server?.stopCameraLocally()
     }
 
     fun setPort(port: Int) {
@@ -73,6 +87,8 @@ object BridgeState {
         _running.value = false
         _peers.value = emptyList()
         _pairingRequest.value = null
+        // The engine was released with the server; the badge must not linger.
+        _camera.value = CameraEngine.State()
     }
 
     private fun unbindMirrors() {

@@ -22,10 +22,10 @@ import android.provider.Settings
  *  3. **Say why.** Each entry carries the reason and the consequence of
  *     refusing, so the UI can explain instead of nagging.
  *
- * The app deliberately declares no CAMERA, BLUETOOTH_SCAN or location
- * permission: nothing uses them yet, and holding a permission the app cannot
- * use is exactly the dishonesty this phase removes. They are listed in
- * [futurePermissions] so the UI can say *why* they are not there.
+ * CAMERA arrived in Phase 4 with a real use. BLUETOOTH_SCAN and location are
+ * still declared nowhere: nothing uses them, and holding a permission the app
+ * cannot use is exactly the dishonesty this project keeps removing. They are
+ * listed in [futurePermissions] so the UI can say *why* they are not there.
  */
 object Permissions {
 
@@ -75,6 +75,16 @@ object Permissions {
                 "else works.",
             minSdk = 31,
         ),
+        Item(
+            permission = Manifest.permission.CAMERA,
+            title = "Camera",
+            why = "Streams frames to the PC, and only after the PC asks with " +
+                "camera.start while a paired session is open. The camera is " +
+                "never opened at launch, in the background, or by a stranger.",
+            withoutIt = "The PC's camera stop button reports 'camera permission not " +
+                "granted' and the phone reports camera.stream as unavailable. " +
+                "Everything else works.",
+        ),
     )
 
     /**
@@ -82,7 +92,6 @@ object Permissions {
      * never implies a capability the app has not implemented.
      */
     val futurePermissions: List<Pair<String, String>> = listOf(
-        "android.permission.CAMERA" to "camera streaming (Phase 4)",
         "android.permission.BLUETOOTH_SCAN" to "Bluetooth device scanning (Phase 5)",
         "android.permission.ACCESS_FINE_LOCATION" to "GPS as a sensor (Phase 5)",
     )
@@ -145,6 +154,7 @@ object Permissions {
     /** What the capability probe would like; the probe runs either way. */
     fun probePermissions(): List<String> = buildList {
         add(Manifest.permission.RECORD_AUDIO)
+        add(Manifest.permission.CAMERA)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             add(Manifest.permission.BLUETOOTH_CONNECT)
         }

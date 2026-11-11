@@ -438,11 +438,12 @@ def test_require_passes_when_the_capability_is_usable(pc_config, running_phone, 
 
 
 def test_require_fails_with_the_reason(pc_config, running_phone, capsys):
-    assert main(cli(pc_config, "capabilities", "--require", "camera.back",
+    # `sensors` is the honest example now: the Phase 4 camera *is* available on
+    # the simulator, so requiring it would succeed.
+    assert main(cli(pc_config, "capabilities", "--require", "sensors",
                     *target_args(running_phone))) == 4
     err = capsys.readouterr().err
-    assert "requirement not met: camera.back" in err
-    assert "simulated: no camera" in err
+    assert "requirement not met: sensors" in err
 
 
 def test_require_warns_about_a_key_the_protocol_does_not_define(
@@ -561,12 +562,12 @@ def test_selftest_json_is_a_matrix_of_rows(pc_config, running_phone, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["protocol_version"] == 1
     assert payload["summary"]["PASS"] == 12
-    # Phase 2 removed audio from this list: four unsupported workflows remain.
-    assert payload["summary"]["NOT IMPLEMENTED"] == 4
+    # Phase 2 removed audio and Phase 4 removed the camera: three remain.
+    assert payload["summary"]["NOT IMPLEMENTED"] == 3
     statuses = {row["status"] for row in payload["rows"]}
     assert statuses == {"PASS", "NOT IMPLEMENTED"}
     unsupported = [row for row in payload["rows"] if row["category"] == "unsupported"]
-    assert len(unsupported) == 4
+    assert len(unsupported) == 3
     assert all("protocol v1" in row["evidence"] for row in unsupported)
     assert not any("audio" in str(row).lower() for row in unsupported), (
         "Phase 2 implemented audio; it must appear as a supported workflow"

@@ -43,6 +43,10 @@ PROTOCOL_V1_METHODS: tuple[str, ...] = (
     "audio.mic.start",
     "audio.mic.stop",
     "audio.status",
+    "camera.start",
+    "camera.stop",
+    "camera.switch",
+    "camera.status",
 )
 
 NO_VERB_NOTE = (

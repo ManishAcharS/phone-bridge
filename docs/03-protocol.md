@@ -183,7 +183,7 @@ plaintext = msg_type(1) ‖ stream_id(4, BE) ‖ payload
 | `0x12` | PONG | `u64` echoed value ‖ `u64` responder monotonic clock (ns, informational) |
 | `0x21` | BLOB | opaque bytes (throughput test; echo stream) |
 | `0x30` | AUDIO | `u8 codec ‖ u8 flags ‖ u16 seq ‖ u32 ts_ms ‖ frame` (Phase 2, implemented) |
-| `0x40` | VIDEO | Phase 4 |
+| `0x40` | VIDEO | `u8 codec ‖ u8 flags ‖ u16 seq ‖ u32 ts_ms ‖ u16 w ‖ u16 h ‖ u16 rot ‖ jpeg` (Phase 4, implemented) |
 | `0x50` | FILE | Phase 5 |
 | `0x60` | SENSOR | Phase 5 |
 | `0x7F` | BYE | UTF-8 reason |
@@ -221,7 +221,11 @@ exactly 16 bytes is dropped rather than treated as an error.
   currently: a second `audio.capabilities.run` while one is already running. The
   phone refuses instead of queueing, because a probe can hold the microphone for
   minutes and a queue of probes is an open recording session. The request may be
-  retried later; the session stays open).
+  retried later; the session stays open), and — from Phase 4 — `camera_denied`
+  (the user has not granted `CAMERA`; the phone never opens the lens to find out),
+  `no_camera` (this phone has no such lens), `camera_busy` (another app holds the
+  camera, or the camera service refused to bind) and `bad_config` (the requested
+  resolution/rate/quality/facing is outside the documented ranges).
 
 ### Implemented RPC methods (phone side)
 
@@ -257,6 +261,10 @@ keys are additive and must be ignored by a client. Types are JSON types.
 | `audio.mic.start` | `ok` bool, `format` object with the same four keys — microphone frames follow on stream 2 |
 | `audio.mic.stop` | `ok` bool, `mic` str (`idle`) |
 | `audio.status` | `playback` str, `mic` str, `volume` int, `muted` bool, `permitted` bool |
+| `camera.start` | `ok` bool, `config` object (`width` int, `height` int, `fps` int, `quality` int, `facing` str) |
+| `camera.stop` | `ok` bool, `streaming` bool (always false) |
+| `camera.switch` | `ok` bool, `facing` str, `streaming` bool |
+| `camera.status` | `streaming` bool, `facing` str, `width` int, `height` int, `fps` int, `frames_sent` int, `dropped` int, `permitted` bool, `hardware` bool, `last_error` str |
 
 `capabilities` (from `system.info`) has, for each of the eight keys, a bool
 `<key>`, a bool `hardware.<key>` and a string `detail.<key>`; the strings
@@ -288,15 +296,61 @@ Rules both sides enforce:
 * a receiver tolerates a bounded amount of reordering, drops duplicates and frames
   older than its window, and resynchronises if the sender jumps forward.
 
+#### `MSG_VIDEO` body (normative, Phase 4)
+
+Camera frames travel as `MSG_VIDEO` (0x40) inside the same encrypted envelope as
+audio and control — there is no second socket and no unencrypted media path. The
+stream id is fixed: **3 = phone to PC**. One message carries **one complete JPEG**,
+so a lost message costs a picture and never a corrupted frame, and there is no
+codec state to rebuild after a reconnect.
+
+| offset | size | field |
+| --- | --- | --- |
+| 0 | 1 | `codec` — `1` = JPEG (the only codec defined) |
+| 1 | 1 | `flags` — bit0 `START`, bit1 `STOP`, bit2 `KEY` |
+| 2 | 2 | `seq` — big-endian, wraps at 65535 |
+| 4 | 4 | `ts_ms` — big-endian, sender's monotonic ms since this stream started |
+| 8 | 2 | `width` — big-endian pixels, as encoded |
+| 10 | 2 | `height` — big-endian pixels, as encoded |
+| 12 | 2 | `rotation` — big-endian degrees the receiver must rotate before display: 0/90/180/270 |
+| 14 | ø | JPEG bytes, starting `FF D8` and ending `FF D9`, at most 2 MiB |
+
+Rules both sides enforce:
+
+* the header is 14 bytes; a body shorter than that, with an unknown codec, an
+  impossible size, a rotation outside 0/90/180/270, a payload that does not start
+  with `FF D8` or does not end with `FF D9`, or a body over 2 MiB + header is
+  **dropped and counted, never fatal** — a bad frame must not kill a preview or a
+  session;
+* `rotation` says how the *receiver* should rotate; the sender never rotates the
+  bytes, so the same frame is useful to a client that cannot decode;
+* `START` marks the first frame of a stream (the receiver uses it to reset its
+  reorder window); `STOP` ends it, carries no picture and may have an empty
+  payload;
+* a receiver tolerates a bounded amount of reordering, drops duplicates and frames
+  older than its window, drops anything that arrives after a newer frame (the
+  preview never rewinds), and resynchronises if the sender jumps forward;
+* frames go through a **bounded** queue (5 frames on the PC, 2 on the phone). When
+  a consumer is behind the *oldest* frame is discarded, because a late frame is
+  worth less than a current one; latency stays flat instead of growing;
+* video is **one-way in protocol v1**: phone to PC. A `MSG_VIDEO` arriving at the
+  phone is ignored and logged; it is not an error and does not close the session;
+* `camera.stop`, a closed session, a failed start, a phone-side stop and
+  `BridgeService.onDestroy` all end transmission. Stop really stops: the phone
+  unbinds every CameraX use case and the camera becomes available to other apps.
+
+Conservative defaults: **1280×720, 15 fps, JPEG quality 70, rear camera.** Valid
+ranges are 320–3840 × 240–2160, 1–60 fps, quality 20–95, facing `back`/`front`.
+
 Error replies are `{"k":"res","id":<id>,"ok":false,"error":{"code":str,"message":str}}`
 with one of the codes listed above. An unknown method **must** be answered with
 `method_not_found` and must not close the session.
 
-**There is no other operation.** File transfer (both directions), camera capture,
-sensor retrieval and audio capture/playback/relay have no method in this
-protocol: the message kinds `0x30 AUDIO`, `0x40 VIDEO`, `0x50 FILE` and `0x60
+**There is no other operation.** File transfer (both directions) and sensor
+retrieval have no method in this protocol: the message kinds `0x50 FILE` and `0x60
 SENSOR` are reserved numbers for later phases with no body format defined and no
-handler on either side. A client that invents a method name will receive
+handler on either side. (`0x30 AUDIO` and `0x40 VIDEO` are implemented, as
+described above.) A client that invents a method name will receive
 `method_not_found`, which is the correct answer.
 
 #### `system.info` device block

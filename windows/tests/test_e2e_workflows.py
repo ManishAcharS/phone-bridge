@@ -424,9 +424,10 @@ async def test_selftest_marks_unimplemented_workflows_without_counting_them(conn
     unsupported = [row for row in rows if row.category == "unsupported"]
     assert {row.status for row in unsupported} == {st.NOT_IMPLEMENTED}
     areas = " ".join(row.workflow for row in unsupported)
-    for area in ("file transfer", "camera", "sensor"):
+    for area in ("file transfer", "sensor"):
         assert area in areas
     assert "audio" not in areas, "Phase 2 implemented audio: it is no longer unimplemented"
+    assert "camera" not in areas, "Phase 4 implemented the camera: it is no longer unimplemented"
     assert st.summarise(rows)[st.NOT_IMPLEMENTED] == len(st.UNSUPPORTED_WORKFLOWS)
 
 

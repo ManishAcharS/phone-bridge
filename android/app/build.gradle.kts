@@ -102,4 +102,14 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // === Phase 4 camera =====================================================
+    // CameraX 1.3.4 is the last line that builds against compileSdk 34 with AGP
+    // 8.5.2, which is what this project pins (see the Compose note above).
+    // `camera-lifecycle` pulls in lifecycle-runtime, whose LifecycleOwner
+    // CameraEngine implements for the duration of one stream.
+    implementation("androidx.camera:camera-core:1.3.4")
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
 }

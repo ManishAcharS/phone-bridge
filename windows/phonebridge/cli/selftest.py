@@ -34,7 +34,6 @@ NOT_IMPLEMENTED = "NOT IMPLEMENTED"
 UNSUPPORTED_WORKFLOWS: tuple[tuple[str, str], ...] = (
     ("file transfer PC -> phone", "no file operation in protocol v1 (Phase 5)"),
     ("file transfer phone -> PC", "no file operation in protocol v1 (Phase 5)"),
-    ("camera capture / retrieval", "no camera operation in protocol v1 (Phase 4)"),
     ("sensor data retrieval", "no sensor operation in protocol v1 (Phase 5)"),
 )
 

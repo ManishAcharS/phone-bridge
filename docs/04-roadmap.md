@@ -8,7 +8,7 @@ Legend: `[x]` implemented and tested · `[~]` partially implemented ·
 | | |
 | --- | --- |
 | Version | `1.0.0` (PC package and Android app) |
-| Gate status | 854 tests (1 skipped), ruff, mypy, `verify.py` 7/7 — all green |
+| Gate status | 927 tests (1 skipped), ruff, mypy, `verify.py` 8/8 — all green |
 | Open blockers | **B1** no physical-device run · **B2** release APK not built here (plus B3–B6: Play `targetSdk`, keystore, Windows/PowerShell run, Kotlin stub compile) |
 | Ship/no-ship | **Not shippable until B1 and B2 are cleared.** See [`14-release-readiness.md`](14-release-readiness.md). |
 
@@ -39,7 +39,7 @@ Note 14 Pro+; nothing in this table is marked tested on hardware unless it was.
 | Separate logical channels (control / audio / camera / BT / sensors / files) | `[ ]` | protocol reserves the message kinds, one RPC channel exists today |
 | Audio PC → phone (WASAPI loopback → AudioTrack) | `[x]` | Phase 2: `phonebridge/audio/*`, GUI Audio section; 62 automated tests, **not device-tested** |
 | Audio phone → PC (AudioRecord → PC monitor) | `[x]` | Phase 2; the in-app monitor only — no virtual microphone (documented, not claimed) |
-| Camera streaming and Windows preview | `[ ]` | Phase 4 |
+| Camera streaming and Windows preview | `[x]` | Phase 4: `phonebridge/camera/*`, GUI Camera section; 66 automated tests + 10 end-to-end against the reference phone, **not device-tested** |
 | Bluetooth (BLE scan/GATT), sensors | `[ ]` | Phase 5 |
 | File transfer (SAF, chunked, SHA-256, resume) | `[ ]` | Phase 5 |
 | Launcher `PhoneBridge-Start.bat` | `[x]` | one-click, self-checking, never resets work |
@@ -159,9 +159,16 @@ and the UI must say so.
 
 ## Phase 4 — Camera and microphone
 
-- [ ] CameraX capture on the phone, front/rear selectable, resolution and fps settings
-- [ ] H.264 (or VP8) encode, stream over a dedicated `stream_id`
-- [ ] PC: decode → `pyvirtualcam` (OBS Virtual Camera / Unity Capture backend)
+Shipped in the camera half (see [`docs/20-camera.md`](20-camera.md)):
+
+- [x] CameraX capture on the phone, front/rear selectable, resolution and fps settings
+- [x] JPEG frames over a dedicated `stream_id` (3), 14-byte header, bounded queues
+- [x] PC: decode, validate, preview in the existing GUI window, start/stop/switch, stats
+- [x] Capability honesty: hardware / permission / implemented / streaming kept apart
+- [ ] **Manual hardware run** — `docs/20-camera.md` §9 (no phone in this environment)
+- [ ] H.264 (or VP8) as an optional second codec — `codec = 1` is JPEG so this stays additive
+- [ ] PC: `pyvirtualcam` (OBS Virtual Camera / Unity Capture) so the phone looks like a webcam
+      to Zoom/Meet/OBS — the preview exists, the virtual device does not
 - [ ] Phone microphone as a standalone PC mic (independent of the Bluetooth path)
 - [ ] Document the VB-CABLE routing once, and check it against Discord/Zoom/Meet/OBS
 
@@ -192,7 +199,8 @@ and the UI must say so.
 | Simultaneous stereo + headset mic | `[!]` Not possible | The headset switches profiles; no OS can do this |
 | Phone as a real Bluetooth adapter for the PC | `[!]` Not possible | A2DP sink is not in the public Android SDK |
 | Phone mic → Discord etc. | Planned (Phase 4) | Needs a VB-CABLE-class device on the PC |
-| Phone camera → Zoom/Meet | Planned (Phase 4) | Needs OBS Virtual Camera or Unity Capture |
+| Phone camera → PC preview | ✅ Implemented (Phase 4) | 720p/15 JPEG over the encrypted session; verified against the reference phone, not yet on hardware |
+| Phone camera → Zoom/Meet | Planned (later) | Needs OBS Virtual Camera or Unity Capture; the preview is not a virtual device |
 | Arbitrary Bluetooth device management | `[!]` Limited | Scan/BLE GATT yes; connect/pair generally no |
 | Everything offline, no accounts | ✅ Already true | No network calls leave the machine |
 

@@ -12,7 +12,8 @@ inconvenient.
 | Limitation | Why | When |
 | --- | --- | --- |
 | **No audio relay.** The phone measures its audio routing and reports it; it does not carry sound between PC and headset. | Phase 2, and it is gated on measurement: whether off-call SCO works is a ROM policy per handset, not a radio feature. Building it before measuring would be a guess. | Phase 2, after the primary handset is measured (`docs/09`) |
-| **No camera, sensors, file transfer or Bluetooth scanning.** | Protocol v1 reserves message kinds `0x40`, `0x60`, `0x50`, `0x30` and implements none of them. The capability report says `false` for all of them instead of shipping dead UI. | Phases 4–5 |
+| **Camera streaming is implemented but has never run on a physical handset.** | Phase 4 implements CameraX capture, the `MSG_VIDEO` format and the Windows preview, and it is tested end-to-end against the reference phone — whose frames are synthetic. Whether CameraX binds 720p/15 on *your* phone, how warm it gets and how it behaves under contention is unknown until `docs/20-camera.md` §9 is run. The capability report still refuses to call a lens usable from hardware alone. | Needs hardware |
+| **No sensors, file transfer or Bluetooth scanning.** | Protocol v1 reserves message kinds `0x60` and `0x50` and implements neither; the capability report says `false` for both instead of shipping dead UI. | Phase 5 |
 | **No desktop GUI.** | The PC client is a CLI. A GUI is Phase 3. | Phase 3 |
 | **No Windows service / autostart.** | The CLI runs when you run it. | not planned for 1.x |
 
@@ -97,3 +98,5 @@ Full analysis with severities: [`13-security-review.md`](13-security-review.md).
 | `soundcard` / `sounddevice` are optional extras | they are imported on demand so a PC without them can use every other feature; the Audio section names the missing package |
 | PCM16LE at 48 kHz is the only codec | simplest correct choice for a first implementation; Opus would be ~8× smaller on cellular-quality links |
 | Windows capture and the Kotlin engine are unverified here | no Windows host, no JDK/SDK, no sound device and no phone in this environment; `docs/19` §7 is the checklist that would change that |
+
+| **A preview needs Pillow on the PC.** | The camera streams, validates and reports statistics without it; only the picture is missing, and the GUI says "pip install pillow" instead of drawing a blank frame. | `pip install pillow` |

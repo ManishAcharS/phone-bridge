@@ -260,6 +260,71 @@ class PhoneBridgeApp:
         )
         self.audio_status.pack(fill="x", pady=(6, 0))
 
+        # ---- Phase 4: camera ------------------------------------------ #
+        camera_frame = ttk.LabelFrame(outer, text="Camera", padding=10)
+        camera_frame.pack(fill="x", pady=(0, 10))
+        camera_row = ttk.Frame(camera_frame)
+        camera_row.pack(fill="x")
+
+        self.camera_button = ttk.Button(
+            camera_row, text="Phone camera \u2192 PC: start", command=self._toggle_camera
+        )
+        self.camera_button.pack(side="left", padx=(0, 6))
+        self.camera_switch_button = ttk.Button(
+            camera_row, text="Switch lens", command=self._switch_camera
+        )
+        self.camera_switch_button.pack(side="left", padx=(0, 12))
+
+        ttk.Label(camera_row, text="Resolution").pack(side="left")
+        self.camera_resolution_var = tk.StringVar(value="1280x720")
+        self.camera_resolution = ttk.Combobox(
+            camera_row,
+            textvariable=self.camera_resolution_var,
+            values=("640x480", "1280x720", "1920x1080"),
+            width=10,
+            state="readonly",
+        )
+        self.camera_resolution.pack(side="left", padx=(4, 10))
+        self.camera_resolution.bind("<<ComboboxSelected>>", self._camera_settings_changed)
+
+        ttk.Label(camera_row, text="Frame rate").pack(side="left")
+        self.camera_fps_var = tk.StringVar(value="15")
+        self.camera_fps = ttk.Combobox(
+            camera_row,
+            textvariable=self.camera_fps_var,
+            values=("5", "10", "15", "24", "30"),
+            width=5,
+            state="readonly",
+        )
+        self.camera_fps.pack(side="left", padx=(4, 0))
+        self.camera_fps.bind("<<ComboboxSelected>>", self._camera_settings_changed)
+
+        # The preview: one Label, refreshed by the existing UI tick. Pillow is
+        # needed to turn JPEG bytes into a picture; without it the label says so
+        # instead of showing a broken image or a fake placeholder.
+        self.camera_preview = tk.Label(
+            camera_frame,
+            text="no stream \u2014 nothing is captured until you press start",
+            bg="#101418",
+            fg="#c9d1d9",
+            width=64,
+            height=8,
+        )
+        self.camera_preview.pack(fill="x", pady=(8, 0))
+        self.camera_status = tk.Label(
+            camera_frame,
+            text="idle",
+            anchor="w",
+            justify="left",
+            bg=CARD,
+            fg="#5b6470",
+            wraplength=880,
+        )
+        self.camera_status.pack(fill="x", pady=(6, 0))
+        self._camera_photo: object | None = None
+        self._camera_shown_seq: int | None = None
+        self._camera_shown_state: str = "idle"
+
         caps = ttk.LabelFrame(outer, text="Capabilities", padding=10)
         caps.pack(fill="both", expand=True)
         self.summary_label = tk.Label(
@@ -340,7 +405,80 @@ class PhoneBridgeApp:
         self.endpoint_var.set("")
         self.runtime.set_endpoint("")
 
+    # ---- camera commands -------------------------------------------------- #
+    def _toggle_camera(self) -> None:
+        """Start or stop the phone's camera. Nothing is captured until pressed."""
+        view = self._last_view
+        running = view is not None and view.camera_state in {"active", "starting"}
+        if running:
+            self.runtime.stop_camera()
+        else:
+            self.runtime.start_camera()
+
+    def _switch_camera(self) -> None:
+        self.runtime.switch_camera()
+
+    def _camera_settings_changed(self, _event: object = None) -> None:
+        """A new resolution or rate is applied to the *next* start.
+
+        Changing a live stream would restart the camera mid-picture; saying so is
+        cheaper than a silent jump, so the status line reports it.
+        """
+        try:
+            width_text, height_text = self.camera_resolution_var.get().split("x")
+            width, height, fps = int(width_text), int(height_text), int(self.camera_fps_var.get())
+        except ValueError:
+            self.camera_preview.configure(text="unreadable resolution: pick one from the list")
+            return
+        self.runtime.choose_camera_config(width, height, fps)
+        self.camera_preview.configure(
+            text=f"{width}x{height} @ {fps} fps chosen \u2014 press start, or stop and start "
+            "again to apply it to a live stream"
+        )
+
     # ---- audio commands -------------------------------------------------- #
+    def _refresh_camera_preview(self, view: View) -> None:
+        """Draw the newest frame, at most once per UI tick and only if it changed.
+
+        Three outcomes, all honest: a picture when the bytes decode, an explicit
+        "install Pillow" line when the decoder is missing, and a plain "waiting"
+        line when the stream is live but no frame has arrived yet.
+        """
+        status = dict(self.runtime.camera_status() or {})
+        preview_state = dict(status.get("preview") or {})  # type: ignore[call-overload]
+        frame = self.runtime.camera_frame()
+        seq = getattr(frame, "seq", None)
+        if frame is None or seq == self._camera_shown_seq:
+            if view.camera_state != self._camera_shown_state:
+                self._camera_shown_state = view.camera_state
+                if view.camera_state == "active":
+                    self.camera_preview.configure(text="waiting for the first frame…", image="")
+                    self._camera_photo = None
+            return
+        self._camera_shown_seq = seq
+        self._camera_shown_state = view.camera_state
+        if not preview_state.get("available"):
+            self.camera_preview.configure(
+                text=(
+                    "frames are arriving, but this PC cannot draw them: "
+                    + str(preview_state.get("detail", "no decoder available"))
+                ),
+                image="",
+            )
+            return
+        try:
+            from ..camera import preview as camera_preview  # noqa: PLC0415 - optional dep
+
+            image = camera_preview.decode(frame)
+        except Exception as exc:  # noqa: BLE001 - a preview must never kill the window
+            self.camera_preview.configure(text=f"could not draw that frame: {exc}", image="")
+            return
+        from PIL import ImageTk  # noqa: PLC0415 - only reachable when Pillow exists
+
+        photo = ImageTk.PhotoImage(image)
+        self._camera_photo = photo  # keep a reference or Tk drops the image
+        self.camera_preview.configure(image=photo, text="")
+
     def _toggle_playback(self) -> None:
         """Start or stop PC audio. Nothing plays until this is pressed."""
         view = self._last_view
@@ -467,6 +605,24 @@ class PhoneBridgeApp:
                 + ("" if view.audio_detail in {"", "\u2014"} else f"  \u00b7  {view.audio_detail}")
             )
         )
+        camera_live = view.camera_state in {"active", "starting"}
+        self.camera_button.configure(
+            text="Phone camera \u2192 PC: stop" if camera_live else "Phone camera \u2192 PC: start"
+        )
+        self.camera_switch_button.configure(
+            state="normal" if view.camera_state != "idle" else "disabled"
+        )
+        self.camera_status.configure(
+            text=(
+                f"camera: {view.camera_state} \u00b7 "
+                f"{'front' if view.camera_facing == 'front' else 'rear'} "
+                f"{view.camera_width}x{view.camera_height} @ {view.camera_fps} fps \u00b7 "
+                f"{view.camera_frames} frames received"
+                + ("" if view.camera_detail in {"", "\u2014"} else f"  \u00b7  {view.camera_detail}")
+            )
+        )
+        self._refresh_camera_preview(view)
+
         self.summary_label.configure(text=view.summary)
         rows = tuple(
             (r.name, r.present, r.permitted, r.implemented, r.available, r.active, r.note)

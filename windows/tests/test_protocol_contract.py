@@ -51,6 +51,10 @@ DOCUMENTED_METHODS = (
     "audio.mic.start",
     "audio.mic.stop",
     "audio.status",
+    "camera.start",
+    "camera.stop",
+    "camera.switch",
+    "camera.status",
 )
 
 DEVICE_BLOCK = {
@@ -75,6 +79,10 @@ EXPECTED_KEYS: dict[str, set[str]] = {
     "audio.mic.start": {"ok", "format"},
     "audio.mic.stop": {"ok"},
     "audio.status": {"playback", "mic", "volume", "muted", "permitted"},
+    "camera.start": {"ok", "config"},
+    "camera.stop": {"ok", "streaming"},
+    "camera.switch": {"ok", "facing", "streaming"},
+    "camera.status": {"streaming", "facing", "width", "height", "fps", "permitted"},
 }
 
 DOCUMENTED_ERROR_CODES = {
@@ -209,14 +217,18 @@ def test_the_cli_calls_nothing_the_protocol_does_not_define():
 def test_the_self_test_does_not_invent_workflows():
     """Every area marked NOT IMPLEMENTED must have no handler on either side."""
     names = " ".join(name for name, _reason in selftest_module.UNSUPPORTED_WORKFLOWS)
-    for area in ("file transfer", "camera", "sensor"):
+    for area in ("file transfer", "sensor"):
         assert area in names
     assert "audio" not in names, "Phase 2 implemented audio; it is not an unsupported workflow"
+    assert "camera" not in names, "Phase 4 implemented the camera; it is not unsupported"
     dispatch = set(kotlin_dispatch())
     assert any(method.startswith("audio.") for method in dispatch), (
         "Phase 2 audio methods must be dispatched by the phone"
     )
-    for area, word in (("file", "file"), ("camera", "camera"), ("sensor", "sensor")):
+    assert any(method.startswith("camera.") for method in dispatch), (
+        "Phase 4 camera methods must be dispatched by the phone"
+    )
+    for area, word in (("file", "file"), ("sensor", "sensor")):
         assert not any(word in method for method in dispatch), (
             f"the phone dispatches a {area} method; the matrix must not call it unimplemented"
         )
@@ -305,15 +317,16 @@ def test_protocol_version_is_one_everywhere():
     assert "# PhoneBridge wire protocol v1" in read(PROTOCOL_DOC)
 
 
-def test_audio_is_the_only_media_kind_with_a_handler():
-    """Phase 2 implemented 0x30; 0x40/0x50/0x60 must still have no handler.
+def test_only_implemented_media_kinds_have_a_handler():
+    """Phases 2 and 4 implemented 0x30 and 0x40; 0x50/0x60 must still be bare.
 
     A media kind without a defined body format cannot be implemented somewhere
     quietly: the capability table would then promise a feature twice.
     """
     server_code = mask_source(read(SERVER))
     assert "Messages.MSG_AUDIO" in server_code, "Phase 2 audio handler disappeared"
-    for kind in ("MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
+    assert "Messages.MSG_VIDEO" in server_code, "Phase 4 camera handler disappeared"
+    for kind in ("MSG_FILE", "MSG_SENSOR"):
         assert f"Messages.{kind}" not in server_code, (
             f"BridgeServer handles {kind}; the feature matrix would be wrong"
         )
@@ -324,7 +337,8 @@ def test_audio_is_the_only_media_kind_with_a_handler():
         assert name in python_code
     sim_code = mask_source(read(REPO / "tools/simulator/phone_sim.py"))
     assert "MSG_AUDIO" in sim_code, "the reference phone must implement Phase 2 audio"
-    for name in ("MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
+    assert "MSG_VIDEO" in sim_code, "the reference phone must implement Phase 4 camera"
+    for name in ("MSG_FILE", "MSG_SENSOR"):
         assert name not in sim_code, (
             f"the reference phone handles {name}, which has no defined body format"
         )
@@ -343,14 +357,14 @@ def test_the_blob_echo_is_the_only_binary_workflow():
 def test_the_reported_permissions_are_declared_and_used():
     permissions = read(PERMISSIONS_KT)
     manifest = read(MANIFEST)
-    for name in ("RECORD_AUDIO", "POST_NOTIFICATIONS", "BLUETOOTH_CONNECT"):
+    for name in ("RECORD_AUDIO", "POST_NOTIFICATIONS", "BLUETOOTH_CONNECT", "CAMERA"):
         assert name in permissions, f"{name} missing from the permission model"
         assert name in manifest, f"{name} missing from AndroidManifest.xml"
     # Nothing is reported that the app does not declare (no invented states):
     # the code never references a permission outside the runtime list.
-    assert "Manifest.permission.CAMERA" not in permissions
     assert "Manifest.permission.BLUETOOTH_SCAN" not in permissions
     assert "Manifest.permission.ACCESS_FINE_LOCATION" not in permissions
+
 
 
 def test_the_capability_permission_mapping_matches_the_documentation():

@@ -45,6 +45,10 @@ from ..audio import (
     default_sink_factory,
     default_source_factory,
 )
+from ..camera import CameraStream, VideoConfig
+from ..camera import preview as camera_preview
+from ..camera.stream import ACTIVE as CAMERA_ACTIVE
+from ..camera.stream import ERROR as CAMERA_ERROR
 from ..core.device_store import DeviceStore
 from ..core.session import (
     BackoffPolicy,
@@ -148,6 +152,14 @@ class Snapshot:
     audio_detail: str = ""
     audio_volume: int = 40
     audio_muted: bool = True
+    #: Phase 4 camera. `state` is the only thing the UI treats as "live".
+    camera_state: str = "idle"
+    camera_detail: str = ""
+    camera_facing: str = "back"
+    camera_width: int = 1280
+    camera_height: int = 720
+    camera_fps: int = 15
+    camera_frames: int = 0
     wifi_status: str = "not checked yet"
     server_reachable: bool | None = None
     auth_ok: bool = False
@@ -269,6 +281,8 @@ class ConnectionManager:
         self._session: BridgeSession | None = None
         #: Phase 2 audio, created when a session comes up and closed with it.
         self._audio: AudioLink | None = None
+        self._camera: CameraStream | None = None
+        self._camera_config = VideoConfig()
         self._audio_snapshot = AudioSnapshot()
         self._audio_state_at: float = 0.0
         #: Injected in tests; the real ones need WASAPI/sounddevice on Windows.
@@ -733,6 +747,121 @@ class ConnectionManager:
             )
             self._active_audio_keys()
 
+    # ------------------------------------------------------------------ #
+    # camera (Phase 4)
+    # ------------------------------------------------------------------ #
+    @property
+    def camera(self) -> CameraStream | None:
+        """The live camera stream, or ``None`` while there is no session."""
+        return self._camera
+
+    def camera_status(self) -> dict[str, Any]:
+        """Everything the Camera section shows, plus whether a preview can draw."""
+        if self._camera is None:
+            return {
+                "state": "idle",
+                "detail": "not connected - connect first",
+                "config": self._camera_config.as_dict(),
+                "stats": {},
+                "has_frame": False,
+                "preview": camera_preview.preview_status(),
+            }
+        return {
+            **self._camera.snapshot().to_dict(),
+            "preview": camera_preview.preview_status(),
+        }
+
+    def camera_frame(self) -> Any:
+        """The newest frame, for the GUI to decode. Never blocks, never raises."""
+        return self._camera.latest_frame() if self._camera is not None else None
+
+    def _on_camera(self, snap: Any) -> None:
+        """Called from the stream's task; publishes state, never touches the UI."""
+        config = snap.config or {}
+        self._publish(
+            camera_state=snap.state,
+            camera_detail=snap.detail,
+            camera_facing=str(config.get("facing", "back")),
+            camera_width=int(config.get("width", 1280) or 1280),
+            camera_height=int(config.get("height", 720) or 720),
+            camera_fps=int(config.get("fps", 15) or 15),
+            camera_frames=int(snap.stats.get("received", 0) or 0),
+        )
+        self._active_camera_keys(snap.state)
+        if snap.state == CAMERA_ERROR:
+            self._log(f"camera: {snap.detail}")
+
+    def _active_camera_keys(self, state: str) -> None:
+        """A lens is only ``active`` while frames are actually flowing."""
+        active = set(self._active)
+        for key in ("camera.back", "camera.front"):
+            if state == CAMERA_ACTIVE and self._camera is not None:
+                current = "camera.back" if self._camera.config.facing == "back" else "camera.front"
+                if key == current:
+                    active.add(key)
+                else:
+                    active.discard(key)
+            else:
+                active.discard(key)
+        if active != self._active:
+            self._active = active
+            self._publish(capabilities=self._capabilities_with_active())
+
+    async def _close_camera(self, reason: str) -> None:
+        camera, self._camera = self._camera, None
+        if camera is None:
+            return
+        try:
+            await camera.close(reason)
+        finally:
+            self._publish(camera_state="idle", camera_detail=reason, camera_frames=0)
+            self._active_camera_keys("idle")
+
+    async def _camera_or_explain(self, action: str) -> CameraStream | None:
+        camera = self._camera
+        if camera is None:
+            self._log(f"camera: {action} needs a connected session")
+            self._publish(camera_detail="not connected - connect first")
+        return camera
+
+    def set_camera_config(
+        self, *, width: int, height: int, fps: int, facing: str | None = None
+    ) -> VideoConfig:
+        """Validate a resolution/rate choice; nonsense raises instead of guessing."""
+        self._camera_config = VideoConfig(
+            width=width,
+            height=height,
+            fps=fps,
+            facing=facing or self._camera_config.facing,
+            quality=self._camera_config.quality,
+        )
+        return self._camera_config
+
+    async def start_camera(self) -> bool:
+        camera = await self._camera_or_explain("camera streaming")
+        if camera is None:
+            return False
+        ok = await camera.start(self._camera_config)
+        self._publish(camera_state=camera.snapshot().state, camera_detail=camera.snapshot().detail)
+        return ok
+
+    async def stop_camera(self, reason: str = "stopped by the user") -> None:
+        if self._camera is not None:
+            await self._camera.stop(reason)
+
+    async def switch_to_other_lens(self) -> bool:
+        """Flip rear <-> front. The stream restarts on the other lens."""
+        current = self._camera_config.facing
+        return await self.switch_camera("front" if current == "back" else "back")
+
+    async def switch_camera(self, facing: str) -> bool:
+        camera = await self._camera_or_explain("switching camera")
+        if camera is None:
+            return False
+        ok = await camera.switch(facing)
+        self._camera_config = camera.config
+        return ok
+
     async def _audio_or_explain(self, action: str) -> AudioLink | None:
         audio = self._audio
         if audio is None:
@@ -1036,6 +1165,12 @@ class ConnectionManager:
         )
         self._session_established = True
         self._fingerprint = self._network_fingerprint()
+        # Phase 4. Built on the same authenticated session as audio; frames ride
+        # stream 3 inside the existing envelope, so the camera has no transport of
+        # its own to get wrong. Nothing is opened until the user presses start.
+        self._camera = CameraStream(
+            session, config=self._camera_config, on_change=self._on_camera
+        )
         # Audio is only ever built on an authenticated session: the AudioLink has
         # no socket of its own, so this ordering is the security property.
         self._audio = AudioLink(
@@ -1137,6 +1272,9 @@ class ConnectionManager:
             self._log(f"could not save the address: {exc}")
 
     async def _teardown_session(self) -> None:
+        # Camera first: a lens left open is worse than a stuck speaker, and both
+        # must be gone before the session object is dropped.
+        await self._close_camera("session ended")
         await self._close_audio("session ended")
         heartbeat, self._heartbeat = self._heartbeat, None
         if heartbeat is not None and not heartbeat.done():

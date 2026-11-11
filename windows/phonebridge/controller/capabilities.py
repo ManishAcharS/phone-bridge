@@ -76,6 +76,9 @@ PHASES: Mapping[str, int] = {
 #: parses the Kotlin source and fails if the two drift apart.
 REQUIRED_PERMISSIONS: Mapping[str, str] = {
     "audio.capture": "RECORD_AUDIO",
+    # Phase 4: a lens is only usable when the user has allowed the camera.
+    "camera.back": "CAMERA",
+    "camera.front": "CAMERA",
 }
 
 #: Permission values as the phone spells them (``Permissions.Status`` lowercased).

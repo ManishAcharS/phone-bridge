@@ -37,6 +37,15 @@
     -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!--
+        Phase 4. Declared because the app now streams camera frames to a paired
+        PC on request; requested the first time the user starts the camera in the
+        app, never at launch. `required=false` keeps the APK installable on a
+        device without a camera, which then reports camera.stream unavailable
+        instead of crashing.
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission
         android:name="android.permission.BLUETOOTH"

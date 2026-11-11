@@ -102,12 +102,16 @@ async def test_pairing_then_connected_with_real_crypto(pc_config, phone) -> None
 
         capabilities = {c.key: c for c in snapshot.capabilities}
         assert len(capabilities) == 8
-        # The simulator implements exactly one capability; the rest must not be
-        # reported as usable even though the hardware is "present".
+        # Phases 2 and 4 implement audio and the camera; the simulator's detail
+        # still says the frames are synthetic, so "available" is never "hardware".
         assert capabilities["audio.bluetooth_sco"].available is True
-        assert capabilities["camera.back"].available is False
+        assert capabilities["camera.back"].available is True
         assert capabilities["camera.back"].present is True
+        assert "simulated" in (capabilities["camera.back"].detail or "")
         assert capabilities["audio.capture"].permitted is False
+        # Sensors and file transfer are still unimplemented on both sides.
+        assert capabilities["sensors"].available is False
+        assert capabilities["file_transfer"].available is False
         assert all(not c.active for c in snapshot.capabilities)
     finally:
         await manager.aclose()

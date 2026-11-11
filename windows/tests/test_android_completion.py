@@ -105,13 +105,26 @@ def test_no_capability_is_hard_coded_as_supported() -> None:
     assert not offenders, "\n".join(offenders)
 
 
-def test_nothing_claims_to_be_implemented_yet() -> None:
-    """Phase 2/4/5 features must report `implemented = false` until they exist."""
+def test_only_shipped_phases_are_marked_implemented() -> None:
+    """`implemented` may only be true for phases that actually shipped.
+
+    Through Phase 1 every row was false, and the test said "nothing". Phases 2 and
+    4 shipped audio and the camera, so the honest assertion is now per key: those
+    two are implemented, and everything still waiting (sensors, file transfer,
+    Bluetooth scanning) must stay false or absent.
+    """
     rows = read(DEVICE_FACTS)
-    assert "implemented = false" in rows
-    assert not re.search(r"implemented\s*=\s*true", rows), (
-        "a capability is marked implemented; only do that when the feature works"
+    assert "implemented = false" in rows, "unshipped rows must still say false"
+    implemented = set(re.findall(r'key = "([a-z_.]+)"[^)]*?implemented = true', rows, re.S))
+    assert implemented == {"camera.back", "camera.front"}, (
+        f"unexpected implemented rows: {sorted(implemented)}"
     )
+    for later in ("sensors", "file_transfer", "bluetooth_scan"):
+        start = rows.index(f'key = "{later}"')
+        block = rows[start : start + 400]
+        assert "implemented = false" in block, (
+            f"{later} is not implemented and must say so"
+        )
 
 
 def test_capabilities_are_gated_on_hardware_and_permission() -> None:
@@ -198,6 +211,7 @@ RUNTIME_PERMISSIONS = {
     "POST_NOTIFICATIONS",
     "RECORD_AUDIO",
     "BLUETOOTH_CONNECT",
+    "CAMERA",
 }
 
 
@@ -233,13 +247,13 @@ def test_no_permission_is_requested_that_the_manifest_does_not_declare() -> None
 def test_permissions_that_nothing_uses_are_not_declared() -> None:
     """Holding a permission the app cannot use is a false capability claim."""
     declared = manifest_permissions()
-    for unused in ("CAMERA", "BLUETOOTH_SCAN", "ACCESS_FINE_LOCATION"):
+    for unused in ("BLUETOOTH_SCAN", "ACCESS_FINE_LOCATION"):
         assert unused not in declared, (
             f"{unused} is declared but nothing uses it; add it with the feature"
         )
     # ...and the UI says so, instead of leaving the user guessing.
     future = read(PERMISSIONS)
-    for name in ("CAMERA", "BLUETOOTH_SCAN", "ACCESS_FINE_LOCATION"):
+    for name in ("BLUETOOTH_SCAN", "ACCESS_FINE_LOCATION"):
         assert name in future, f"{name} should appear in futurePermissions with a reason"
 
 
@@ -266,8 +280,9 @@ def test_the_permanently_denied_case_opens_app_settings() -> None:
 
 def test_each_permission_explains_why_it_is_needed() -> None:
     text = read(PERMISSIONS)
-    assert text.count("why = ") == 3
-    assert text.count("withoutIt = ") == 3
+    # One per runtime permission: notifications, microphone, Bluetooth, camera.
+    assert text.count("why = ") == 4
+    assert text.count("withoutIt = ") == 4
     # The panel shows the reason for a denial, not just a red label.
     assert "item.why" in read(PERMISSIONS_CARD)
     assert "item.withoutIt" in read(PERMISSIONS_CARD)
@@ -303,10 +318,17 @@ def test_permission_wire_keys_are_the_real_permission_names() -> None:
 
 
 def test_permissions_are_requested_at_the_moment_of_use_not_at_launch() -> None:
+    """Every request is triggered by a user action, never by composition.
+
+    Two launchers exist since Phase 4: notifications from `startBridge()`, and the
+    camera from the camera card's Allow button. Both are inside a callback, which
+    is the whole point — nothing asks on launch.
+    """
     activity = read(ACTIVITY)
     launch_sites = re.findall(r"\.launch\(", activity)
-    assert len(launch_sites) == 1, (
-        "MainActivity should launch exactly one permission request, from startBridge()"
+    assert len(launch_sites) == 2, (
+        "MainActivity should launch exactly two permission requests: "
+        "notifications from startBridge(), camera from the camera card"
     )
     start = body_after(activity, "fun startBridge()")
     assert "notificationPermission.launch(" in start

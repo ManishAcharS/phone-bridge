@@ -94,6 +94,14 @@ class View:
     audio_detail: str = "—"
     audio_volume: int = 40
     audio_muted: bool = True
+    #: Phase 4 camera. Only `camera_state == "active"` may look live.
+    camera_state: str = "idle"
+    camera_detail: str = "—"
+    camera_facing: str = "back"
+    camera_width: int = 1280
+    camera_height: int = 720
+    camera_fps: int = 15
+    camera_frames: int = 0
     wifi: str = "—"
     server: str = "—"
     auth_ok: str = "—"
@@ -253,6 +261,13 @@ def build_view(snapshot: Snapshot) -> View:
         audio_detail=snapshot.audio_detail or "—",
         audio_volume=snapshot.audio_volume,
         audio_muted=snapshot.audio_muted,
+        camera_state=snapshot.camera_state or "idle",
+        camera_detail=snapshot.camera_detail or "—",
+        camera_facing=snapshot.camera_facing or "back",
+        camera_width=snapshot.camera_width,
+        camera_height=snapshot.camera_height,
+        camera_fps=snapshot.camera_fps,
+        camera_frames=snapshot.camera_frames,
         wifi=snapshot.wifi_status or "not checked yet",
         server=server_text(snapshot),
         auth_ok=auth_text(snapshot),
