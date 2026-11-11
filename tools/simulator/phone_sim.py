@@ -365,11 +365,44 @@ class SimulatedPhone:
 
     # --- Phase 5 files -------------------------------------------------- #
     #: Where the simulated phone puts files it receives. A real phone uses SAF.
+    #: Unset means a private temporary directory: writing into the process's
+    #: working directory used to leave `selftest.bin` in whatever folder a test or
+    #: `tools/verify.py` happened to run from, which then looked like a stray
+    #: artefact in the checkout.
     file_dir: Path | None = None
     files: dict[int, dict[str, Any]] = field(default_factory=dict)
+    #: Private scratch directory used when `file_dir` is unset (see `_file_target`).
+    _scratch: Path | None = field(default=None, init=False, repr=False)
+    #: Partial transfers kept between attempts, keyed by name — the simulator's
+    #: stand-in for the phone's `.part` document in the SAF tree.
+    file_parts: dict[str, dict[str, Any]] = field(default_factory=dict)
     file_next_id: int = 1
     file_offers: int = 0
     file_requests: int = 0
+    #: Seconds to wait between outbound chunks. 0 streams flat out, which is right
+    #: for most tests; a resume test sets it so a transfer can be interrupted in
+    #: flight rather than racing the whole file through the socket.
+    file_pace_s: float = 0.0
+    #: Model an older build that cannot resume: `file.resume` answers zero and the
+    #: sender still starts at chunk 0, which is what the PC must survive.
+    file_cannot_resume: bool = False
+    #: Drop acknowledgements for files arriving from the PC, starting at this
+    #: chunk index, so a lost ack (and the sender's retry) is exercised over a
+    #: real socket. Acks are cumulative, so a gap has to be *consecutive* to stall
+    #: the sender's window: dropping an isolated early ack is invisible, and rightly
+    #: so.
+    file_drop_ack_from: int = -1
+    file_drop_ack_count: int = 0
+    file_dropped_acks: int = 0
+    #: How long the phone holds its first outbound chunk, waiting for the PC to
+    #: say where to resume. A real handset does the same; the delay is generous
+    #: here so a test that hashes a large part before asking is not racing it.
+    file_resume_grace_s: float = 0.3
+    #: Advertise a SHA-256 the file will not match. The receiver must refuse it.
+    file_bad_digest: bool = False
+    #: Advertise more bytes than the sender actually streams: the receiver ends up
+    #: with a valid but short prefix, which must be *kept*, not deleted.
+    file_report_size_extra: int = 0
     #: Bytes the simulator will offer when the PC asks for a file.
     outbound_file: tuple[str, bytes] | None = None
 
@@ -633,25 +666,50 @@ class SimulatedPhone:
                 raise RpcError("bad_params", "size may not be negative")
             if not digest:
                 raise RpcError("bad_params", "a SHA-256 is required for every transfer")
+            chunk_size = int(params.get("chunk_size") or 65536)
             transfer_id = self.file_next_id
             self.file_next_id += 1
-            target = (self.file_dir or Path.cwd()) / name
+            target = self._file_target() / name
+            # A partial from an earlier attempt with the same identity is resumed
+            # in place, at a chunk boundary, exactly as the phone does with its
+            # SAF document. The simulator has no SAF, so "the document" is a buffer.
+            previous = self.file_parts.get(name)
+            resumed = 0
+            data = bytearray()
+            if (
+                previous is not None
+                and previous.get("size") == size
+                and previous.get("sha256") == digest
+                and previous.get("chunk_size") == chunk_size
+            ):
+                held = len(previous["data"])
+                resumed = held - (held % chunk_size)
+                data = bytearray(previous["data"][:resumed])
+            self.file_parts[name] = {
+                "size": size,
+                "sha256": digest,
+                "chunk_size": chunk_size,
+                "data": data,
+            }
             self.files[transfer_id] = {
                 "name": name,
                 "size": size,
                 "sha256": digest,
                 "direction": "to_phone",
                 "state": "receiving",
-                "data": bytearray(),
+                "data": data,
+                "part": self.file_parts[name],
                 "target": str(target),
-                "chunk_size": int(params.get("chunk_size") or 65536),
+                "chunk_size": chunk_size,
+                "resumed_from": resumed,
+                "chunk_count": resumed // chunk_size,
             }
             self.file_offers += 1
             return {
                 "ok": True,
                 "transfer_id": transfer_id,
-                "resume_from": 0,
-                "chunk_size": int(params.get("chunk_size") or 65536),
+                "resume_from": resumed,
+                "chunk_size": chunk_size,
                 "simulated": "the simulator writes into its own directory, not SAF",
             }
 
@@ -672,16 +730,34 @@ class SimulatedPhone:
                 "state": "sending",
                 "data": bytearray(payload),
                 "chunk_size": 65536,
+                "start_index": 0,
+                "resumed_from": 0,
+                "decided": False,
             }
             self.file_requests += 1
-            _asyncio.get_event_loop().create_task(self._send_file_chunks(transfer_id))
+            # The real phone holds its first chunk for a moment so the PC can ask
+            # for a resume offset; the simulator models that delay instead of
+            # pretending a resume can arrive retroactively.
+            _asyncio.get_event_loop().create_task(
+                self._later(
+                    _asyncio.get_event_loop(),
+                    self.file_resume_grace_s,
+                    self._send_file_chunks,
+                    transfer_id,
+                )
+            )
+            advertised = digest
+            if self.file_bad_digest:
+                advertised = "0" * 64
+            size_reported = len(payload) + max(0, self.file_report_size_extra)
             return {
                 "ok": True,
                 "transfer_id": transfer_id,
                 "name": name,
-                "size": len(payload),
-                "sha256": digest,
+                "size": size_reported,
+                "sha256": advertised,
                 "chunk_size": 65536,
+                "resume_from": 0,
             }
 
         @r.register("file.complete")
@@ -694,8 +770,15 @@ class SimulatedPhone:
                 raise RpcError("bad_params", f"unknown transfer {transfer_id}")
             data = bytes(entry["data"])
             actual = _hashlib.sha256(data).hexdigest()
-            verified = actual == entry["sha256"]
+            verified = actual == entry["sha256"] and len(data) == int(entry["size"])
             entry["state"] = "complete" if verified else "failed"
+            if verified:
+                # Only a verified file clears the part; a short or wrong one keeps
+                # it so the next attempt can resume (or discards it when it is
+                # provably wrong, which is what the phone does with a bad hash).
+                self.file_parts.pop(entry.get("name") or "", None)
+            elif len(data) == int(entry["size"]):
+                self.file_parts.pop(entry.get("name") or "", None)
             if verified:
                 try:
                     Path(entry["target"]).write_bytes(data)
@@ -746,10 +829,29 @@ class SimulatedPhone:
             if entry is None:
                 raise RpcError("bad_params", f"unknown transfer {transfer_id}")
             from_bytes = int((params or {}).get("from_bytes") or 0)
+            if from_bytes < 0 or from_bytes > int(entry["size"]):
+                raise RpcError(
+                    "bad_params", f"from_bytes {from_bytes} is outside this transfer"
+                )
+            chunk_size = int(entry.get("chunk_size") or 65536)
+            if self.file_cannot_resume and from_bytes:
+                entry["state"] = "sending"
+                return {"ok": True, "transfer_id": transfer_id, "from_bytes": 0}
+            if entry.get("direction") == "to_pc":
+                if chunk_size and from_bytes % chunk_size:
+                    raise RpcError(
+                        "bad_params",
+                        f"from_bytes must be a multiple of the {chunk_size} byte chunk size",
+                    )
+                if entry.get("decided"):
+                    # Streaming has begun: report where it really began, because the
+                    # receiver uses this number to decide how much of its part to keep.
+                    from_bytes = int(entry.get("resumed_from") or 0)
+                else:
+                    entry["start_index"] = from_bytes // chunk_size
+                    entry["resumed_from"] = from_bytes
+                    entry["decided"] = True
             entry["state"] = "sending"
-            if from_bytes:
-                # The simulator can honour a byte offset: it holds the whole file.
-                entry["restart_from"] = from_bytes
             return {"ok": True, "transfer_id": transfer_id, "from_bytes": from_bytes}
 
         # --- Phase 5 Bluetooth ------------------------------------------------ #
@@ -1520,6 +1622,29 @@ class SimulatedPhone:
         elif kind == "res":
             log.debug("unexpected response from PC: %s", msg.get("id"))
 
+    def _file_target(self) -> Path:
+        """The directory this phone stores received files in, created on demand."""
+        if self.file_dir is not None:
+            self.file_dir.mkdir(parents=True, exist_ok=True)
+            return self.file_dir
+        if self._scratch is None:
+            import tempfile  # noqa: PLC0415
+
+            self._scratch = Path(tempfile.mkdtemp(prefix="phonebridge-sim-files-"))
+        return self._scratch
+
+    @staticmethod
+    async def _later(
+        loop: Any, delay: float, action: Any, *args: Any
+    ) -> None:
+        """Run `action(*args)` after `delay`, so a handshake can land first."""
+        import asyncio as _asyncio  # noqa: PLC0415
+
+        await _asyncio.sleep(delay)
+        result = action(*args)
+        if _asyncio.iscoroutine(result):
+            await result
+
     async def _send_frame(self, ws: ServerConnection, data: bytes) -> None:
         """Send one envelope, keeping the outbound counters honest."""
         await ws.send(data)
@@ -1758,7 +1883,17 @@ class SimulatedPhone:
         if chunk.flags & FLAG_CANCEL:
             entry["state"] = "cancelled"
             return
-        entry["data"].extend(chunk.payload)
+        expected = int(entry.get("chunk_count") or 0)
+        if chunk.chunk_index < expected:
+            # Duplicate: ack it, never append it twice.
+            pass
+        elif chunk.chunk_index > expected:
+            entry["state"] = "failed"
+            entry["error"] = f"chunk {chunk.chunk_index} arrived before {expected}"
+            return
+        else:
+            entry["data"].extend(chunk.payload)
+            entry["chunk_count"] = expected + 1
         entry["state"] = "receiving"
         if chunk.flags & FLAG_END:
             entry["state"] = "received"
@@ -1768,10 +1903,22 @@ class SimulatedPhone:
             chunk_index=chunk.chunk_index,
             flags=FLAG_ACK,
         ).encode()
+        if (
+            self.file_drop_ack_from >= 0
+            and chunk.chunk_index >= self.file_drop_ack_from
+            and self.file_dropped_acks < self.file_drop_ack_count
+        ):
+            # A lost acknowledgement: the PC must notice and retry rather than
+            # wait out its window and fail a transfer whose bytes all arrived.
+            self.file_dropped_acks += 1
+            log.info("dropping ack for chunk %d on purpose", chunk.chunk_index)
+            return
         await self._send_frame(ws, _seal(codec, ack, _MSG_FILE, FILE_STREAM_TO_PC))
 
     async def _send_file_chunks(self, transfer_id: int) -> None:
         """Stream an offered file to every connected PC, acknowledging nothing."""
+        import asyncio as _asyncio  # noqa: PLC0415
+
         from phonebridge.files.frames import (  # noqa: PLC0415
             FILE_STREAM_TO_PC,
             FLAG_END,
@@ -1786,7 +1933,9 @@ class SimulatedPhone:
         data = bytes(entry["data"])
         chunk_size = int(entry.get("chunk_size") or 65536)
         total = max(1, -(-len(data) // chunk_size))
-        for index in range(total):
+        entry["decided"] = True
+        start_index = int(entry.get("start_index") or 0)
+        for index in range(start_index, total):
             block = data[index * chunk_size : (index + 1) * chunk_size]
             flags = 0
             if index == 0:
@@ -1801,6 +1950,8 @@ class SimulatedPhone:
                     await self._send_frame(ws, _seal(codec, body, _MSG_FILE, FILE_STREAM_TO_PC))
                 except Exception:  # noqa: BLE001
                     pass
+            if self.file_pace_s:
+                await _asyncio.sleep(self.file_pace_s)
 
     # ------------------------------------------------------------------ #
     # Phase 5: Bluetooth
