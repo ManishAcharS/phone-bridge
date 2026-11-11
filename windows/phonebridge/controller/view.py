@@ -88,6 +88,12 @@ class View:
     usb_diagnosis: str = "—"
     usb_action: str = "—"
     usb_stage: str = "—"
+    #: Phase 2 audio, one label per direction.
+    audio_playback: str = "idle"
+    audio_mic: str = "idle"
+    audio_detail: str = "—"
+    audio_volume: int = 40
+    audio_muted: bool = True
     wifi: str = "—"
     server: str = "—"
     auth_ok: str = "—"
@@ -242,6 +248,11 @@ def build_view(snapshot: Snapshot) -> View:
         usb_diagnosis=snapshot.usb_diagnosis or "not checked yet",
         usb_action=snapshot.usb_action or "—",
         usb_stage=snapshot.usb_stage or "—",
+        audio_playback=snapshot.audio_playback or "idle",
+        audio_mic=snapshot.audio_mic or "idle",
+        audio_detail=snapshot.audio_detail or "—",
+        audio_volume=snapshot.audio_volume,
+        audio_muted=snapshot.audio_muted,
         wifi=snapshot.wifi_status or "not checked yet",
         server=server_text(snapshot),
         auth_ok=auth_text(snapshot),

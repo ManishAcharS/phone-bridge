@@ -8,7 +8,7 @@ Legend: `[x]` implemented and tested · `[~]` partially implemented ·
 | | |
 | --- | --- |
 | Version | `1.0.0` (PC package and Android app) |
-| Gate status | 783 tests (1 skipped), ruff, mypy, `verify.py` 7/7 — all green |
+| Gate status | 854 tests (1 skipped), ruff, mypy, `verify.py` 7/7 — all green |
 | Open blockers | **B1** no physical-device run · **B2** release APK not built here (plus B3–B6: Play `targetSdk`, keystore, Windows/PowerShell run, Kotlin stub compile) |
 | Ship/no-ship | **Not shippable until B1 and B2 are cleared.** See [`14-release-readiness.md`](14-release-readiness.md). |
 
@@ -37,12 +37,13 @@ Note 14 Pro+; nothing in this table is marked tested on hardware unless it was.
 | Hotspot stability: health checks, bounded backoff, drop explanation, one session per socket | `[x]` | `controller/manager.py`; proven by tests, **not yet proven on a real hotspot** |
 | Wi-Fi discovery, pairing, AES-256-GCM, transport switching, saved endpoints | `[x]` | unchanged from 1.0.0; manual endpoint never defaults to loopback |
 | Separate logical channels (control / audio / camera / BT / sensors / files) | `[ ]` | protocol reserves the message kinds, one RPC channel exists today |
-| Audio PC → phone and phone → PC | `[ ]` | Phase 2 |
+| Audio PC → phone (WASAPI loopback → AudioTrack) | `[x]` | Phase 2: `phonebridge/audio/*`, GUI Audio section; 62 automated tests, **not device-tested** |
+| Audio phone → PC (AudioRecord → PC monitor) | `[x]` | Phase 2; the in-app monitor only — no virtual microphone (documented, not claimed) |
 | Camera streaming and Windows preview | `[ ]` | Phase 4 |
 | Bluetooth (BLE scan/GATT), sensors | `[ ]` | Phase 5 |
 | File transfer (SAF, chunked, SHA-256, resume) | `[ ]` | Phase 5 |
 | Launcher `PhoneBridge-Start.bat` | `[x]` | one-click, self-checking, never resets work |
-| Window sections (Audio, Camera, Bluetooth, Sensors, Files) | `[ ]` | Connection and Diagnostics exist; the rest are not drawn until they work |
+| Window sections | `[~]` | Connection, Diagnostics and **Audio** exist; Camera, Bluetooth, Sensors and Files are not drawn until they work |
 | Android lifecycle audit (compileSdk/targetSdk, foreground-service types, permissions at point of use) | `[ ]` | not started |
 
 No row is marked `[x]` on the strength of a plan, and no window section exists

@@ -44,6 +44,13 @@ DOCUMENTED_METHODS = (
     "audio.route.bluetooth",
     "audio.capabilities.run",
     "audio.capabilities.last",
+    "audio.playback.start",
+    "audio.playback.stop",
+    "audio.playback.mute",
+    "audio.playback.volume",
+    "audio.mic.start",
+    "audio.mic.stop",
+    "audio.status",
 )
 
 DEVICE_BLOCK = {
@@ -61,6 +68,13 @@ EXPECTED_KEYS: dict[str, set[str]] = {
     "bluetooth.headset.status": {"connected", "profile", "devices"},
     "audio.route.bluetooth": {"supported", "detail"},
     "audio.capabilities.last": {"available"},
+    "audio.playback.start": {"ok", "format"},
+    "audio.playback.stop": {"ok"},
+    "audio.playback.mute": {"ok", "muted"},
+    "audio.playback.volume": {"ok", "percent"},
+    "audio.mic.start": {"ok", "format"},
+    "audio.mic.stop": {"ok"},
+    "audio.status": {"playback", "mic", "volume", "muted", "permitted"},
 }
 
 DOCUMENTED_ERROR_CODES = {
@@ -195,9 +209,13 @@ def test_the_cli_calls_nothing_the_protocol_does_not_define():
 def test_the_self_test_does_not_invent_workflows():
     """Every area marked NOT IMPLEMENTED must have no handler on either side."""
     names = " ".join(name for name, _reason in selftest_module.UNSUPPORTED_WORKFLOWS)
-    for area in ("file transfer", "camera", "sensor", "audio"):
+    for area in ("file transfer", "camera", "sensor"):
         assert area in names
+    assert "audio" not in names, "Phase 2 implemented audio; it is not an unsupported workflow"
     dispatch = set(kotlin_dispatch())
+    assert any(method.startswith("audio.") for method in dispatch), (
+        "Phase 2 audio methods must be dispatched by the phone"
+    )
     for area, word in (("file", "file"), ("camera", "camera"), ("sensor", "sensor")):
         assert not any(word in method for method in dispatch), (
             f"the phone dispatches a {area} method; the matrix must not call it unimplemented"
@@ -287,19 +305,26 @@ def test_protocol_version_is_one_everywhere():
     assert "# PhoneBridge wire protocol v1" in read(PROTOCOL_DOC)
 
 
-def test_media_message_kinds_are_reserved_without_a_handler():
-    """0x30/0x40/0x50/0x60 exist as numbers; nothing implements them."""
+def test_audio_is_the_only_media_kind_with_a_handler():
+    """Phase 2 implemented 0x30; 0x40/0x50/0x60 must still have no handler.
+
+    A media kind without a defined body format cannot be implemented somewhere
+    quietly: the capability table would then promise a feature twice.
+    """
     server_code = mask_source(read(SERVER))
-    for kind in ("MSG_AUDIO", "MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
+    assert "Messages.MSG_AUDIO" in server_code, "Phase 2 audio handler disappeared"
+    for kind in ("MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
         assert f"Messages.{kind}" not in server_code, (
             f"BridgeServer handles {kind}; the feature matrix would be wrong"
         )
+    for kind in ("MSG_AUDIO", "MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
         assert f"const val {kind}" in read(MESSAGES), f"{kind} constant disappeared"
     python_code = mask_source(read(REPO / "windows/phonebridge/protocol/messages.py"))
     for name in ("MSG_AUDIO", "MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
         assert name in python_code
     sim_code = mask_source(read(REPO / "tools/simulator/phone_sim.py"))
-    for name in ("MSG_AUDIO", "MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
+    assert "MSG_AUDIO" in sim_code, "the reference phone must implement Phase 2 audio"
+    for name in ("MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
         assert name not in sim_code, (
             f"the reference phone handles {name}, which has no defined body format"
         )

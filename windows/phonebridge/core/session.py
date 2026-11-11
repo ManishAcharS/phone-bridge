@@ -39,6 +39,7 @@ from ..protocol.framing import (
     encode_json_envelope,
 )
 from ..protocol.messages import (
+    MSG_AUDIO,
     MSG_BLOB,
     MSG_BYE,
     MSG_CONTROL,
@@ -546,7 +547,17 @@ class BridgeSession:
                 self.on_blob(stream_id, payload)
             q = self._blob_waiters.get(stream_id)
             if q is not None:
-                q.put_nowait(payload)
+                try:
+                    q.put_nowait(payload)
+                except asyncio.QueueFull:
+                    # Media, not control: a full queue means the consumer is behind,
+                    # and dropping the *oldest* frame is what keeps latency bounded.
+                    # Raising here would kill the read loop and the whole session.
+                    try:  # noqa: SIM105
+                        q.get_nowait()
+                        q.put_nowait(payload)
+                    except (asyncio.QueueEmpty, asyncio.QueueFull):  # pragma: no cover
+                        log.warning("media stream %d is full; dropped a frame", stream_id)
         elif msg_type == MSG_BYE:
             reason = payload.decode("utf-8", "replace").strip() or "phone said bye"
             # A BYE is the phone's clean shutdown: honour it as a close so the
@@ -640,6 +651,14 @@ class BridgeSession:
 
     async def send_blob(self, data: bytes, stream_id: int = 1) -> None:
         await self._safe_send(MSG_BLOB, stream_id, data)
+
+    async def send_audio(self, body: bytes, stream_id: int = 1) -> None:
+        """Send one encoded audio frame on ``stream_id`` (Phase 2).
+
+        The body is already framed by :mod:`phonebridge.audio.frames`; this only
+        puts it inside the encrypted envelope.
+        """
+        await self._safe_send(MSG_AUDIO, stream_id, body)
 
     def subscribe_blobs(self, stream_id: int) -> asyncio.Queue[bytes | None]:
         """Frames from `stream_id`; ``None`` once the session has ended."""

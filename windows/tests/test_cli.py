@@ -561,12 +561,16 @@ def test_selftest_json_is_a_matrix_of_rows(pc_config, running_phone, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["protocol_version"] == 1
     assert payload["summary"]["PASS"] == 12
-    assert payload["summary"]["NOT IMPLEMENTED"] == 5
+    # Phase 2 removed audio from this list: four unsupported workflows remain.
+    assert payload["summary"]["NOT IMPLEMENTED"] == 4
     statuses = {row["status"] for row in payload["rows"]}
     assert statuses == {"PASS", "NOT IMPLEMENTED"}
     unsupported = [row for row in payload["rows"] if row["category"] == "unsupported"]
-    assert len(unsupported) == 5
+    assert len(unsupported) == 4
     assert all("protocol v1" in row["evidence"] for row in unsupported)
+    assert not any("audio" in str(row).lower() for row in unsupported), (
+        "Phase 2 implemented audio; it must appear as a supported workflow"
+    )
 
 
 def test_selftest_exits_one_when_a_workflow_cannot_run(pc_config, sim_state, capsys):

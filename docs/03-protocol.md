@@ -182,7 +182,7 @@ plaintext = msg_type(1) ‖ stream_id(4, BE) ‖ payload
 | `0x11` | PING | `u64` sender clock (ns) |
 | `0x12` | PONG | `u64` echoed value ‖ `u64` responder monotonic clock (ns, informational) |
 | `0x21` | BLOB | opaque bytes (throughput test; echo stream) |
-| `0x30` | AUDIO | `u8 codec ‖ u8 flags ‖ u16 seq ‖ frame` (Phase 2) |
+| `0x30` | AUDIO | `u8 codec ‖ u8 flags ‖ u16 seq ‖ u32 ts_ms ‖ frame` (Phase 2, implemented) |
 | `0x40` | VIDEO | Phase 4 |
 | `0x50` | FILE | Phase 5 |
 | `0x60` | SENSOR | Phase 5 |
@@ -250,10 +250,43 @@ keys are additive and must be ignored by a client. Types are JSON types.
 | `audio.route.bluetooth` | `supported` bool, `detail` str |
 | `audio.capabilities.run` | the probe report itself (schema in `docs/08` §2): `schema_version`, `source`, `device`, `route_output`, `route_input`, `duplex`, `latency` |
 | `audio.capabilities.last` | `available` bool; when true also `report` object with the schema above; when false `reason` str |
+| `audio.playback.start` | `ok` bool, `format` object (`sample_rate` int, `channels` int, `frame_ms` int, `codec` int) — the format the phone will actually play |
+| `audio.playback.stop` | `ok` bool, `playback` str (`idle`) |
+| `audio.playback.mute` | `ok` bool, `muted` bool |
+| `audio.playback.volume` | `ok` bool, `percent` int (0-100, echoed after clamping) |
+| `audio.mic.start` | `ok` bool, `format` object with the same four keys — microphone frames follow on stream 2 |
+| `audio.mic.stop` | `ok` bool, `mic` str (`idle`) |
+| `audio.status` | `playback` str, `mic` str, `volume` int, `muted` bool, `permitted` bool |
 
 `capabilities` (from `system.info`) has, for each of the eight keys, a bool
 `<key>`, a bool `hardware.<key>` and a string `detail.<key>`; the strings
 `audio.bluetooth_profile` and int `protocol_version` may also appear.
+
+#### `MSG_AUDIO` body (normative, Phase 2)
+
+Audio travels as `MSG_AUDIO` (0x30) inside the encrypted envelope, one frame per
+message. Stream ids are fixed: **1 = PC to phone** (playback), **2 = phone to PC**
+(microphone). Both directions use this body:
+
+| offset | size | field |
+| --- | --- | --- |
+| 0 | 1 | `codec` — `1` = PCM16LE (the only codec defined) |
+| 1 | 1 | `flags` — bit0 `START`, bit1 `STOP`, bit2 `MUTED` |
+| 2 | 2 | `seq` — big-endian, wraps at 65535 |
+| 4 | 4 | `ts_ms` — big-endian, sender's monotonic ms since the stream started |
+| 8 | n | PCM16LE, whole samples only, at most 512 KiB |
+
+Rules both sides enforce:
+
+* the default format is 48 000 Hz, mono, 20 ms frames (960 samples, 1920 bytes);
+  `audio.playback.start` / `audio.mic.start` may adjust it, and the phone's answer
+  is authoritative;
+* a frame shorter than 8 bytes, with an unknown codec, an odd payload, or over the
+  size limit is **dropped and counted**, never fatal;
+* `STOP` ends the direction without closing the session; `MUTED` frames carry
+  silence and keep the timing (so "muted" is distinguishable from "disconnected");
+* a receiver tolerates a bounded amount of reordering, drops duplicates and frames
+  older than its window, and resynchronises if the sender jumps forward.
 
 Error replies are `{"k":"res","id":<id>,"ok":false,"error":{"code":str,"message":str}}`
 with one of the codes listed above. An unknown method **must** be answered with

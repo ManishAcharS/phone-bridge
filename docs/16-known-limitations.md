@@ -88,3 +88,12 @@ Full analysis with severities: [`13-security-review.md`](13-security-review.md).
 | Android Open Accessory was investigated, not implemented | AOA needs the phone to expose accessory mode and the PC to claim the interface with a USB driver; it would only help where adb cannot, and it cannot be validated without the handset. It is not wired in, and the app does not claim it |
 | `adb devices -l` can be stale | a phone that was unplugged may linger as `offline` until `adb kill-server`; the window says so instead of reporting a healthy cable |
 | The descriptor names are shown, not interpreted | a cable that only charges usually produces *no Android row at all*; the window can say Windows never saw the phone, but it cannot distinguish a dead cable from a dead port |
+
+## Audio (Phase 2)
+
+| Limitation | Why, and what would remove it |
+| --- | --- |
+| The phone is not a Windows recording device | that needs a third-party virtual audio driver, which PhoneBridge will not install silently. The in-app monitor is provided instead; the virtual-microphone option is documented in `docs/19` §5 |
+| `soundcard` / `sounddevice` are optional extras | they are imported on demand so a PC without them can use every other feature; the Audio section names the missing package |
+| PCM16LE at 48 kHz is the only codec | simplest correct choice for a first implementation; Opus would be ~8× smaller on cellular-quality links |
+| Windows capture and the Kotlin engine are unverified here | no Windows host, no JDK/SDK, no sound device and no phone in this environment; `docs/19` §7 is the checklist that would change that |

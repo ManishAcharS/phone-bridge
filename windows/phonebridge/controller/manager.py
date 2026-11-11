@@ -37,6 +37,14 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
+from ..audio import ERROR as AUDIO_ERROR
+from ..audio import (
+    AudioLink,
+    AudioSnapshot,
+    backend_status,
+    default_sink_factory,
+    default_source_factory,
+)
 from ..core.device_store import DeviceStore
 from ..core.session import (
     BackoffPolicy,
@@ -134,6 +142,12 @@ class Snapshot:
     usb_diagnosis: str = ""
     usb_action: str = ""
     usb_stage: str = ""
+    #: Phase 2 audio. Separate strings so one direction cannot hide the other.
+    audio_playback: str = "idle"
+    audio_mic: str = "idle"
+    audio_detail: str = ""
+    audio_volume: int = 40
+    audio_muted: bool = True
     wifi_status: str = "not checked yet"
     server_reachable: bool | None = None
     auth_ok: bool = False
@@ -203,6 +217,8 @@ class ConnectionManager:
         usb_probe: Callable[[], list[PnpDevice]] | None = None,
         system: str | None = None,
         adb: Any | None = None,
+        source_factory: Callable[[Any], Any] | None = None,
+        sink_factory: Callable[[Any], Any] | None = None,
         gateways: Callable[[], list[Gateway]] | None = None,
         probe: Callable[[str, int, float], Awaitable[bool]] | None = None,
     ) -> None:
@@ -251,6 +267,13 @@ class ConnectionManager:
         #: restart the backoff ladder instead of leaving it at the cap.
         self._session_established = False
         self._session: BridgeSession | None = None
+        #: Phase 2 audio, created when a session comes up and closed with it.
+        self._audio: AudioLink | None = None
+        self._audio_snapshot = AudioSnapshot()
+        self._audio_state_at: float = 0.0
+        #: Injected in tests; the real ones need WASAPI/sounddevice on Windows.
+        self._source_factory = source_factory or default_source_factory
+        self._sink_factory = sink_factory or default_sink_factory
         self._task: asyncio.Task[None] | None = None
         self._heartbeat: asyncio.Task[None] | None = None
         self._identity: Any = None
@@ -582,6 +605,11 @@ class ConnectionManager:
             usb_diagnosis=statuses["usb_diagnosis"].headline,
             usb_action=statuses["usb_diagnosis"].action,
             usb_stage=getattr(statuses["usb_diagnosis"], "stage", "") or "",
+            audio_playback=self._audio_snapshot.playback,
+            audio_mic=self._audio_snapshot.mic,
+            audio_detail=self._audio_snapshot.detail or self._audio_snapshot.mic_detail,
+            audio_volume=self._audio_snapshot.volume,
+            audio_muted=self._audio_snapshot.muted,
             last_discovery_error=(
                 statuses["discovery_error"] or (discovery_errors[0] if discovery_errors else None)
             ),
@@ -634,6 +662,129 @@ class ConnectionManager:
             pnp=self._device_tree(),
             system=self._system,
         )
+
+    # ------------------------------------------------------------------ #
+    # audio (Phase 2)
+    # ------------------------------------------------------------------ #
+    @property
+    def audio(self) -> AudioLink | None:
+        """The live audio plane, or ``None`` while there is no session."""
+        return self._audio
+
+    def audio_status(self) -> dict[str, Any]:
+        """Everything the Audio section shows, plus why a library is missing."""
+        snap = self._audio_snapshot
+        return {
+            **snap.to_dict(),
+            "connected": self._session is not None and self._session_established,
+            "backends": backend_status(),
+        }
+
+    def _on_audio(self, snap: AudioSnapshot) -> None:
+        """Called from the audio tasks; publishes, never blocks on the UI."""
+        self._audio_snapshot = snap
+        self._publish(
+            audio_playback=snap.playback,
+            audio_mic=snap.mic,
+            audio_detail=snap.detail or snap.mic_detail,
+            audio_volume=snap.volume,
+            audio_muted=snap.muted,
+        )
+        self._active_audio_keys()
+        if snap.playback == AUDIO_ERROR or snap.mic == AUDIO_ERROR:
+            self._log(f"audio: {snap.detail or snap.mic_detail}")
+
+    def _active_audio_keys(self) -> None:
+        """The registry's ``active`` column follows the streams, not the wish."""
+        snap = self._audio_snapshot
+        active = set(self._active)
+        for key, state in (("audio.playback", snap.playback), ("audio.capture", snap.mic)):
+            if state == "active":
+                active.add(key)
+            else:
+                active.discard(key)
+        if active != self._active:
+            self._active = active
+            self._publish(capabilities=self._capabilities_with_active())
+
+    def _capabilities_with_active(self) -> tuple[Capability, ...]:
+        self._active = set(self._active)
+        return tuple(
+            capability.with_active(capability.key in self._active)
+            for capability in self._snapshot.capabilities
+        )
+
+    async def _close_audio(self, reason: str) -> None:
+        audio, self._audio = self._audio, None
+        if audio is None:
+            return
+        try:
+            await audio.close(reason)
+        finally:
+            self._audio_snapshot = audio.snapshot()
+            self._audio_snapshot.playback = "idle"
+            self._audio_snapshot.mic = "idle"
+            self._publish(
+                audio_playback="idle",
+                audio_mic="idle",
+                audio_detail=reason,
+                audio_volume=self._audio_snapshot.volume,
+                audio_muted=self._audio_snapshot.muted,
+            )
+            self._active_audio_keys()
+
+    async def _audio_or_explain(self, action: str) -> AudioLink | None:
+        audio = self._audio
+        if audio is None:
+            self._log(f"audio: {action} needs a connected session")
+            self._publish(audio_detail="not connected - connect first")
+        return audio
+
+    async def start_audio_playback(self) -> bool:
+        audio = await self._audio_or_explain("PC audio to the phone")
+        if audio is None:
+            return False
+        self._log("audio: starting PC audio to the phone")
+        ok = await audio.start_playback()
+        self._on_audio(audio.snapshot())
+        self._log("audio: PC audio is playing on the phone" if ok else "audio: PC audio did not start")
+        return ok
+
+    async def stop_audio_playback(self) -> None:
+        if self._audio is not None:
+            self._log("audio: stopping PC audio")
+            await self._audio.stop_playback("stopped by the user")
+            self._on_audio(self._audio.snapshot())
+
+    async def start_mic(self) -> bool:
+        audio = await self._audio_or_explain("the phone microphone")
+        if audio is None:
+            return False
+        self._log("audio: asking the phone for its microphone")
+        ok = await audio.start_mic()
+        self._on_audio(audio.snapshot())
+        self._log("audio: microphone stream is playing" if ok else "audio: microphone did not start")
+        return ok
+
+    async def stop_mic(self) -> None:
+        if self._audio is not None:
+            self._log("audio: stopping the phone microphone")
+            await self._audio.stop_mic("stopped by the user")
+            self._on_audio(self._audio.snapshot())
+
+    async def set_audio_volume(self, percent: int) -> int:
+        if self._audio is None:
+            return self._audio_snapshot.volume
+        volume = await self._audio.set_volume(percent)
+        self._on_audio(self._audio.snapshot())
+        return volume
+
+    async def set_audio_mute(self, muted: bool) -> bool:
+        if self._audio is None:
+            return muted
+        value = await self._audio.set_mute(muted)
+        self._on_audio(self._audio.snapshot())
+        return value
 
     async def diagnose_usb(self) -> UsbReport:
         """Run the whole USB chain on demand, and say where it stopped.
@@ -885,6 +1036,15 @@ class ConnectionManager:
         )
         self._session_established = True
         self._fingerprint = self._network_fingerprint()
+        # Audio is only ever built on an authenticated session: the AudioLink has
+        # no socket of its own, so this ordering is the security property.
+        self._audio = AudioLink(
+            session,
+            source_factory=self._source_factory,
+            sink_factory=self._sink_factory,
+            on_change=self._on_audio,
+        )
+        self._active_audio_keys()
         self._log(
             f"connected over {candidate.kind} at {candidate.endpoint}; "
             f"{sum(1 for c in registry if c.available)} of {len(registry)} capabilities available"
@@ -977,6 +1137,7 @@ class ConnectionManager:
             self._log(f"could not save the address: {exc}")
 
     async def _teardown_session(self) -> None:
+        await self._close_audio("session ended")
         heartbeat, self._heartbeat = self._heartbeat, None
         if heartbeat is not None and not heartbeat.done():
             heartbeat.cancel()
