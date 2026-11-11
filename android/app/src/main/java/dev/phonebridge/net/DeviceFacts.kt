@@ -266,6 +266,10 @@ object DeviceFacts {
             out["hardware.${row.key}"] = row.hardware
             out["detail.${row.key}"] = row.summary(granted)
         }
+        // Phase 2: the PC can now tell "not implemented" apart from "no hardware"
+        // instead of inferring it, because this build says so explicitly.
+        out["implemented.audio.playback"] = true
+        out["implemented.audio.capture"] = true
         // Existing string-valued key (the PC prints it as the active profile).
         out["audio.bluetooth_profile"] = AudioProbe.bluetoothProfileName(context)
         out["protocol_version"] = Framing.PROTOCOL_VERSION

@@ -68,6 +68,8 @@ class PhoneBridgeApp:
         self.auto_connect = auto_connect
         self._queue: queue.Queue[Snapshot] = queue.Queue()
         self._rows: tuple[Any, ...] = ()
+        #: Debounce handle for the volume slider, so a drag is one RPC.
+        self._volume_after: str | None = None
         self._last_view: View | None = None
 
         self.runtime = BackgroundRuntime(
@@ -215,6 +217,49 @@ class PhoneBridgeApp:
             wraplength=880,
         )
 
+        # ---- Phase 2: audio ------------------------------------------- #
+        audio_frame = ttk.LabelFrame(outer, text="Audio", padding=10)
+        audio_frame.pack(fill="x", pady=(0, 10))
+        buttons_row = ttk.Frame(audio_frame)
+        buttons_row.pack(fill="x")
+        self.playback_button = ttk.Button(
+            buttons_row, text="PC audio \u2192 phone: start", command=self._toggle_playback
+        )
+        self.playback_button.pack(side="left", padx=(0, 6))
+        self.mic_button = ttk.Button(
+            buttons_row, text="Phone mic \u2192 PC: start", command=self._toggle_mic
+        )
+        self.mic_button.pack(side="left", padx=(0, 6))
+        self.mute_button = ttk.Button(
+            buttons_row, text="Mute outgoing", command=self._toggle_mute
+        )
+        self.mute_button.pack(side="left", padx=(0, 12))
+
+        ttk.Label(buttons_row, text="Volume").pack(side="left")
+        self.volume_var = tk.IntVar(value=40)
+        self.volume_scale = ttk.Scale(
+            buttons_row,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            length=180,
+            command=self._volume_dragged,
+        )
+        self.volume_scale.pack(side="left", padx=6)
+        self.volume_label = tk.Label(buttons_row, text="40%", bg=CARD, width=5)
+        self.volume_label.pack(side="left")
+
+        self.audio_status = tk.Label(
+            audio_frame,
+            text="idle - neither direction is running",
+            anchor="w",
+            justify="left",
+            bg=CARD,
+            fg="#5b6470",
+            wraplength=880,
+        )
+        self.audio_status.pack(fill="x", pady=(6, 0))
+
         caps = ttk.LabelFrame(outer, text="Capabilities", padding=10)
         caps.pack(fill="both", expand=True)
         self.summary_label = tk.Label(
@@ -295,6 +340,40 @@ class PhoneBridgeApp:
         self.endpoint_var.set("")
         self.runtime.set_endpoint("")
 
+    # ---- audio commands -------------------------------------------------- #
+    def _toggle_playback(self) -> None:
+        """Start or stop PC audio. Nothing plays until this is pressed."""
+        view = self._last_view
+        if view is not None and view.audio_playback in {"active", "starting"}:
+            self.runtime.stop_audio_playback()
+        else:
+            self.runtime.start_audio_playback()
+
+    def _toggle_mic(self) -> None:
+        view = self._last_view
+        if view is not None and view.audio_mic in {"active", "starting"}:
+            self.runtime.stop_mic()
+        else:
+            self.runtime.start_mic()
+
+    def _toggle_mute(self) -> None:
+        view = self._last_view
+        muted = view.audio_muted if view is not None else True
+        self.runtime.set_audio_mute(not muted)
+
+    def _volume_dragged(self, raw: str) -> None:
+        """Drag updates the label; releasing sends one RPC (not one per pixel)."""
+        percent = int(float(raw))
+        self.volume_var.set(percent)
+        self.volume_label.configure(text=f"{percent}%")
+        if self._volume_after is not None:
+            self.root.after_cancel(self._volume_after)
+        self._volume_after = self.root.after(150, self._volume_committed)
+
+    def _volume_committed(self) -> None:
+        self._volume_after = None
+        self.runtime.set_audio_volume(self.volume_var.get())
+
     def _pair(self, approve: bool) -> None:
         self.runtime.resolve_pairing(approve)
 
@@ -368,6 +447,26 @@ class PhoneBridgeApp:
         else:
             self.error_label.pack_forget()
 
+        playing = view.audio_playback in {"active", "starting"}
+        recording = view.audio_mic in {"active", "starting"}
+        self.playback_button.configure(
+            text="PC audio \u2192 phone: stop" if playing else "PC audio \u2192 phone: start"
+        )
+        self.mic_button.configure(
+            text="Phone mic \u2192 PC: stop" if recording else "Phone mic \u2192 PC: start"
+        )
+        self.mute_button.configure(text="Unmute outgoing" if view.audio_muted else "Mute outgoing")
+        if self._volume_after is None and int(self.volume_scale.get()) != view.audio_volume:
+            self.volume_scale.set(view.audio_volume)
+        self.volume_label.configure(text=f"{view.audio_volume}%")
+        outgoing = "muted" if view.audio_muted else "unmuted"
+        self.audio_status.configure(
+            text=(
+                f"PC audio \u2192 phone: {view.audio_playback} ({outgoing}, "
+                f"{view.audio_volume}%)  \u00b7  phone mic \u2192 PC: {view.audio_mic}"
+                + ("" if view.audio_detail in {"", "\u2014"} else f"  \u00b7  {view.audio_detail}")
+            )
+        )
         self.summary_label.configure(text=view.summary)
         rows = tuple(
             (r.name, r.present, r.permitted, r.implemented, r.available, r.active, r.note)

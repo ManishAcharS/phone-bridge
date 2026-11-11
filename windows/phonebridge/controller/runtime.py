@@ -151,6 +151,32 @@ class BackgroundRuntime:
     def reconnect(self) -> None:
         self.submit(lambda manager: manager.reconnect())
 
+    # ---- Phase 2 audio --------------------------------------------------- #
+    def start_audio_playback(self) -> None:
+        """Play the PC's audio on the phone. Never called automatically."""
+        self.submit(lambda manager: manager.start_audio_playback())
+
+    def stop_audio_playback(self) -> None:
+        self.submit(lambda manager: manager.stop_audio_playback())
+
+    def start_mic(self) -> None:
+        """Ask the phone for its microphone (the phone may refuse; it says why)."""
+        self.submit(lambda manager: manager.start_mic())
+
+    def stop_mic(self) -> None:
+        self.submit(lambda manager: manager.stop_mic())
+
+    def set_audio_mute(self, muted: bool) -> None:
+        self.submit(lambda manager: manager.set_audio_mute(muted))
+
+    def set_audio_volume(self, percent: int) -> None:
+        self.submit(lambda manager: manager.set_audio_volume(percent))
+
+    def audio_status(self) -> dict[str, object]:
+        """A snapshot the Audio section can redraw without touching the loop."""
+        manager = self._manager
+        return manager.audio_status() if manager is not None else {}
+
     def diagnose_usb(self) -> None:
         """Run the whole USB chain in the controller thread and log the report."""
         self.submit(lambda manager: manager.diagnose_usb())

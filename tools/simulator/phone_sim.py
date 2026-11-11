@@ -44,6 +44,7 @@ from phonebridge.protocol.framing import (
     decode_envelope,
 )
 from phonebridge.protocol.messages import (
+    MSG_AUDIO,
     MSG_BLOB,
     MSG_CONTROL,
     MSG_PING,
@@ -114,7 +115,9 @@ _PERMISSION_FOR: dict[str, str] = {
 # Implemented today: only the protocol-level pieces. Everything else is a
 # declared hardware row with `usable = false`, exactly like the real app. A test
 # may override this to model a phone that implements one more feature.
-_IMPLEMENTED: frozenset[str] = frozenset({"audio.bluetooth_sco"})
+_IMPLEMENTED: frozenset[str] = frozenset(
+    {"audio.bluetooth_sco", "audio.playback", "audio.capture"}
+)
 
 # The runtime permission snapshot the app would report (docs/03 §6).
 DEFAULT_PERMISSIONS: dict[str, str] = {
@@ -197,6 +200,23 @@ class SimulatedPhone:
     frames_out: int = 0
     bytes_out: int = 0
     blobs_echoed: int = 0
+    #: Phase 2 audio. The simulator has no sound device, so this records what a
+    #: real phone would do: accept a format, count frames, and (for the mic) send
+    #: them back — which is what makes an end-to-end audio test possible.
+    audio: dict[str, Any] = field(
+        default_factory=lambda: {
+            "playback": "idle",
+            "mic": "idle",
+            "volume": 40,
+            "muted": True,
+            "format": {},
+        }
+    )
+    audio_frames_in: int = 0
+    audio_frames_out: int = 0
+    audio_bad_frames: int = 0
+    mic_permission: bool = True
+    echo_playback_as_mic: bool = True
     started_at: float = field(default_factory=time.time)
 
     # ------------------------------------------------------------------ #
@@ -324,6 +344,65 @@ class SimulatedPhone:
                 return self._simulated_capability_report(params)
             finally:
                 self._probe_in_flight = False
+
+        # --- Phase 2 audio -------------------------------------------------- #
+        @r.register("audio.playback.start")
+        def _playback_start(params: dict[str, Any]) -> dict[str, Any]:
+            fmt = _audio_format(params)
+            self.audio["playback"] = "active"
+            self.audio["format"] = fmt.as_dict()
+            return {"ok": True, "format": fmt.as_dict()}
+
+        @r.register("audio.playback.stop")
+        def _playback_stop(_params: dict[str, Any]) -> dict[str, Any]:
+            self.audio["playback"] = "idle"
+            return {"ok": True, "playback": "idle"}
+
+        @r.register("audio.playback.mute")
+        def _playback_mute(params: dict[str, Any]) -> dict[str, Any]:
+            self.audio["muted"] = bool((params or {}).get("muted", True))
+            return {"ok": True, "muted": self.audio["muted"]}
+
+        @r.register("audio.playback.volume")
+        def _playback_volume(params: dict[str, Any]) -> dict[str, Any]:
+            try:
+                percent = int((params or {}).get("percent"))
+            except (TypeError, ValueError) as exc:
+                raise ProtocolError("percent must be an integer 0-100") from exc
+            if not 0 <= percent <= 100:
+                raise ProtocolError(f"percent out of range: {percent}")
+            self.audio["volume"] = percent
+            return {"ok": True, "percent": percent}
+
+        @r.register("audio.mic.start")
+        def _mic_start(params: dict[str, Any]) -> dict[str, Any]:
+            if not self.mic_permission:
+                raise RpcError(
+                    "mic_denied",
+                    "microphone permission was refused on the phone, or the PC "
+                    "microphone toggle is off in the PhoneBridge app",
+                )
+            fmt = _audio_format(params)
+            self.audio["mic"] = "active"
+            return {"ok": True, "format": fmt.as_dict()}
+
+        @r.register("audio.mic.stop")
+        def _mic_stop(_params: dict[str, Any]) -> dict[str, Any]:
+            self.audio["mic"] = "idle"
+            return {"ok": True, "mic": "idle"}
+
+        @r.register("audio.status")
+        def _audio_status(_params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "playback": self.audio["playback"],
+                "mic": self.audio["mic"],
+                "volume": self.audio["volume"],
+                "muted": self.audio["muted"],
+                "format": self.audio["format"],
+                "frames_in": self.audio_frames_in,
+                "frames_out": self.audio_frames_out,
+                "permitted": self.mic_permission,
+            }
 
         @r.register("audio.capabilities.last")
         def _capabilities_last(_params: dict[str, Any]) -> dict[str, Any]:
@@ -799,6 +878,32 @@ class SimulatedPhone:
                 await self._handle_control(ws, codec, payload)
             elif msg_type == MSG_PING:
                 await self._send_frame(ws, _seal(codec, pong_payload(parse_ping(payload)), MSG_PONG))
+            elif msg_type == MSG_AUDIO:
+                from phonebridge.audio.frames import (  # noqa: PLC0415
+                    MIC_STREAM,
+                    AudioFrameError,
+                    decode_frame,
+                )
+
+                try:
+                    frame = decode_frame(payload)
+                except AudioFrameError as exc:
+                    self.audio_bad_frames += 1
+                    log.warning("bad audio frame: %s", exc)
+                    continue
+                self.audio_frames_in += 1
+                # With no sound card, "playback" means: consume the frame, and if
+                # the microphone stream is active, send the same audio back. That
+                # makes the simulator a real loopback peer for integration tests.
+                if self.echo_playback_as_mic and self.audio["mic"] == "active" and frame.payload:
+                    self.audio_frames_out += 1
+                    echo = frame.__class__(
+                        seq=frame.seq & 0xFFFF,
+                        timestamp_ms=frame.timestamp_ms,
+                        payload=frame.payload,
+                        flags=frame.flags,
+                    ).encode()
+                    await self._send_frame(ws, _seal(codec, echo, MSG_AUDIO, MIC_STREAM))
             elif msg_type == MSG_BLOB:
                 self.blobs_echoed += 1
                 # Echo the blob back on the same stream: a clean, boring way to
@@ -849,6 +954,10 @@ class SimulatedPhone:
                 out[f"detail.{key}"] = f"permission {permission} is {self.permissions.get(permission)}"
             else:
                 out[f"detail.{key}"] = _DETAIL[key]
+        # Declared, not inferred: the PC must be able to tell "not implemented"
+        # apart from "no hardware" without guessing (docs/03 §5).
+        for key in self.implemented:
+            out[f"implemented.{key}"] = True
         return out
 
     # ------------------------------------------------------------------ #
@@ -868,6 +977,16 @@ class SimulatedPhone:
             except Exception:  # noqa: BLE001 - one dead peer must not block others
                 pass
         return sent
+
+
+def _audio_format(params: dict[str, Any] | None):
+    """Parse the proposed format, turning a bad one into a documented error code."""
+    from phonebridge.audio.frames import AudioFormat, AudioFrameError  # noqa: PLC0415
+
+    try:
+        return AudioFormat.from_dict(params.get("format") if isinstance(params, dict) else None)
+    except (AudioFrameError, ValueError) as exc:
+        raise RpcError("bad_params", f"unusable audio format: {exc}") from exc
 
 
 def _seal(codec: SecureCodec, payload: bytes, msg_type: int = MSG_CONTROL,

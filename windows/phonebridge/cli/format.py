@@ -36,6 +36,13 @@ PROTOCOL_V1_METHODS: tuple[str, ...] = (
     "audio.route.bluetooth",
     "audio.capabilities.run",
     "audio.capabilities.last",
+    "audio.playback.start",
+    "audio.playback.stop",
+    "audio.playback.mute",
+    "audio.playback.volume",
+    "audio.mic.start",
+    "audio.mic.stop",
+    "audio.status",
 )
 
 NO_VERB_NOTE = (

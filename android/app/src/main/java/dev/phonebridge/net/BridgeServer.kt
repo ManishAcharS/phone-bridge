@@ -129,6 +129,26 @@ class BridgeServer(
         val handshakes: Long = 0,
     )
 
+    /**
+     * Phase 2 audio. One engine for the phone: it is refused until a session is
+     * authenticated (there is nobody to send frames to otherwise), and it is
+     * released when the last session ends so no microphone outlives a window.
+     */
+    private val audio = AudioEngine(
+        context = context,
+        sendFrame = { streamId, body -> sendAudioFrame(streamId, body) },
+        log = { level, message -> addLog(level, message) },
+    )
+
+    private fun sendAudioFrame(streamId: Int, body: ByteArray) {
+        val session = sessions.firstOrNull { it.isReady }
+        if (session == null) {
+            addLog("WARN", "dropping audio frame: no authenticated session")
+            return
+        }
+        session.sendSecure(Messages.MSG_AUDIO, streamId, body)
+    }
+
     private val _running = MutableStateFlow(false)
     val running: StateFlow<Boolean> = _running.asStateFlow()
 
@@ -403,6 +423,8 @@ class BridgeServer(
     internal fun unregisterSession(session: PeerSession) {
         sessions.remove(session)
         publishPeers()
+        // The last PC leaving must not leave a microphone or an AudioTrack open.
+        releaseAudioIfIdle()
     }
 
     private fun publishPeers() {
@@ -531,6 +553,73 @@ class BridgeServer(
                     ),
                 )
 
+                // --- Phase 2 audio ------------------------------------- //
+                // The result maps are built here, not inside AudioEngine, so the
+                // wire contract stays readable next to the method name (and the
+                // protocol contract test can check it against docs/03).
+                "audio.playback.start" -> {
+                    val state = audio.startPlayback(params)
+                    Messages.responseOk(
+                        id,
+                        mapOf(
+                            "ok" to true,
+                            "format" to state["format"],
+                            "detail" to (state["detail"] ?: "playing"),
+                        ),
+                    )
+                }
+
+                "audio.playback.stop" -> {
+                    audio.stopPlayback()
+                    Messages.responseOk(id, mapOf("ok" to true, "playback" to "idle"))
+                }
+
+                "audio.playback.mute" -> {
+                    val mutedNow = audio.setMuted(params["muted"] as? Boolean ?: true)
+                    Messages.responseOk(
+                        id,
+                        mapOf("ok" to true, "muted" to mutedNow["muted"]),
+                    )
+                }
+
+                "audio.playback.volume" -> {
+                    val applied = audio.setVolume((params["percent"] as? Number)?.toInt() ?: 40)
+                    Messages.responseOk(
+                        id,
+                        mapOf("ok" to true, "percent" to applied["percent"]),
+                    )
+                }
+
+                "audio.mic.start" -> {
+                    val state = audio.startMic(params)
+                    Messages.responseOk(id, mapOf("ok" to true, "format" to state["format"]))
+                }
+
+                "audio.mic.stop" -> {
+                    audio.stopMic()
+                    Messages.responseOk(id, mapOf("ok" to true, "mic" to "idle"))
+                }
+
+                "audio.status" -> {
+                    val s = audio.status()
+                    Messages.responseOk(
+                        id,
+                        mapOf(
+                            "playback" to s["playback"],
+                            "mic" to s["mic"],
+                            "volume" to s["volume"],
+                            "muted" to s["muted"],
+                            "permitted" to s["permitted"],
+                            "mic_muted" to s["mic_muted"],
+                            "format" to s["format"],
+                            "frames_in" to s["frames_in"],
+                            "frames_out" to s["frames_out"],
+                            "dropped" to s["dropped"],
+                            "last_error" to s["last_error"],
+                        ),
+                    )
+                }
+
                 "bluetooth.headset.status" -> Messages.responseOk(
                     id,
                     mapOf(
@@ -575,6 +664,11 @@ class BridgeServer(
 
                 else -> Messages.responseErr(id, "method_not_found", "no handler for '$method'")
             }
+        } catch (e: RpcFailure) {
+            // A refusal with a documented code (docs/03 §7) and a sentence the PC
+            // shows verbatim: "microphone permission is not granted", not "bad_params".
+            addLog("INFO", "RPC $method refused: ${e.code} - ${e.message}")
+            Messages.responseErr(id, e.code, e.message ?: e.code)
         } catch (e: Exception) {
             addLog("ERROR", "RPC $method failed: ${e.message}")
             Messages.responseErr(id, "internal", "${e.javaClass.simpleName}: ${e.message}")
@@ -867,7 +961,14 @@ class BridgeServer(
         private fun responseSasNormalised(formatted: String) = formatted.replace(" ", "")
 
         /** @return true when this session was admitted; false means it was closed. */
-        private fun markReady(): Boolean {
+        /** Called whenever a session leaves the ready set. */
+    private fun releaseAudioIfIdle() {
+        if (sessions.none { it.isReady }) {
+            audio.release()
+        }
+    }
+
+    private fun markReady(): Boolean {
             cancelSetupTimeout()
             val refusal = admitSession(this, peerDeviceId)
             if (refusal != null) {
@@ -907,6 +1008,8 @@ class BridgeServer(
                     addLog("INFO", "PC said bye${if (reason.isEmpty()) "" else ": $reason"}")
                     close("PC said bye")
                 }
+
+                Messages.MSG_AUDIO -> audio.onFrame(opened.streamId, opened.payload)
 
                 Messages.MSG_BLOB -> sendSecure(Messages.MSG_BLOB, opened.streamId, opened.payload)
                 else -> addLog("WARN", "ignoring msg type 0x%02x".format(opened.msgType))
