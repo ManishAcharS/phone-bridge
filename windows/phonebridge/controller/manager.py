@@ -266,7 +266,11 @@ class ConnectionManager:
         self._manual: FixedCandidates | None = None
         self._last_found: list[Candidate] = []
         self._profile: str | None = None
-        self._profile_at: float = 0.0
+        # `-inf`, not 0.0: the clock is monotonic (time since boot), so on a machine
+        # booted less than a minute ago `now - 0.0` looks like a fresh cache entry
+        # and the very first probe is skipped. That is how a fresh boot lost the
+        # Public-network hint, and why this test was flaky on a cold runner.
+        self._profile_at: float = float("-inf")
         #: Windows' device tree is a subprocess; ask it at most every 30 s.
         self._usb_probe = usb_probe or query_pnp
         self._system = system or platform.system()
@@ -275,7 +279,9 @@ class ConnectionManager:
         self._adb = adb if adb is not None else Adb()
         self._usb_report: UsbReport | None = None
         self._pnp: list[PnpDevice] = []
-        self._pnp_at: float = 0.0
+        # Same sentinel rule as `_profile_at`: `-inf` so the first USB probe always
+        # runs, however young the monotonic clock is.
+        self._pnp_at: float = float("-inf")
         #: Network fingerprint at the moment the session came up, so a drop can
         #: say "the network changed" instead of "something went wrong".
         self._gateways = gateways or default_gateways
@@ -305,7 +311,6 @@ class ConnectionManager:
         self._sensor_ids: list[int] = []
         self._active_at_publish: set[str] = set()
         self._audio_snapshot = AudioSnapshot()
-        self._audio_state_at: float = 0.0
         #: Injected in tests; the real ones need WASAPI/sounddevice on Windows.
         self._source_factory = source_factory or default_source_factory
         self._sink_factory = sink_factory or default_sink_factory

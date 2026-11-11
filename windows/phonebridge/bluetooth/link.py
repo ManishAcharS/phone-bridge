@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -28,6 +30,7 @@ from .frames import (
     GATT_CONNECTED,
     GATT_DISCONNECTED,
     GATT_FAILED,
+    MAX_DEVICES,
     SCAN_ERROR,
     SCAN_IDLE,
     SCAN_SCANNING,
@@ -43,6 +46,7 @@ from .frames import (
     encode_value,
     hex_of,
     is_mac,
+    normalise_address,
     normalise_uuid,
     parse_devices,
     printable_of,
@@ -59,6 +63,11 @@ SCAN_DURATIONS_MS: tuple[tuple[str, int], ...] = (
 )
 
 DEFAULT_SCAN_MS = 10000
+
+#: How often coalesced scan updates are published. A crowded room can produce
+#: hundreds of sightings a second; the GUI cannot draw them faster than this and
+#: every publish copies the device list.
+DEVICE_EVENT_RATE = 5.0
 
 #: How long a GATT operation may take before the PC gives up waiting.
 GATT_TIMEOUT_S = 20.0
@@ -108,23 +117,37 @@ class BluetoothLink:
         self._connections: dict[str, GattConnection] = {}
         self._detail = ""
         self._pending_scan_ms = DEFAULT_SCAN_MS
+        #: The name filter last asked for. Applied locally as well as on the phone,
+        #: so `--name` also filters a phone that predates the parameter.
+        self._name_prefix = ""
+        #: Device updates waiting for the next publish. Keyed by address, so a
+        #: flood of sightings collapses to the newest state per device and cannot
+        #: grow without bound (docs/21 §4).
+        self._pending_devices: dict[str, BleDevice] = {}
+        self._last_device_publish = 0.0
+        #: Guards the connection and device tables against the GUI thread, which
+        #: polls `snapshot()` while the event handler inserts into them.
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ #
     # observation
     # ------------------------------------------------------------------ #
     def snapshot(self) -> BluetoothSnapshot:
-        return BluetoothSnapshot(
-            adapter=self._adapter,
-            scan=self._scan,
-            connections=tuple(self._connections.values()),
-            detail=self._detail,
-        )
+        with self._lock:
+            return BluetoothSnapshot(
+                adapter=self._adapter,
+                scan=self._scan,
+                connections=tuple(self._connections.values()),
+                detail=self._detail,
+            )
 
     def connection(self, address: str) -> GattConnection | None:
-        return self._connections.get(address)
+        with self._lock:
+            return self._connections.get(normalise_address(address))
 
     def devices(self) -> tuple[BleDevice, ...]:
-        return self._scan.sorted_devices()
+        with self._lock:
+            return self._scan.sorted_devices()
 
     # ------------------------------------------------------------------ #
     # adapter and scanning
@@ -168,6 +191,8 @@ class BluetoothLink:
             params["filter_uuids"] = [normalise_uuid(u) for u in filter_uuids]
         if name_prefix:
             params["name_prefix"] = name_prefix
+        self._name_prefix = name_prefix.strip()
+        self._pending_devices.clear()
         try:
             reply = await self._session.call(
                 "bluetooth.scan.start", params, timeout=SCAN_CALL_TIMEOUT_S
@@ -205,6 +230,7 @@ class BluetoothLink:
             self._publish()
             return False
         devices = parse_devices(reply) if isinstance(reply, dict) else ()
+        self._pending_devices.clear()
         self._scan = ScanState(
             state=SCAN_STOPPED,
             devices=devices or self._scan.devices,
@@ -230,7 +256,7 @@ class BluetoothLink:
             return self._scan
         if not isinstance(reply, dict):
             return self._scan
-        devices = parse_devices(reply)
+        devices = self._filtered(parse_devices(reply))
         state = self._scan.state
         if isinstance(reply.get("scanning"), bool):
             state = SCAN_SCANNING if reply["scanning"] else (
@@ -244,6 +270,7 @@ class BluetoothLink:
             filter_uuids=self._scan.filter_uuids,
             detail=str(reply.get("detail") or ""),
         )
+        self._pending_devices.clear()
         self._publish()
         return self._scan
 
@@ -252,6 +279,7 @@ class BluetoothLink:
     # ------------------------------------------------------------------ #
     async def connect(self, address: str) -> GattConnection:
         """Connect to a device the user picked. Never called by discovery."""
+        address = normalise_address(address)
         if not is_mac(address):
             raise BluetoothError(f"{address!r} is not a Bluetooth address")
         if not getattr(self._session, "is_open", False):
@@ -291,12 +319,14 @@ class BluetoothLink:
 
     async def services(self, address: str) -> GattTree:
         """Discover services and characteristics for a connected peripheral."""
+        address = normalise_address(address)
         reply = await self._call(
             "bluetooth.gatt.services", {"address": address}, "the phone could not read GATT services"
         )
         return GattTree.from_dict(reply if isinstance(reply, dict) else {})
 
     async def disconnect(self, address: str) -> bool:
+        address = normalise_address(address)
         connection = self._connections.pop(address, None)
         ok = True
         if getattr(self._session, "is_open", False):
@@ -309,12 +339,15 @@ class BluetoothLink:
                 ok = False
         if connection is not None:
             connection.state = GATT_DISCONNECTED
-            for notification in connection.notifications:
-                del notification
+            # Release the buffered notifications rather than iterating over them
+            # and deleting the loop variable (which cleared nothing at all).
+            connection.notifications.clear()
+            connection.subscriptions = ()
             self._publish()
         return ok
 
     async def read(self, address: str, service: str, characteristic: str) -> bytes:
+        address = normalise_address(address)
         reply = await self._call(
             "bluetooth.gatt.read",
             {
@@ -344,6 +377,7 @@ class BluetoothLink:
         *,
         with_response: bool = True,
     ) -> int:
+        address = normalise_address(address)
         payload = encode_value(data)
         reply = await self._call(
             "bluetooth.gatt.write",
@@ -362,6 +396,7 @@ class BluetoothLink:
         self, address: str, service: str, characteristic: str, *, enable: bool = True
     ) -> bool:
         """Subscribe (or unsubscribe) and report whether it is subscribed *now*."""
+        address = normalise_address(address)
         reply = await self._call(
             "bluetooth.gatt.subscribe",
             {
@@ -395,7 +430,7 @@ class BluetoothLink:
         if not isinstance(reply, dict):
             return
         live = {
-            str(entry.get("address")): str(entry.get("state") or "")
+            normalise_address(str(entry.get("address"))): str(entry.get("state") or "")
             for entry in reply.get("connections") or ()
             if isinstance(entry, dict)
         }
@@ -434,13 +469,17 @@ class BluetoothLink:
         try:
             if name == "bluetooth.device":
                 device = BleDevice.from_dict(data)
-                if not device.address:
+                if not device.address or not self._accepts(device):
                     return
                 devices = {d.address: d for d in self._scan.devices}
                 existing = devices.get(device.address)
-                devices[device.address] = (
-                    existing.updated_with(device) if existing else device
-                )
+                merged = existing.updated_with(device) if existing else device
+                devices[device.address] = merged
+                # Keep at most MAX_DEVICES, weakest first out: a scan cannot make
+                # the PC allocate without bound even if the phone misbehaves.
+                if len(devices) > MAX_DEVICES:
+                    weakest = min(devices.values(), key=lambda d: d.rssi)
+                    devices.pop(weakest.address, None)
                 self._scan = ScanState(
                     state=SCAN_SCANNING,
                     devices=tuple(devices.values()),
@@ -448,7 +487,14 @@ class BluetoothLink:
                     duration_ms=self._scan.duration_ms,
                     filter_uuids=self._scan.filter_uuids,
                 )
-                self._publish()
+                # Coalesce: a crowded room produces hundreds of sightings a second
+                # and every publish copies the whole device list. The newest state
+                # per device is kept; the GUI sees it at most [DEVICE_EVENT_RATE]
+                # times a second, and `refresh_scan` (its poll) flushes the rest.
+                self._pending_devices[device.address] = merged
+                now = time.monotonic()
+                if now - self._last_device_publish >= 1.0 / DEVICE_EVENT_RATE:
+                    self._flush_devices(now)
             elif name == "bluetooth.scan":
                 state = str(data.get("state") or "").strip().lower()
                 if state in {SCAN_IDLE, SCAN_SCANNING, SCAN_STOPPED, SCAN_ERROR}:
@@ -463,7 +509,7 @@ class BluetoothLink:
                     )
                     self._publish()
             elif name == "bluetooth.gatt":
-                address = str(data.get("address") or "")
+                address = normalise_address(str(data.get("address") or ""))
                 state = str(data.get("state") or "")
                 connection = self._connections.get(address)
                 if connection is not None and state:
@@ -473,12 +519,36 @@ class BluetoothLink:
                     self._publish()
             elif name == "bluetooth.notification":
                 notification = Notification.from_event(data)
-                connection = self._connections.get(notification.address)
+                connection = self._connections.get(
+                    normalise_address(notification.address)
+                )
                 if connection is not None:
                     connection.add_notification(notification)
                     self._publish()
         except Exception:  # noqa: BLE001 - an event must never break the session
             log.exception("ignoring a malformed %s event", name)
+
+    def _accepts(self, device: BleDevice) -> bool:
+        """Whether the current name filter allows this device.
+
+        Applied here as well as on the phone: a phone that predates the
+        ``name_prefix`` parameter would otherwise make `--name` a no-op, and a
+        filter that silently does nothing is worse than no filter.
+        """
+        if not self._name_prefix:
+            return True
+        return device.name.lower().startswith(self._name_prefix.lower())
+
+    def _filtered(self, devices: tuple[BleDevice, ...]) -> tuple[BleDevice, ...]:
+        if not self._name_prefix:
+            return devices
+        return tuple(d for d in devices if self._accepts(d))
+
+    def _flush_devices(self, now: float | None = None) -> None:
+        """Publish the coalesced device updates once."""
+        self._pending_devices.clear()
+        self._last_device_publish = time.monotonic() if now is None else now
+        self._publish()
 
     # ------------------------------------------------------------------ #
     # internals

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -73,6 +74,9 @@ class SensorSnapshot:
     detail: str = ""
     registry: SensorRegistry | None = None
     stats: dict[str, Any] | None = None
+    #: Frames the phone sent that could not be decoded. Kept on the snapshot so a
+    #: user can see a broken stream without a fabricated "sensor 0" row.
+    invalid_frames: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         registry = self.registry or SensorRegistry()
@@ -81,6 +85,7 @@ class SensorSnapshot:
             "detail": self.detail,
             "registry": registry.to_dict(),
             "stats": dict(self.stats or {}),
+            "invalid_frames": self.invalid_frames,
         }
 
 
@@ -105,6 +110,12 @@ class SensorLink:
         self._queue: asyncio.Queue[bytes | None] | None = None
         self._task: asyncio.Task[None] | None = None
         self._last_seen: dict[int, float] = {}
+        #: Frames the phone sent that could not be decoded. Counted here so no
+        #: fabricated sensor row appears in the GUI or the JSON output.
+        self._invalid_frames = 0
+        #: Guards the registry tables against the GUI thread, which polls
+        #: `snapshot()` while the frame pump inserts a newly-seen sensor id.
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ #
     # observation
@@ -127,6 +138,10 @@ class SensorLink:
         #
         # Keys are strings: the snapshot is what the GUI and the JSON output read,
         # and a dict with int keys cannot be serialised as-is.
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> SensorSnapshot:
         stats: dict[str, Any] = {
             str(info.id): self._registry.stats.get(info.id, SensorStats()).to_dict()
             for info in self._registry.sensors
@@ -138,6 +153,7 @@ class SensorLink:
             detail=self._detail,
             registry=self._registry,
             stats=stats,
+            invalid_frames=self._invalid_frames,
         )
 
     def reading(self, sensor_id: int) -> SensorReading | None:
@@ -196,11 +212,17 @@ class SensorLink:
             return False
 
         self._set(STARTING)
+        # Subscribe *before* asking: the phone registers its listeners inside
+        # `sensor.start` and starts sending immediately, so a queue created after
+        # the reply would drop the first readings (the file plane learned this
+        # the hard way with its acks).
+        self._queue, self._task = await self._open_stream()
         try:
             reply = await self._session.call(
                 "sensor.start", {"ids": ids, "interval_us": self._interval_us}
             )
         except Exception as exc:  # noqa: BLE001
+            await self._stop_stream()
             self._set(ERROR, _explain("the phone refused to start sensors", exc))
             await self._quiet_rpc("sensor.stop")
             return False
@@ -213,9 +235,17 @@ class SensorLink:
         self._registry.stats = {i: SensorStats() for i in started}
         self._registry.readings = {}
         self._last_seen.clear()
-        self._queue, self._task = await self._open_stream()
         self._set(ACTIVE, "")
         return True
+
+    async def _stop_stream(self) -> None:
+        """Drop the frame queue and its reader without touching the phone."""
+        task, self._task = self._task, None
+        self._queue = None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
     async def stop(self, reason: str = "stopped") -> None:
         """Stop every stream on the phone and close the local side."""
@@ -296,9 +326,11 @@ class SensorLink:
         try:
             frame = decode_frame(body)
         except SensorFrameError as exc:
-            stats = self._stats_for(0)
-            stats.invalid += 1
-            stats.last_error = str(exc)
+            # Counted on the link, not on a made-up "sensor 0": a phantom row with
+            # a decode error is more confusing than no row at all.
+            with self._lock:
+                self._invalid_frames += 1
+                self._detail = f"{self._invalid_frames} malformed sensor frame(s): {exc}"
             return
         self._apply(frame)
 
@@ -345,11 +377,12 @@ class SensorLink:
     # internals
     # ------------------------------------------------------------------ #
     def _stats_for(self, sensor_id: int) -> SensorStats:
-        stats = self._registry.stats.get(sensor_id)
-        if stats is None:
-            stats = SensorStats()
-            self._registry.stats[sensor_id] = stats
-        return stats
+        with self._lock:
+            stats = self._registry.stats.get(sensor_id)
+            if stats is None:
+                stats = SensorStats()
+                self._registry.stats[sensor_id] = stats
+            return stats
 
     def _set(self, state: str, detail: str = "") -> None:
         self._state = state
