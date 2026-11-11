@@ -43,6 +43,7 @@ from ..protocol.messages import (
     MSG_BLOB,
     MSG_BYE,
     MSG_CONTROL,
+    MSG_FILE,
     MSG_PING,
     MSG_PONG,
     MSG_VIDEO,
@@ -668,6 +669,14 @@ class BridgeSession:
         diagnostic can still exercise the reverse direction deliberately.
         """
         await self._safe_send(MSG_VIDEO, stream_id, body)
+
+    async def send_file_chunk(self, body: bytes, stream_id: int = 5) -> None:
+        """Send one encoded file chunk or acknowledgement (Phase 5).
+
+        The body is framed by :mod:`phonebridge.files.frames`; this only puts it
+        inside the encrypted envelope, on the file stream it names.
+        """
+        await self._safe_send(MSG_FILE, stream_id, body)
 
     def subscribe_blobs(
         self, stream_id: int, maxsize: int = 256
