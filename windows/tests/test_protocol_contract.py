@@ -30,6 +30,9 @@ KOTLIN = REPO / "android/app/src/main/java/dev/phonebridge"
 SERVER = KOTLIN / "net/BridgeServer.kt"
 DEVICE_FACTS = KOTLIN / "net/DeviceFacts.kt"
 MESSAGES = KOTLIN / "protocol/Messages.kt"
+BLE = KOTLIN / "net/BleEngine.kt"
+SENSOR_ENGINE = KOTLIN / "net/SensorEngine.kt"
+FILE_ENGINE = KOTLIN / "net/FileTransferEngine.kt"
 FRAMING_KT = KOTLIN / "protocol/Framing.kt"
 PERMISSIONS_KT = KOTLIN / "Permissions.kt"
 MANIFEST = REPO / "android/app/src/main/AndroidManifest.xml"
@@ -55,6 +58,29 @@ DOCUMENTED_METHODS = (
     "camera.stop",
     "camera.switch",
     "camera.status",
+    # Phase 5: Bluetooth, sensors and file transfer.
+    "bluetooth.adapter.status",
+    "bluetooth.scan.start",
+    "bluetooth.scan.stop",
+    "bluetooth.scan.results",
+    "bluetooth.gatt.connect",
+    "bluetooth.gatt.services",
+    "bluetooth.gatt.read",
+    "bluetooth.gatt.write",
+    "bluetooth.gatt.subscribe",
+    "bluetooth.gatt.disconnect",
+    "bluetooth.gatt.status",
+    "sensor.list",
+    "sensor.start",
+    "sensor.stop",
+    "sensor.status",
+    "file.offer",
+    "file.request",
+    "file.complete",
+    "file.progress",
+    "file.cancel",
+    "file.pause",
+    "file.resume",
 )
 
 DEVICE_BLOCK = {
@@ -83,6 +109,29 @@ EXPECTED_KEYS: dict[str, set[str]] = {
     "camera.stop": {"ok", "streaming"},
     "camera.switch": {"ok", "facing", "streaming"},
     "camera.status": {"streaming", "facing", "width", "height", "fps", "permitted"},
+    "bluetooth.adapter.status": {"supported", "enabled", "le_supported", "permitted", "detail"},
+    "bluetooth.scan.start": {"ok", "scanning", "started_at_ms", "duration_ms"},
+    "bluetooth.scan.stop": {"ok", "scanning", "devices"},
+    "bluetooth.scan.results": {"scanning", "state", "devices", "detail"},
+    "bluetooth.gatt.connect": {"address", "state", "services", "mtu"},
+    "bluetooth.gatt.services": {"address", "mtu", "services"},
+    "bluetooth.gatt.read": {"value_b64", "bytes"},
+
+    "bluetooth.gatt.write": {"ok", "bytes"},
+    "bluetooth.gatt.subscribe": {"ok", "subscribed"},
+    "bluetooth.gatt.disconnect": {"ok", "state"},
+    "bluetooth.gatt.status": {"connections", "scanning"},
+    "sensor.list": {"sensors", "permitted", "interval_us", "detail"},
+    "sensor.start": {"ok", "active", "interval_us"},
+    "sensor.stop": {"ok", "stopped", "active"},
+    "sensor.status": {"active", "interval_us", "frames_sent", "permitted"},
+    "file.offer": {"transfer_id", "chunk_size", "window", "resume_from"},
+    "file.request": {"transfer_id", "name", "size", "sha256", "chunk_size"},
+    "file.complete": {"ok", "verified", "sha256", "bytes"},
+    "file.progress": {"transfer_id", "state", "bytes", "chunks"},
+    "file.cancel": {"ok", "state"},
+    "file.pause": {"ok", "state"},
+    "file.resume": {"ok", "from_bytes", "state"},
 }
 
 DOCUMENTED_ERROR_CODES = {
@@ -93,6 +142,23 @@ DOCUMENTED_ERROR_CODES = {
     "unsupported_by_device",
     "probe_failed",
     "busy",
+    # Phase 4 camera.
+    "camera_denied",
+    "no_camera",
+    "camera_busy",
+    "bad_config",
+    # Phase 5 Bluetooth, sensors and files.
+    "no_bluetooth",
+    "bluetooth_off",
+    "bluetooth_denied",
+    "gatt_failed",
+    "not_connected",
+    "sensor_denied",
+    "sensor_failed",
+    "unknown_transfer",
+    "hash_mismatch",
+    "storage_denied",
+    "cancelled",
 }
 
 #: The one request the CLI sends on purpose to prove the error path works.
@@ -138,6 +204,44 @@ def paren_block_after(text: str, marker: str, opener: str) -> str:
             if depth == 0:
                 return text[open_paren : index + 1]
     raise AssertionError(f"unbalanced parentheses after {marker!r}")
+
+
+#: Phase 5 methods whose result map is built inside an engine rather than in the
+#: dispatch branch. The contract test follows the delegation instead of demanding
+#: that every key be spelled twice: the keys live next to the code that produces
+#: them, and this table says where to look.
+DELEGATED_KEYS: dict[str, tuple[Path, str]] = {
+    "bluetooth.adapter.status": (BLE, "fun status("),
+    "bluetooth.scan.start": (BLE, "fun startScan("),
+    "bluetooth.scan.stop": (BLE, "fun stopScan("),
+    "bluetooth.scan.results": (BLE, "fun results("),
+    "bluetooth.gatt.connect": (BLE, "fun connect("),
+    "bluetooth.gatt.services": (BLE, "fun services("),
+    "bluetooth.gatt.read": (BLE, "fun read("),
+    "bluetooth.gatt.write": (BLE, "fun write("),
+    "bluetooth.gatt.subscribe": (BLE, "fun subscribe("),
+    "bluetooth.gatt.disconnect": (BLE, "fun disconnect("),
+    "bluetooth.gatt.status": (BLE, "fun connections("),
+    "sensor.status": (SENSOR_ENGINE, "fun status("),
+    "file.offer": (FILE_ENGINE, "fun offer("),
+    "file.request": (FILE_ENGINE, "fun request("),
+    "file.complete": (FILE_ENGINE, "fun complete("),
+    "file.progress": (FILE_ENGINE, "fun progress("),
+    "file.cancel": (FILE_ENGINE, "fun cancel("),
+    "file.pause": (FILE_ENGINE, "fun pause("),
+    "file.resume": (FILE_ENGINE, "fun resume("),
+}
+
+
+def delegated_keys(method: str) -> set[str]:
+    """Keys returned by an engine function the dispatch branch delegates to."""
+    entry = DELEGATED_KEYS.get(method)
+    if entry is None:
+        return set()
+    path, signature = entry
+    # Every engine accessor is expression-bodied (`fun f(): Map<..> = linkedMapOf(`),
+    # so the map call itself is the extent — no braces to balance.
+    return map_keys(paren_block_after(read(path), signature, "linkedMapOf("))
 
 
 def map_keys(block: str) -> set[str]:
@@ -215,23 +319,28 @@ def test_the_cli_calls_nothing_the_protocol_does_not_define():
 
 
 def test_the_self_test_does_not_invent_workflows():
-    """Every area marked NOT IMPLEMENTED must have no handler on either side."""
-    names = " ".join(name for name, _reason in selftest_module.UNSUPPORTED_WORKFLOWS)
-    for area in ("file transfer", "sensor"):
-        assert area in names
-    assert "audio" not in names, "Phase 2 implemented audio; it is not an unsupported workflow"
-    assert "camera" not in names, "Phase 4 implemented the camera; it is not unsupported"
+    """The matrix may only disclaim an area that has no handler on the phone.
+
+    The rule survives Phase 5 even though nothing is disclaimed any more: if a
+    future phase removed a handler, a NOT IMPLEMENTED row would be the honest
+    answer, and one appearing while the phone *does* dispatch the methods would
+    mean the matrix had started lying.
+    """
+    assert selftest_module.UNSUPPORTED_WORKFLOWS == (), (
+        "Phase 5 implemented Bluetooth, sensors and file transfer, so the matrix has "
+        "nothing left to disclaim"
+    )
     dispatch = set(kotlin_dispatch())
-    assert any(method.startswith("audio.") for method in dispatch), (
-        "Phase 2 audio methods must be dispatched by the phone"
-    )
-    assert any(method.startswith("camera.") for method in dispatch), (
-        "Phase 4 camera methods must be dispatched by the phone"
-    )
-    for area, word in (("file", "file"), ("sensor", "sensor")):
-        assert not any(word in method for method in dispatch), (
-            f"the phone dispatches a {area} method; the matrix must not call it unimplemented"
+    for prefix in ("audio.", "camera.", "bluetooth.", "sensor.", "file."):
+        assert any(method.startswith(prefix) for method in dispatch), (
+            f"the phone dispatches no {prefix}* method, yet the feature is implemented"
         )
+    for name, _reason in selftest_module.UNSUPPORTED_WORKFLOWS:
+        lowered = name.lower()
+        for word in ("audio", "camera", "bluetooth", "sensor", "file"):
+            assert word not in lowered, (
+                f"the matrix disclaims {name!r} while the phone implements {word}"
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -246,8 +355,23 @@ def test_kotlin_result_has_every_key_the_docs_require(method):
         keys |= map_keys(
             paren_block_after(read(DEVICE_FACTS), "fun deviceInfo", "linkedMapOf(")
         )
+    keys |= delegated_keys(method)
     missing = EXPECTED_KEYS[method] - keys
     assert not missing, f"{method} does not return {sorted(missing)}"
+
+
+def test_every_documented_phase_five_method_is_dispatched():
+    """The docs and the phone must agree on the whole Phase 5 surface."""
+    dispatch = kotlin_dispatch()
+    for method in (
+        "bluetooth.adapter.status", "bluetooth.scan.start", "bluetooth.scan.stop",
+        "bluetooth.scan.results", "bluetooth.gatt.connect", "bluetooth.gatt.services",
+        "bluetooth.gatt.read", "bluetooth.gatt.write", "bluetooth.gatt.subscribe",
+        "bluetooth.gatt.disconnect", "bluetooth.gatt.status", "sensor.list",
+        "sensor.start", "sensor.stop", "sensor.status", "file.offer", "file.request",
+        "file.complete", "file.progress", "file.cancel", "file.pause", "file.resume",
+    ):
+        assert method in dispatch, f"the phone does not dispatch {method}"
 
 
 def test_kotlin_reports_the_capability_contract_keys():
@@ -280,11 +404,21 @@ def test_the_docs_list_every_required_key():
             assert f"`{key}`" in row, f"docs/03 schema row for {method} omits `{key}`"
 
 
-def test_the_docs_say_there_is_no_other_operation():
+def test_the_docs_say_every_operation_is_implemented():
+    """The Phase 1 disclaimer is gone, and the doc says so explicitly.
+
+    It must be replaced by the stronger claim, not just deleted: a reader has to be
+    able to tell that `0x50`/`0x60` stopped being reserved numbers.
+    """
     text = read(PROTOCOL_DOC)
-    assert "There is no other operation" in text
+    assert "There is no other operation" not in text, (
+        "the Phase 1 disclaimer survived Phase 5"
+    )
+    assert "Every operation this document lists is implemented on both sides" in text
     for kind in ("AUDIO", "VIDEO", "FILE", "SENSOR"):
         assert kind in text
+    for body in ("`MSG_FILE` body", "`MSG_SENSOR` body"):
+        assert body in text, f"{body} is not documented"
 
 
 # --------------------------------------------------------------------------- #
@@ -317,31 +451,33 @@ def test_protocol_version_is_one_everywhere():
     assert "# PhoneBridge wire protocol v1" in read(PROTOCOL_DOC)
 
 
-def test_only_implemented_media_kinds_have_a_handler():
-    """Phases 2 and 4 implemented 0x30 and 0x40; 0x50/0x60 must still be bare.
+def test_every_implemented_media_kind_has_a_handler():
+    """All four media kinds are implemented now, and each has a real handler.
 
-    A media kind without a defined body format cannot be implemented somewhere
-    quietly: the capability table would then promise a feature twice.
+    The inverse of the Phase 1-4 test: a kind whose capability row says
+    "implemented" must be handled by the phone, or the matrix would promise a
+    feature that nothing answers.
     """
     server_code = mask_source(read(SERVER))
     assert "Messages.MSG_AUDIO" in server_code, "Phase 2 audio handler disappeared"
     assert "Messages.MSG_VIDEO" in server_code, "Phase 4 camera handler disappeared"
+    # 0x50/0x60 need a handler *and* a body format defined in docs/03.
+    doc = read(PROTOCOL_DOC)
     for kind in ("MSG_FILE", "MSG_SENSOR"):
-        assert f"Messages.{kind}" not in server_code, (
-            f"BridgeServer handles {kind}; the feature matrix would be wrong"
-        )
-    for kind in ("MSG_AUDIO", "MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
-        assert f"const val {kind}" in read(MESSAGES), f"{kind} constant disappeared"
+        assert kind in doc, f"{kind} is not documented in docs/03"
+    assert "Messages.MSG_FILE" in server_code, "BridgeServer does not handle MSG_FILE"
+    assert "Messages.MSG_SENSOR" in server_code, "BridgeServer does not handle MSG_SENSOR"
+    assert "files.onChunk(opened.payload)" in server_code, (
+        "MSG_FILE must reach the transfer engine"
+    )
+    for name in ("MSG_AUDIO", "MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
+        assert f"const val {name}" in read(MESSAGES), f"{name} constant disappeared"
     python_code = mask_source(read(REPO / "windows/phonebridge/protocol/messages.py"))
     for name in ("MSG_AUDIO", "MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
         assert name in python_code
     sim_code = mask_source(read(REPO / "tools/simulator/phone_sim.py"))
-    assert "MSG_AUDIO" in sim_code, "the reference phone must implement Phase 2 audio"
-    assert "MSG_VIDEO" in sim_code, "the reference phone must implement Phase 4 camera"
-    for name in ("MSG_FILE", "MSG_SENSOR"):
-        assert name not in sim_code, (
-            f"the reference phone handles {name}, which has no defined body format"
-        )
+    for kind in ("MSG_AUDIO", "MSG_VIDEO", "MSG_FILE", "MSG_SENSOR"):
+        assert kind in sim_code, f"the reference phone must implement {kind}"
 
 
 def test_the_blob_echo_is_the_only_binary_workflow():
@@ -360,10 +496,20 @@ def test_the_reported_permissions_are_declared_and_used():
     for name in ("RECORD_AUDIO", "POST_NOTIFICATIONS", "BLUETOOTH_CONNECT", "CAMERA"):
         assert name in permissions, f"{name} missing from the permission model"
         assert name in manifest, f"{name} missing from AndroidManifest.xml"
-    # Nothing is reported that the app does not declare (no invented states):
-    # the code never references a permission outside the runtime list.
-    assert "Manifest.permission.BLUETOOTH_SCAN" not in permissions
-    assert "Manifest.permission.ACCESS_FINE_LOCATION" not in permissions
+    # Phase 5 added the Bluetooth pair. Both are declared, modelled and requested
+    # at the moment of use; the location permission is the Android 11 spelling of
+    # the same power and is capped at SDK 30 in the manifest.
+    for name in ("BLUETOOTH_SCAN", "ACCESS_FINE_LOCATION"):
+        assert f"Manifest.permission.{name}" in permissions, (
+            f"{name} is not modelled in Permissions.kt"
+        )
+        assert name in manifest, f"{name} is not declared in AndroidManifest.xml"
+    assert 'android:maxSdkVersion="30"' in manifest, (
+        "ACCESS_FINE_LOCATION must not be requested on Android 12+"
+    )
+    assert "usesPermissionFlags=\"neverForLocation\"" in manifest, (
+        "BLUETOOTH_SCAN must state that scan results are not used for location"
+    )
 
 
 

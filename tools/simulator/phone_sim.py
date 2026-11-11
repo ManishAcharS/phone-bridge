@@ -47,8 +47,10 @@ from phonebridge.protocol.messages import (
     MSG_AUDIO,
     MSG_BLOB,
     MSG_CONTROL,
+    MSG_FILE,
     MSG_PING,
     MSG_PONG,
+    MSG_SENSOR,
     MSG_VIDEO,
     STREAM_CONTROL,
     ProtocolError,
@@ -79,6 +81,7 @@ CAPABILITY_KEYS = (
     "audio.bluetooth_sco",
     "camera.back",
     "camera.front",
+    "bluetooth_gatt",
     "sensors",
     "file_transfer",
     "bluetooth_scan",
@@ -90,6 +93,7 @@ _HARDWARE = {
     "audio.bluetooth_sco": True,
     "camera.back": True,
     "camera.front": True,
+    "bluetooth_gatt": True,
     "sensors": True,
     "file_transfer": True,
     "bluetooth_scan": True,
@@ -101,9 +105,10 @@ _DETAIL = {
     "audio.bluetooth_sco": "simulated: no Bluetooth radio",
     "camera.back": "simulated: no camera behind these synthetic JPEG frames",
     "camera.front": "simulated: no camera behind these synthetic JPEG frames",
-    "sensors": "simulated: no sensors",
-    "file_transfer": "no file method in protocol v1 (Phase 5)",
-    "bluetooth_scan": "no scan method in protocol v1 (Phase 5)",
+    "bluetooth_gatt": "simulated: GATT answers come from a fixed tree, not a radio",
+    "sensors": "simulated: readings are generated, not measured",
+    "file_transfer": "simulated: files land in the simulator's own directory",
+    "bluetooth_scan": "simulated: the device list is fixed, nothing is in the air",
 }
 
 # Which runtime permission gates each capability, mirroring DeviceFacts.kt.
@@ -111,14 +116,101 @@ _DETAIL = {
 # and the permission is granted - the same three-way rule the phone applies.
 _PERMISSION_FOR: dict[str, str] = {
     "audio.capture": "RECORD_AUDIO",
+    "camera.back": "CAMERA",
+    "camera.front": "CAMERA",
+    "bluetooth_scan": "BLUETOOTH_SCAN",
+    "bluetooth_gatt": "BLUETOOTH_CONNECT",
 }
 
 # Implemented today: only the protocol-level pieces. Everything else is a
 # declared hardware row with `usable = false`, exactly like the real app. A test
 # may override this to model a phone that implements one more feature.
 _IMPLEMENTED: frozenset[str] = frozenset(
-    {"audio.bluetooth_sco", "audio.playback", "audio.capture", "camera.back", "camera.front"}
+    {
+        "audio.bluetooth_sco",
+        "audio.playback",
+        "audio.capture",
+        "camera.back",
+        "camera.front",
+        "sensors",
+        "file_transfer",
+        "bluetooth_scan",
+        "bluetooth_gatt",
+    }
 )
+
+#: Simulated sensor catalogue. `kind` values are Android `Sensor.TYPE_*`, which is
+#: what the wire header carries; the PC maps them to names. These are the sensors
+#: an ordinary phone reports, and the detail strings say they are generated.
+_SIM_SENSORS: list[dict[str, Any]] = [
+    {"id": 1, "kind": 1, "name": "Accelerometer", "vendor": "simulated", "min_delay_us": 5000,
+     "max_delay_us": 200000, "max_range": 39.2, "resolution": 0.001, "power_ma": 0.2},
+    {"id": 2, "kind": 4, "name": "Gyroscope", "vendor": "simulated", "min_delay_us": 5000,
+     "max_delay_us": 200000, "max_range": 34.9, "resolution": 0.001, "power_ma": 0.3},
+    {"id": 3, "kind": 2, "name": "Magnetometer", "vendor": "simulated", "min_delay_us": 10000,
+     "max_delay_us": 200000, "max_range": 4900.0, "resolution": 0.15, "power_ma": 0.5},
+    {"id": 4, "kind": 11, "name": "Rotation Vector", "vendor": "simulated",
+     "min_delay_us": 5000, "max_delay_us": 200000, "max_range": 1.0, "resolution": 1e-05,
+     "power_ma": 0.3},
+    {"id": 5, "kind": 5, "name": "Light", "vendor": "simulated", "min_delay_us": 200000,
+     "max_delay_us": 1000000, "max_range": 100000.0, "resolution": 1.0, "power_ma": 0.1},
+    {"id": 6, "kind": 8, "name": "Proximity", "vendor": "simulated", "min_delay_us": 200000,
+     "max_delay_us": 1000000, "max_range": 5.0, "resolution": 1.0, "power_ma": 0.1},
+    {"id": 7, "kind": 19, "name": "Step Counter", "vendor": "simulated", "min_delay_us": 200000,
+     "max_delay_us": 1000000, "max_range": 1000000.0, "resolution": 1.0, "power_ma": 0.1},
+]
+
+#: A tiny, plausible GATT tree: battery service (readable level + notify) and a
+#: vendor service with a writable characteristic. It is fixed data, not a radio.
+_SIM_GATT_SERVICES: list[dict[str, Any]] = [
+    {
+        "uuid": "0000180f-0000-1000-8000-00805f9b34fb",
+        "characteristics": [
+            {
+                "uuid": "00002a19-0000-1000-8000-00805f9b34fb",
+                "properties": ["read", "notify"],
+                "descriptors": ["00002902-0000-1000-8000-00805f9b34fb"],
+            }
+        ],
+    },
+    {
+        "uuid": "0000180a-0000-1000-8000-00805f9b34fb",
+        "characteristics": [
+            {"uuid": "00002a29-0000-1000-8000-00805f9b34fb", "properties": ["read"]},
+        ],
+    },
+    {
+        "uuid": "0000ffe0-0000-1000-8000-00805f9b34fb",
+        "characteristics": [
+            {
+                "uuid": "0000ffe1-0000-1000-8000-00805f9b34fb",
+                "properties": ["write", "write_no_response", "notify"],
+            }
+        ],
+    },
+]
+
+#: Devices a simulated scan reports, with the RSSI values an office would show.
+_SIM_BLE_DEVICES: list[dict[str, Any]] = [
+    {"address": "C4:7F:51:00:00:01", "name": "Heart Rate Band", "rssi": -54,
+     "service_uuids": ["0000180d-0000-1000-8000-00805f9b34fb"], "connectable": True},
+    {"address": "E1:2A:9B:00:00:02", "name": "Thermo Beacon", "rssi": -71,
+     "service_uuids": ["00001809-0000-1000-8000-00805f9b34fb"], "connectable": True},
+    {"address": "F0:0D:1C:00:00:03", "name": "", "rssi": -88,
+     "service_uuids": [], "connectable": False},
+]
+
+
+def _default_outbound() -> bytes:
+    """A small file the simulator can offer when the PC asks for one."""
+    return (
+        b"PhoneBridge simulator file\n"
+        b"----------------------------------------\n"
+        b"This file is generated by tools/simulator/phone_sim.py.\n"
+        b"It exists so the PC's receive path, chunking, acknowledgements and\n"
+        b"SHA-256 verification can be exercised without a phone.\n"
+    )
+
 
 #: A real, decodable 1x1 JPEG — the simulator has no camera, and says so in the
 #: frame's `detail`, but a synthetic picture still exercises the whole receive
@@ -140,9 +232,14 @@ _SYNTHETIC_JPEG = bytes.fromhex(
 
 # The runtime permission snapshot the app would report (docs/03 §6).
 DEFAULT_PERMISSIONS: dict[str, str] = {
+    # A simulated Android 14 phone where the user allowed the camera and the two
+    # Bluetooth powers but never the microphone: that makes the "usable" and
+    # "blocked by permission" paths both reachable in tests.
     "RECORD_AUDIO": "denied",
     "POST_NOTIFICATIONS": "granted",
-    "BLUETOOTH_CONNECT": "not_applicable",
+    "CAMERA": "granted",
+    "BLUETOOTH_CONNECT": "granted",
+    "BLUETOOTH_SCAN": "granted",
 }
 
 
@@ -249,6 +346,47 @@ class SimulatedPhone:
     camera_permission: bool = True
     camera_frames_sent: int = 0
     camera_seq: int = 0
+
+    # --- Phase 5 sensors ------------------------------------------------ #
+    #: Simulated: readings are computed, never measured, and every reply says so.
+    sensor_streaming: dict[str, Any] = field(
+        default_factory=lambda: {
+            "active": [],
+            "interval_us": 20000,
+            "seq": {},
+            "frames": 0,
+            "started_at": 0.0,
+        }
+    )
+    sensor_permission: bool = True
+    #: Emit readings on their own while a stream is active, the way a phone does.
+    #: A test that wants to drive the frames by hand sets this to False.
+    sensor_auto_emit: bool = True
+
+    # --- Phase 5 files -------------------------------------------------- #
+    #: Where the simulated phone puts files it receives. A real phone uses SAF.
+    file_dir: Path | None = None
+    files: dict[int, dict[str, Any]] = field(default_factory=dict)
+    file_next_id: int = 1
+    file_offers: int = 0
+    file_requests: int = 0
+    #: Bytes the simulator will offer when the PC asks for a file.
+    outbound_file: tuple[str, bytes] | None = None
+
+    # --- Phase 5 Bluetooth ---------------------------------------------- #
+    ble: dict[str, Any] = field(
+        default_factory=lambda: {
+            "scanning": False,
+            "scanned_uuids": [],
+            "connected": {},
+            "started_at_ms": 0,
+            "duration_ms": 0,
+            "devices_seen": {},
+        }
+    )
+    ble_permission: bool = True
+    ble_enabled: bool = True
+    ble_supported_flag: bool = True
     started_at: float = field(default_factory=time.time)
 
     # ------------------------------------------------------------------ #
@@ -422,6 +560,358 @@ class SimulatedPhone:
         def _mic_stop(_params: dict[str, Any]) -> dict[str, Any]:
             self.audio["mic"] = "idle"
             return {"ok": True, "mic": "idle"}
+
+        # --- Phase 5 sensors -------------------------------------------------- #
+        @r.register("sensor.list")
+        def _sensor_list(params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "sensors": _SIM_SENSORS,
+                "interval_us": int((params or {}).get("interval_us") or 20000),
+                "permitted": self.sensor_permission,
+                "simulated": "readings are generated by the simulator, not measured",
+            }
+
+        @r.register("sensor.start")
+        def _sensor_start(params: dict[str, Any]) -> dict[str, Any]:
+            if not self.sensor_permission:
+                raise RpcError(
+                    "sensor_denied",
+                    "no sensor permission on the phone (simulator: sensor_permission=False)",
+                )
+            params = params or {}
+            ids = [int(v) for v in params.get("ids") or []]
+            known = {int(entry["id"]) for entry in _SIM_SENSORS}
+            unknown = [i for i in ids if i not in known]
+            if unknown:
+                raise RpcError("bad_params", f"this phone has no sensor(s) {unknown}")
+            interval = int(params.get("interval_us") or 20000)
+            if not 1000 <= interval <= 10_000_000:
+                raise RpcError("bad_params", f"unsupported sampling interval {interval}")
+            self.sensor_streaming["active"] = ids
+            self.sensor_streaming["interval_us"] = interval
+            self.sensor_streaming["seq"] = {i: 0 for i in ids}
+            self.sensor_streaming["started_at"] = time.monotonic()
+            if self.sensor_auto_emit:
+                self._ensure_sensor_emitter()
+            return {
+                "ok": True,
+                "active": ids,
+                "interval_us": interval,
+                "simulated": True,
+            }
+
+        @r.register("sensor.stop")
+        def _sensor_stop(_params: dict[str, Any]) -> dict[str, Any]:
+            stopped = list(self.sensor_streaming["active"])
+            self.sensor_streaming["active"] = []
+            self.sensor_streaming["started_at"] = 0.0
+            return {"ok": True, "active": [], "stopped": stopped}
+
+        @r.register("sensor.status")
+        def _sensor_status(_params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "active": list(self.sensor_streaming["active"]),
+                "interval_us": self.sensor_streaming["interval_us"],
+                "frames_sent": self.sensor_streaming["frames"],
+                "permitted": self.sensor_permission,
+                "simulated": True,
+            }
+
+        # --- Phase 5 files ---------------------------------------------------- #
+        @r.register("file.offer")
+        def _file_offer(params: dict[str, Any]) -> dict[str, Any]:
+            from phonebridge.files.frames import safe_name  # noqa: PLC0415
+
+            params = params or {}
+            try:
+                name = safe_name(str(params.get("name") or ""))
+            except ValueError as exc:
+                raise RpcError("bad_name", f"refusing that file name: {exc}") from exc
+            size = int(params.get("size") or 0)
+            digest = str(params.get("sha256") or "")
+            if size < 0:
+                raise RpcError("bad_params", "size may not be negative")
+            if not digest:
+                raise RpcError("bad_params", "a SHA-256 is required for every transfer")
+            transfer_id = self.file_next_id
+            self.file_next_id += 1
+            target = (self.file_dir or Path.cwd()) / name
+            self.files[transfer_id] = {
+                "name": name,
+                "size": size,
+                "sha256": digest,
+                "direction": "to_phone",
+                "state": "receiving",
+                "data": bytearray(),
+                "target": str(target),
+                "chunk_size": int(params.get("chunk_size") or 65536),
+            }
+            self.file_offers += 1
+            return {
+                "ok": True,
+                "transfer_id": transfer_id,
+                "resume_from": 0,
+                "chunk_size": int(params.get("chunk_size") or 65536),
+                "simulated": "the simulator writes into its own directory, not SAF",
+            }
+
+        @r.register("file.request")
+        def _file_request(_params: dict[str, Any]) -> dict[str, Any]:
+            import asyncio as _asyncio  # noqa: PLC0415
+            import hashlib as _hashlib  # noqa: PLC0415
+
+            name, payload = self.outbound_file or ("simulator-note.txt", _default_outbound())
+            transfer_id = self.file_next_id
+            self.file_next_id += 1
+            digest = _hashlib.sha256(payload).hexdigest()
+            self.files[transfer_id] = {
+                "name": name,
+                "size": len(payload),
+                "sha256": digest,
+                "direction": "to_pc",
+                "state": "sending",
+                "data": bytearray(payload),
+                "chunk_size": 65536,
+            }
+            self.file_requests += 1
+            _asyncio.get_event_loop().create_task(self._send_file_chunks(transfer_id))
+            return {
+                "ok": True,
+                "transfer_id": transfer_id,
+                "name": name,
+                "size": len(payload),
+                "sha256": digest,
+                "chunk_size": 65536,
+            }
+
+        @r.register("file.complete")
+        def _file_complete(params: dict[str, Any]) -> dict[str, Any]:
+            import hashlib as _hashlib  # noqa: PLC0415
+
+            transfer_id = int((params or {}).get("transfer_id") or 0)
+            entry = self.files.get(transfer_id)
+            if entry is None:
+                raise RpcError("bad_params", f"unknown transfer {transfer_id}")
+            data = bytes(entry["data"])
+            actual = _hashlib.sha256(data).hexdigest()
+            verified = actual == entry["sha256"]
+            entry["state"] = "complete" if verified else "failed"
+            if verified:
+                try:
+                    Path(entry["target"]).write_bytes(data)
+                except OSError as exc:  # pragma: no cover - disk trouble is not a protocol bug
+                    raise RpcError("internal", f"could not store the file: {exc}") from exc
+            return {
+                "ok": verified,
+                "verified": verified,
+                "sha256": actual,
+                "bytes": len(data),
+                "path": entry["target"] if verified else "",
+            }
+
+        @r.register("file.progress")
+        def _file_progress(params: dict[str, Any]) -> dict[str, Any]:
+            transfer_id = int((params or {}).get("transfer_id") or 0)
+            entry = self.files.get(transfer_id)
+            if entry is None:
+                raise RpcError("bad_params", f"unknown transfer {transfer_id}")
+            return {
+                "transfer_id": transfer_id,
+                "state": entry["state"],
+                "bytes": len(entry["data"]),
+                "size": entry["size"],
+                "sha256": entry["sha256"],
+            }
+
+        @r.register("file.cancel")
+        def _file_cancel(params: dict[str, Any]) -> dict[str, Any]:
+            transfer_id = int((params or {}).get("transfer_id") or 0)
+            entry = self.files.get(transfer_id)
+            if entry is not None:
+                entry["state"] = "cancelled"
+            return {"ok": True, "transfer_id": transfer_id}
+
+        @r.register("file.pause")
+        def _file_pause(params: dict[str, Any]) -> dict[str, Any]:
+            transfer_id = int((params or {}).get("transfer_id") or 0)
+            entry = self.files.get(transfer_id)
+            if entry is not None:
+                entry["state"] = "paused"
+            return {"ok": True, "transfer_id": transfer_id}
+
+        @r.register("file.resume")
+        def _file_resume(params: dict[str, Any]) -> dict[str, Any]:
+            transfer_id = int((params or {}).get("transfer_id") or 0)
+            entry = self.files.get(transfer_id)
+            if entry is None:
+                raise RpcError("bad_params", f"unknown transfer {transfer_id}")
+            from_bytes = int((params or {}).get("from_bytes") or 0)
+            entry["state"] = "sending"
+            if from_bytes:
+                # The simulator can honour a byte offset: it holds the whole file.
+                entry["restart_from"] = from_bytes
+            return {"ok": True, "transfer_id": transfer_id, "from_bytes": from_bytes}
+
+        # --- Phase 5 Bluetooth ------------------------------------------------ #
+        @r.register("bluetooth.adapter.status")
+        def _ble_adapter(_params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "supported": self.ble_supported_flag,
+                "enabled": self.ble_enabled,
+                "le_supported": self.ble_supported_flag,
+                "name": "simulated-radio",
+                "address": "00:11:22:33:44:55",
+                "permitted": self.ble_permission,
+                "detail": "" if self.ble_enabled else "Bluetooth is turned off on the phone",
+            }
+
+        @r.register("bluetooth.scan.start")
+        def _ble_scan_start(params: dict[str, Any]) -> dict[str, Any]:
+            import asyncio as _asyncio  # noqa: PLC0415
+
+            if not self.ble_supported_flag:
+                raise RpcError("no_bluetooth", "this device has no Bluetooth radio")
+            if not self.ble_permission:
+                raise RpcError("bluetooth_denied", "the Bluetooth scan permission is not granted")
+            if not self.ble_enabled:
+                raise RpcError("bluetooth_off", "Bluetooth is turned off on the phone")
+            params = params or {}
+            duration = int(params.get("duration_ms") or 0)
+            uuids = [str(u) for u in params.get("filter_uuids") or []]
+            self.ble.update(
+                {
+                    "scanning": True,
+                    "started_at_ms": int(time.monotonic() * 1000),
+                    "duration_ms": duration,
+                    "scanned_uuids": uuids,
+                }
+            )
+            _asyncio.get_event_loop().create_task(self._run_ble_scan(duration))
+            return {
+                "ok": True,
+                "scanning": True,
+                "started_at_ms": self.ble["started_at_ms"],
+                "duration_ms": duration,
+                "simulated": "the device list is fixed; nothing is transmitting",
+            }
+
+        @r.register("bluetooth.scan.stop")
+        def _ble_scan_stop(_params: dict[str, Any]) -> dict[str, Any]:
+            self.ble["scanning"] = False
+            return {
+                "ok": True,
+                "scanning": False,
+                "devices": list(self.ble["devices_seen"].values()),
+            }
+
+        @r.register("bluetooth.scan.results")
+        def _ble_scan_results(_params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "scanning": self.ble["scanning"],
+                "started_at_ms": self.ble["started_at_ms"],
+                "duration_ms": self.ble["duration_ms"],
+                "devices": list(self.ble["devices_seen"].values()),
+                "detail": "simulated device list",
+            }
+
+        @r.register("bluetooth.gatt.connect")
+        def _ble_connect(params: dict[str, Any]) -> dict[str, Any]:
+            if not self.ble_permission:
+                raise RpcError("bluetooth_denied", "the Bluetooth permission is not granted")
+            address = str((params or {}).get("address") or "")
+            if address not in self.ble["devices_seen"]:
+                raise RpcError("not_found", f"{address} is not in the scan results")
+            if not self.ble["devices_seen"][address].get("connectable", True):
+                raise RpcError("not_connectable", f"{address} does not accept connections")
+            self.ble["connected"][address] = "connected"
+            return {"ok": True, "address": address, "state": "connected"}
+
+        @r.register("bluetooth.gatt.services")
+        def _ble_services(params: dict[str, Any]) -> dict[str, Any]:
+            address = str((params or {}).get("address") or "")
+            if address not in self.ble["connected"]:
+                raise RpcError("not_connected", f"{address} is not connected")
+            return {
+                "address": address,
+                "mtu": 185,
+                "services": _SIM_GATT_SERVICES,
+                "simulated": True,
+            }
+
+        @r.register("bluetooth.gatt.read")
+        def _ble_read(params: dict[str, Any]) -> dict[str, Any]:
+            import base64 as _base64  # noqa: PLC0415
+
+            params = params or {}
+            address = str(params.get("address") or "")
+            if address not in self.ble["connected"]:
+                raise RpcError("not_connected", f"{address} is not connected")
+            char = str(params.get("characteristic") or "").lower()
+            if "2a19" not in char:
+                raise RpcError(
+                    "not_supported",
+                    "this characteristic is not readable in the simulator "
+                    "(only the battery level, 2a19, is)",
+                )
+            return {
+                "ok": True,
+                "value_b64": _base64.b64encode(bytes([87])).decode("ascii"),
+                "bytes": 1,
+                "simulated": True,
+            }
+
+        @r.register("bluetooth.gatt.write")
+        def _ble_write(params: dict[str, Any]) -> dict[str, Any]:
+            import base64 as _base64  # noqa: PLC0415
+
+            params = params or {}
+            address = str(params.get("address") or "")
+            if address not in self.ble["connected"]:
+                raise RpcError("not_connected", f"{address} is not connected")
+            try:
+                raw = _base64.b64decode(str(params.get("value_b64") or ""), validate=True)
+            except Exception as exc:  # noqa: BLE001
+                raise RpcError("bad_params", f"value is not base64: {exc}") from exc
+            if len(raw) > 512:
+                raise RpcError("bad_params", "a characteristic value may not exceed 512 bytes")
+            return {"ok": True, "bytes": len(raw), "simulated": True}
+
+        @r.register("bluetooth.gatt.subscribe")
+        def _ble_subscribe(params: dict[str, Any]) -> dict[str, Any]:
+            import asyncio as _asyncio  # noqa: PLC0415
+
+            params = params or {}
+            address = str(params.get("address") or "")
+            if address not in self.ble["connected"]:
+                raise RpcError("not_connected", f"{address} is not connected")
+            enable = bool(params.get("enable", True))
+            if enable:
+                _asyncio.get_event_loop().create_task(
+                    self._emit_ble_notifications(
+                        address,
+                        str(params.get("service") or ""),
+                        str(params.get("characteristic") or ""),
+                    )
+                )
+            return {"ok": True, "subscribed": enable, "simulated": True}
+
+        @r.register("bluetooth.gatt.disconnect")
+        def _ble_disconnect(params: dict[str, Any]) -> dict[str, Any]:
+            address = str((params or {}).get("address") or "")
+            self.ble["connected"].pop(address, None)
+            return {"ok": True, "address": address, "state": "disconnected"}
+
+        @r.register("bluetooth.gatt.status")
+        def _ble_status(_params: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "scanning": self.ble["scanning"],
+                "connections": [
+                    {"address": address, "state": state}
+                    for address, state in self.ble["connected"].items()
+                ],
+                "permitted": self.ble_permission,
+                "simulated": True,
+            }
 
         # --- Phase 4 camera -------------------------------------------------- #
         @r.register("camera.start")
@@ -787,6 +1277,11 @@ class SimulatedPhone:
             # way, or a test would pass here and leak a lens on a real phone.
             if not self.connections:
                 self.camera["streaming"] = False
+                # Phase 5: a real phone drops its GATT links and its scan with the
+                # last session (BridgeServer releases them), so the simulator does.
+                self.ble["connected"].clear()
+                self.ble["scanning"] = False
+                self.sensor_streaming["active"] = []
 
     async def _authenticate(
         self,
@@ -997,6 +1492,10 @@ class SimulatedPhone:
                         flags=frame.flags,
                     ).encode()
                     await self._send_frame(ws, _seal(codec, echo, MSG_AUDIO, MIC_STREAM))
+            elif msg_type == MSG_FILE:
+                await self._handle_file_chunk(ws, codec, stream_id, payload)
+            elif msg_type == MSG_SENSOR:
+                log.debug("ignoring sensor frame from the PC (one-way in v1)")
             elif msg_type == MSG_BLOB:
                 self.blobs_echoed += 1
                 # Echo the blob back on the same stream: a clean, boring way to
@@ -1119,6 +1618,245 @@ class SimulatedPhone:
             flags=FLAG_STOP,
         ).encode()
         return await self.emit_camera_body(body)
+
+    # ------------------------------------------------------------------ #
+    # Phase 5: sensors
+    # ------------------------------------------------------------------ #
+    def _ensure_sensor_emitter(self) -> None:
+        """Start the background emitter once, if a stream is active."""
+        task = getattr(self, "_sensor_emitter", None)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - no loop in a sync test
+            return
+        self._sensor_emitter = loop.create_task(
+            self._sensor_emit_loop(), name="sim-sensors"
+        )
+
+    async def _sensor_emit_loop(self) -> None:
+        """Emit one reading per active sensor every sampling interval.
+
+        This is what a phone does: the listener fires on its own schedule. The
+        simulator needs it so the PC's measured rates are real measurements of a
+        real stream, and so `phonebridge selftest` can exercise one. A test that
+        needs exact counts turns [sensor_auto_emit] off and drives the frames
+        itself.
+        """
+        while True:
+            active = list(self.sensor_streaming["active"])
+            if not active or not self.connections:
+                return
+            interval_us = max(5_000, int(self.sensor_streaming["interval_us"] or 20000))
+            await asyncio.sleep(min(interval_us / 1_000_000, 0.2))
+            if not self.sensor_streaming["active"]:
+                return
+            try:
+                await self.emit_sensor_frames(1)
+            except Exception as exc:  # noqa: BLE001 - a stream must not kill the phone
+                log.warning("simulated sensor emitter stopped: %s", exc)
+                return
+
+    async def emit_sensor_frames(self, count: int = 3, *, interval_us: int | None = None) -> int:
+        """Send synthetic readings for every active sensor (tests do this).
+
+        The values are computed from a sine wave, not measured, and the capability
+        detail says so. What is *real* is the framing: header, per-sensor sequence
+        numbers, timestamps and the PC's duplicate/gap accounting.
+        """
+        from phonebridge.protocol.messages import MSG_SENSOR as _MSG_SENSOR  # noqa: PLC0415
+        from phonebridge.sensors.frames import SENSOR_STREAM, SensorFrame  # noqa: PLC0415
+
+        active = list(self.sensor_streaming["active"])
+        if not active:
+            return 0
+        interval = int(interval_us or self.sensor_streaming["interval_us"] or 20000)
+        catalogue = {int(entry["id"]): entry for entry in _SIM_SENSORS}
+        sent = 0
+        for step in range(count):
+            for sensor_id in active:
+                entry = catalogue.get(sensor_id)
+                if entry is None:
+                    continue
+                seq = int(self.sensor_streaming["seq"].get(sensor_id, 0))
+                axes = 1
+                if entry["kind"] in {1, 2, 4, 9, 10, 14, 16}:
+                    axes = 3
+                elif entry["kind"] in {11, 15, 20}:
+                    axes = 4
+                phase = step * 0.15
+                if axes == 1:
+                    values = (round(1.0 + step * 0.1, 3),)
+                elif axes == 3:
+                    values = (
+                        round(0.2 * (step + 1), 3),
+                        round(9.81 * (1.0 if sensor_id == 1 else 0.1), 3),
+                        round(0.05 * sensor_id, 3),
+                    )
+                else:
+                    values = (0.0, 0.0, 0.0, 1.0)
+                started = float(self.sensor_streaming.get("started_at") or 0.0)
+                elapsed_ms = int((time.monotonic() - started) * 1000) if started else 0
+                body = SensorFrame(
+                    sensor_id=sensor_id,
+                    seq=seq & 0xFFFF,
+                    timestamp_ms=elapsed_ms + int(step * interval / 1000),
+                    kind=int(entry["kind"]),
+                    values=values + (0.0,) * (axes - len(values)),
+                ).encode()
+                self.sensor_streaming["seq"][sensor_id] = (seq + 1) & 0xFFFF
+                for ws, codec in list(self.connections):
+                    try:
+                        await self._send_frame(
+                            ws, _seal(codec, body, _MSG_SENSOR, SENSOR_STREAM)
+                        )
+                        sent += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+                self.sensor_streaming["frames"] += 1
+                del phase
+        return sent
+
+    # ------------------------------------------------------------------ #
+    # Phase 5: files
+    # ------------------------------------------------------------------ #
+    async def _handle_file_chunk(
+        self, ws: ServerConnection, codec: SecureCodec, stream_id: int, payload: bytes
+    ) -> None:
+        """Receive one file chunk, acknowledge it, and verify at the end."""
+        import hashlib as _hashlib  # noqa: PLC0415
+
+        from phonebridge.files.frames import (  # noqa: PLC0415
+            FILE_STREAM_TO_PC,
+            FLAG_ACK,
+            FLAG_CANCEL,
+            FLAG_END,
+            FileChunk,
+            FileFrameError,
+            decode_chunk,
+        )
+        from phonebridge.protocol.messages import MSG_FILE as _MSG_FILE  # noqa: PLC0415
+
+        try:
+            chunk = decode_chunk(payload)
+        except FileFrameError as exc:
+            log.warning("bad file chunk: %s", exc)
+            return
+        if chunk.flags & FLAG_ACK:
+            return
+        entry = self.files.get(chunk.transfer_id)
+        if entry is None or entry.get("direction") != "to_phone":
+            if not (chunk.flags & FLAG_CANCEL):
+                reply = FileChunk(
+                    transfer_id=chunk.transfer_id, chunk_index=0, flags=FLAG_CANCEL
+                ).encode()
+                await self._send_frame(
+                    ws, _seal(codec, reply, _MSG_FILE, FILE_STREAM_TO_PC)
+                )
+            return
+        if chunk.flags & FLAG_CANCEL:
+            entry["state"] = "cancelled"
+            return
+        entry["data"].extend(chunk.payload)
+        entry["state"] = "receiving"
+        if chunk.flags & FLAG_END:
+            entry["state"] = "received"
+            entry["sha256_actual"] = _hashlib.sha256(bytes(entry["data"])).hexdigest()
+        ack = FileChunk(
+            transfer_id=chunk.transfer_id,
+            chunk_index=chunk.chunk_index,
+            flags=FLAG_ACK,
+        ).encode()
+        await self._send_frame(ws, _seal(codec, ack, _MSG_FILE, FILE_STREAM_TO_PC))
+
+    async def _send_file_chunks(self, transfer_id: int) -> None:
+        """Stream an offered file to every connected PC, acknowledging nothing."""
+        from phonebridge.files.frames import (  # noqa: PLC0415
+            FILE_STREAM_TO_PC,
+            FLAG_END,
+            FLAG_START,
+            FileChunk,
+        )
+        from phonebridge.protocol.messages import MSG_FILE as _MSG_FILE  # noqa: PLC0415
+
+        entry = self.files.get(transfer_id)
+        if entry is None:
+            return
+        data = bytes(entry["data"])
+        chunk_size = int(entry.get("chunk_size") or 65536)
+        total = max(1, -(-len(data) // chunk_size))
+        for index in range(total):
+            block = data[index * chunk_size : (index + 1) * chunk_size]
+            flags = 0
+            if index == 0:
+                flags |= FLAG_START
+            if index == total - 1:
+                flags |= FLAG_END
+            body = FileChunk(
+                transfer_id=transfer_id, chunk_index=index, flags=flags, payload=block
+            ).encode()
+            for ws, codec in list(self.connections):
+                try:
+                    await self._send_frame(ws, _seal(codec, body, _MSG_FILE, FILE_STREAM_TO_PC))
+                except Exception:  # noqa: BLE001
+                    pass
+
+    # ------------------------------------------------------------------ #
+    # Phase 5: Bluetooth
+    # ------------------------------------------------------------------ #
+    async def _run_ble_scan(self, duration_ms: int) -> None:
+        """Report the fixed device list, one event per device, then stop."""
+        import asyncio as _asyncio  # noqa: PLC0415
+
+        for index, device in enumerate(_SIM_BLE_DEVICES):
+            await _asyncio.sleep(0.02)
+            now_ms = int(time.monotonic() * 1000)
+            payload = dict(device)
+            payload.setdefault("sightings", 1)
+            payload["first_seen_ms"] = now_ms
+            payload["last_seen_ms"] = now_ms
+            # Each device is seen twice: that is how duplicate handling gets
+            # exercised over a real socket rather than only in a unit test.
+            for _repeat in range(2):
+                existing = self.ble["devices_seen"].get(payload["address"])
+                if existing is not None:
+                    existing["sightings"] = int(existing.get("sightings", 1)) + 1
+                    existing["rssi"] = payload["rssi"] - 3
+                    existing["last_seen_ms"] = now_ms
+                else:
+                    self.ble["devices_seen"][payload["address"]] = dict(payload)
+                await self.push_event(
+                    "bluetooth.device",
+                    dict(self.ble["devices_seen"][payload["address"]]),
+                )
+                await _asyncio.sleep(0.01)
+            del index
+        self.ble["scanning"] = False
+        await self.push_event("bluetooth.scan", {"state": "stopped", "detail": ""})
+        if duration_ms:
+            log.debug("simulated scan finished after %d ms", duration_ms)
+
+    async def _emit_ble_notifications(
+        self, address: str, service: str, characteristic: str
+    ) -> None:
+        import asyncio as _asyncio  # noqa: PLC0415
+        import base64 as _base64  # noqa: PLC0415
+
+        for level in (87, 86, 84):
+            await _asyncio.sleep(0.02)
+            await self.push_event(
+                "bluetooth.notification",
+                {
+                    "address": address,
+                    "service": service
+                    or "0000180f-0000-1000-8000-00805f9b34fb",
+                    "characteristic": characteristic
+                    or "00002a19-0000-1000-8000-00805f9b34fb",
+                    "value_b64": _base64.b64encode(bytes([level])).decode("ascii"),
+                    "ts_ms": level,
+                },
+            )
 
     async def push_event(self, name: str, data: dict[str, Any]) -> int:
         """Send an unsolicited event to every connected PC.  Returns the count.

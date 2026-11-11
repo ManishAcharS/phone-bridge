@@ -82,6 +82,7 @@ CAPABILITY_KEYS = {
     "sensors",
     "file_transfer",
     "bluetooth_scan",
+    "bluetooth_gatt",
 }
 
 
@@ -106,25 +107,41 @@ def test_no_capability_is_hard_coded_as_supported() -> None:
 
 
 def test_only_shipped_phases_are_marked_implemented() -> None:
-    """`implemented` may only be true for phases that actually shipped.
+    """`implemented` may only be true for a phase that shipped *and* whose engines exist.
 
-    Through Phase 1 every row was false, and the test said "nothing". Phases 2 and
-    4 shipped audio and the camera, so the honest assertion is now per key: those
-    two are implemented, and everything still waiting (sensors, file transfer,
-    Bluetooth scanning) must stay false or absent.
+    Phases 2, 4 and 5 are in: audio, the camera, sensors, files and both Bluetooth
+    powers. The four capability rows that are still not implemented (they belong to
+    no shipped phase) all sit in the audio group, so nothing may be `false` by
+    accident: every row below must be `true`, and the phones' engines must exist for
+    each of them.
     """
     rows = read(DEVICE_FACTS)
-    assert "implemented = false" in rows, "unshipped rows must still say false"
-    implemented = set(re.findall(r'key = "([a-z_.]+)"[^)]*?implemented = true', rows, re.S))
-    assert implemented == {"camera.back", "camera.front"}, (
-        f"unexpected implemented rows: {sorted(implemented)}"
-    )
-    for later in ("sensors", "file_transfer", "bluetooth_scan"):
-        start = rows.index(f'key = "{later}"')
-        block = rows[start : start + 400]
-        assert "implemented = false" in block, (
-            f"{later} is not implemented and must say so"
+    implemented = {
+        key
+        for key, block in re.findall(
+            r'key = "([a-z_.]+)"(.*?)(?=CapabilityRow\(|\n\s*\))', rows, re.S
         )
+        if "implemented = true" in block
+    }
+    # Audio's three rows are declared `implemented = false` and marked implemented
+    # in the flat map (they arrived in Phase 2, before the row gained the flag), so
+    # the row-level assertion covers everything else.
+    expected = CAPABILITY_KEYS - {"audio.playback", "audio.capture", "audio.bluetooth_sco"}
+    assert implemented == expected, f"unexpected implemented rows: {sorted(implemented)}"
+    for key in ("audio.playback", "audio.capture"):
+        assert f'out["implemented.{key}"] = true' in rows, (
+            f"{key} shipped in Phase 2 and must be reported as implemented"
+        )
+    # The SCO row is a *route*, not an engine: Phase 2's relay reports it usable
+    # from the audio capability probe, so it has no flat `implemented.` claim.
+    assert 'out["audio.bluetooth_profile"]' in rows
+    # Each implemented capability has an engine behind it, not just a flag.
+    for engine in ("AudioEngine.kt", "CameraEngine.kt", "SensorEngine.kt",
+                   "FileTransferEngine.kt", "BleEngine.kt"):
+        assert (KOTLIN / "net" / engine).exists(), f"{engine} is missing"
+    server = read(BRIDGE_SERVER)
+    for engine in ("audio", "camera", "sensors", "files", "bluetooth"):
+        assert f"private val {engine} = " in server, f"BridgeServer does not own {engine}"
 
 
 def test_capabilities_are_gated_on_hardware_and_permission() -> None:
@@ -211,6 +228,8 @@ RUNTIME_PERMISSIONS = {
     "POST_NOTIFICATIONS",
     "RECORD_AUDIO",
     "BLUETOOTH_CONNECT",
+    "BLUETOOTH_SCAN",
+    "ACCESS_FINE_LOCATION",
     "CAMERA",
 }
 
@@ -245,16 +264,42 @@ def test_no_permission_is_requested_that_the_manifest_does_not_declare() -> None
 
 
 def test_permissions_that_nothing_uses_are_not_declared() -> None:
-    """Holding a permission the app cannot use is a false capability claim."""
+    """Holding a permission the app cannot use is a false capability claim.
+
+    Phase 5 gave the Bluetooth pair and the legacy location permission a real use
+    (scanning for BLE peripherals, and the same job on Android 11 and older), so
+    they moved from `futurePermissions` into `runtime`. What stays true is the rule
+    itself: nothing may be declared without code that exercises it.
+    """
     declared = manifest_permissions()
-    for unused in ("BLUETOOTH_SCAN", "ACCESS_FINE_LOCATION"):
-        assert unused not in declared, (
-            f"{unused} is declared but nothing uses it; add it with the feature"
+    permissions = read(PERMISSIONS)
+    used = {
+        "BLUETOOTH_SCAN": "BleEngine",
+        "ACCESS_FINE_LOCATION": "BleEngine",
+        "BLUETOOTH_CONNECT": "BleEngine",
+    }
+    for name, engine in used.items():
+        assert name in declared, f"{name} is used by {engine} but not declared"
+        assert f"Manifest.permission.{name}" in permissions, (
+            f"{name} must be modelled so the panel can explain it"
         )
-    # ...and the UI says so, instead of leaving the user guessing.
-    future = read(PERMISSIONS)
-    for name in ("BLUETOOTH_SCAN", "ACCESS_FINE_LOCATION"):
-        assert name in future, f"{name} should appear in futurePermissions with a reason"
+    # The legacy location permission is capped: Android 12+ has BLUETOOTH_SCAN and
+    # must not be asked for location.
+    manifest = read(MANIFEST)
+    location = re.search(
+        r'<uses-permission\s+android:name="android\.permission\.ACCESS_FINE_LOCATION"(.*?)/>',
+        manifest,
+        re.S,
+    )
+    assert location is not None and 'android:maxSdkVersion="30"' in location.group(1), (
+        "ACCESS_FINE_LOCATION must be capped at SDK 30"
+    )
+    # `futurePermissions` may not name a permission this build actually uses.
+    future_body = segment_after(permissions, "val futurePermissions", "= listOf(")
+    for name in used:
+        assert f"android.permission.{name}" not in future_body, (
+            f"{name} is used now; it cannot still be listed as a future permission"
+        )
 
 
 def test_denied_and_permanently_denied_are_distinguished() -> None:
@@ -280,9 +325,10 @@ def test_the_permanently_denied_case_opens_app_settings() -> None:
 
 def test_each_permission_explains_why_it_is_needed() -> None:
     text = read(PERMISSIONS)
-    # One per runtime permission: notifications, microphone, Bluetooth, camera.
-    assert text.count("why = ") == 4
-    assert text.count("withoutIt = ") == 4
+    # One pair per runtime permission: notifications, microphone, Bluetooth connect,
+    # Bluetooth scan, legacy location and camera (Phase 5 added two).
+    assert text.count("why = ") == 6
+    assert text.count("withoutIt = ") == 6
     # The panel shows the reason for a denial, not just a red label.
     assert "item.why" in read(PERMISSIONS_CARD)
     assert "item.withoutIt" in read(PERMISSIONS_CARD)
@@ -320,18 +366,27 @@ def test_permission_wire_keys_are_the_real_permission_names() -> None:
 def test_permissions_are_requested_at_the_moment_of_use_not_at_launch() -> None:
     """Every request is triggered by a user action, never by composition.
 
-    Two launchers exist since Phase 4: notifications from `startBridge()`, and the
-    camera from the camera card's Allow button. Both are inside a callback, which
-    is the whole point — nothing asks on launch.
+    Four launches exist since Phase 5: notifications from `startBridge()`, the
+    camera from the camera card's Allow button, the Bluetooth scan permission from
+    the Bluetooth card's Grant button, and the two SAF pickers (folder and files)
+    from the file card. Every one is inside a callback, which is the whole point —
+    nothing asks on launch.
     """
     activity = read(ACTIVITY)
     launch_sites = re.findall(r"\.launch\(", activity)
-    assert len(launch_sites) == 2, (
-        "MainActivity should launch exactly two permission requests: "
-        "notifications from startBridge(), camera from the camera card"
+    assert len(launch_sites) == 5, (
+        "MainActivity should launch exactly five things: two permission requests "
+        "(notifications, camera), the Bluetooth scan permission from its card, and "
+        "the two SAF pickers"
     )
     start = body_after(activity, "fun startBridge()")
     assert "notificationPermission.launch(" in start
+    # Each Phase 5 permission is requested from the button that needs it.
+    assert "bluetoothPermission.launch(permission)" in activity, (
+        "the Bluetooth scan permission must be requested by its own card"
+    )
+    for picker in ("folderPicker.launch(", "filePicker.launch("):
+        assert picker in activity, f"{picker} is missing"
     # No eager request anywhere in the launch path.
     for path in (ACTIVITY,):
         text = read(path)
@@ -466,7 +521,12 @@ def test_nested_maps_are_converted_before_encoding() -> None:
 # --------------------------------------------------------------------------- #
 def test_documented_capability_keys_match_the_code() -> None:
     doc = read(DOCS_PROTOCOL)
-    documented = set(re.findall(r"`((?:audio|camera|file_transfer|sensors|bluetooth_scan)[a-z_.]*)`", doc))
+    documented = set(
+        re.findall(
+            r"`((?:audio|camera|file_transfer|sensors|bluetooth_scan|bluetooth_gatt)[a-z_.]*)`",
+            doc,
+        )
+    )
     missing = CAPABILITY_KEYS - documented
     assert not missing, f"documented nowhere in docs/03: {sorted(missing)}"
     assert "hardware." in doc and "detail." in doc, (

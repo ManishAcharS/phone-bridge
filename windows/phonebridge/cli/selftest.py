@@ -21,21 +21,25 @@ import statistics
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from ..bluetooth import BluetoothLink
 from ..core import compat
 from ..core.session import BridgeSession, SessionError
+from ..files import TransferManager
+from ..sensors import SensorLink
 
 PASS = "PASS"
 FAIL = "FAIL"
 NOT_IMPLEMENTED = "NOT IMPLEMENTED"
 
 #: Workflows the protocol deliberately does not have (docs/03 §6).
-UNSUPPORTED_WORKFLOWS: tuple[tuple[str, str], ...] = (
-    ("file transfer PC -> phone", "no file operation in protocol v1 (Phase 5)"),
-    ("file transfer phone -> PC", "no file operation in protocol v1 (Phase 5)"),
-    ("sensor data retrieval", "no sensor operation in protocol v1 (Phase 5)"),
-)
+#:
+#: Empty since Phase 5: Bluetooth, sensors and file transfer are all real RPCs
+#: now, so there is nothing left for the matrix to disclaim. The mechanism stays
+#: because a future phase that removes a feature must be able to say so again.
+UNSUPPORTED_WORKFLOWS: tuple[tuple[str, str], ...] = ()
 
 #: Required keys per method, from the normative table in docs/03 §6.
 INFO_KEYS = {
@@ -71,6 +75,7 @@ CAPABILITY_KEYS = (
     "sensors",
     "file_transfer",
     "bluetooth_scan",
+    "bluetooth_gatt",
 )
 
 PERMISSION_STATES = {"granted", "denied", "permanently_denied", "not_applicable"}
@@ -138,6 +143,11 @@ class WorkflowRunner:
             ("audio probe report", self.check_probe),
             ("ping round trip", self.check_ping),
             ("binary integrity (blob echo)", self.check_blobs),
+            ("bluetooth scan lifecycle", self.check_bluetooth_scan),
+            ("bluetooth GATT lifecycle", self.check_bluetooth_gatt),
+            ("sensor discovery and stream", self.check_sensors),
+            ("file transfer PC -> phone", self.check_file_send),
+            ("file transfer phone -> PC", self.check_file_receive),
             ("error contract (unknown method)", self.check_unknown_method),
             ("timeout handling", self.check_timeout),
         )
@@ -213,8 +223,8 @@ class WorkflowRunner:
                 raise AssertionError(f"{key} is usable but the hardware is reported absent")
         self.notes["usable"] = usable
         return (
-            f"8 capabilities, {len(usable)} usable ({', '.join(usable) or 'none'}), "
-            f"{len(present)} present in hardware"
+            f"{len(CAPABILITY_KEYS)} capabilities, {len(usable)} usable "
+            f"({', '.join(usable) or 'none'}), {len(present)} present in hardware"
         )
 
     async def check_permissions(self) -> str:
@@ -344,20 +354,25 @@ class WorkflowRunner:
         fast link answers first and the check silently proves nothing (a 1 ms
         limit did exactly that on loopback).
 
-        One subtlety makes a single attempt slightly racy: ``call()`` awaits the
-        send *before* it arms the timer, so on a loopback link the reply can
-        occasionally be read and matched during that await, and the call then
-        returns successfully. That is not a bug in the timeout -- the deadline
-        was met -- but it is not evidence either, so the attempt is repeated a
-        bounded number of times until the timer is the thing that wins. Running
-        out of attempts is a failure, not a pass.
+        A second subtlety decides whether the timer can win at all: ``call()``
+        awaits the send *before* it arms the timer, so with a tiny request on a
+        loopback link the reply can be read and matched during that await, and
+        the call then returns successfully. The fix is to make the request large
+        enough that the reply cannot exist yet when the send returns: a 1 MiB
+        echo takes milliseconds on any link, while the deadline is 1 us. That
+        makes the timer win for reasons that hold on a real phone too, instead of
+        depending on how fast the loop happened to be.
+
+        The attempt is still repeated a bounded number of times, and running out
+        of attempts is a failure: a check that cannot fail is not a check.
         """
+        payload = "x" * (1 << 20)
         attempts = 0
-        for attempts in range(1, 9):
+        for attempts in range(1, 4):
             started = time.perf_counter()
             try:
                 await self.session.call(
-                    "system.echo", {"value": 1}, timeout=IMPOSSIBLE_TIMEOUT_S
+                    "system.echo", {"value": payload}, timeout=IMPOSSIBLE_TIMEOUT_S
                 )
                 continue  # the reply beat the timer; arm it again and retry
             except SessionError as exc:
@@ -375,6 +390,229 @@ class WorkflowRunner:
             f"a {IMPOSSIBLE_TIMEOUT_S * 1e6:.0f} us timeout did not fire in "
             f"{attempts} attempts: the answer beat the deadline every time, which "
             "means the client is not enforcing it"
+        )
+
+    # -- Phase 5: Bluetooth, sensors, files ----------------------------- #
+    async def check_bluetooth_scan(self) -> str:
+        """Scan for a few seconds and check the *lifecycle*, not just the answer."""
+        link = BluetoothLink(self.session)
+        self.session.on_event = link.on_event
+        try:
+            adapter = await link.refresh_adapter()
+            if adapter.permitted is False:
+                raise AssertionError(
+                    "the phone has not granted the Bluetooth scan permission, so a "
+                    "scan cannot be exercised"
+                )
+            if not adapter.enabled:
+                raise AssertionError("Bluetooth is switched off on the phone")
+            if not adapter.supported:
+                raise AssertionError("the phone reports no Bluetooth LE radio")
+            if not await link.start_scan(duration_ms=4000):
+                raise AssertionError(f"the phone refused to scan: {link.snapshot().detail}")
+            if not link.snapshot().scan.scanning:
+                raise AssertionError("the phone accepted a scan but reports it is not scanning")
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline and link.snapshot().scan.scanning:
+                await asyncio.sleep(0.25)
+                await link.refresh_scan()
+            await link.stop_scan()
+            scan = await link.refresh_scan()
+            if scan.scanning:
+                raise AssertionError("the scan was still running after stop_scan")
+            devices = scan.devices
+            for device in devices:
+                if not device.address:
+                    raise AssertionError("a scan result arrived without an address")
+                if not isinstance(device.rssi, int):
+                    raise AssertionError(f"{device.address} has a non-integer RSSI")
+            self.notes["ble_devices"] = devices
+            if not devices:
+                return (
+                    f"adapter {adapter.name or 'unnamed'} scanned and stopped cleanly; "
+                    "no peripheral was in range (a real result, not a failure)"
+                )
+            best = max(devices, key=lambda d: d.rssi)
+            return (
+                f"{len(devices)} peripheral(s) seen in 4 s; strongest "
+                f"{best.display_name or best.address} at {best.rssi} dBm "
+                f"({len(best.service_uuids)} advertised service(s)); scan stopped"
+            )
+        finally:
+            await link.close()
+
+    async def check_bluetooth_gatt(self) -> str:
+        """Connect to *one* peripheral the previous check saw, and exercise GATT."""
+        link = BluetoothLink(self.session)
+        self.session.on_event = link.on_event
+        try:
+            devices = self.notes.get("ble_devices")
+            if devices is None:
+                adapter = await link.refresh_adapter()
+                if adapter.permitted is False or not adapter.enabled:
+                    raise AssertionError("Bluetooth cannot be used on this phone right now")
+                if not await link.start_scan(duration_ms=3000):
+                    raise AssertionError("the phone refused a scan")
+                await asyncio.sleep(3.5)
+                await link.stop_scan()
+                devices = (await link.refresh_scan()).devices
+            candidates = [d for d in devices if d.connectable]
+            if not candidates:
+                raise AssertionError(
+                    "no connectable peripheral was in range, so GATT could not be exercised"
+                )
+            target = candidates[0]
+            connection = await link.connect(target.address)
+            if connection.state != "connected":
+                raise AssertionError(
+                    f"connecting to {target.address} failed: "
+                    f"{connection.error or connection.state}"
+                )
+            try:
+                tree = connection.tree or await link.services(target.address)
+                if not tree.services:
+                    raise AssertionError(f"{target.address} exposed no GATT services")
+                readable = notify = None
+                for service in tree.services:
+                    for characteristic in service.characteristics:
+                        if readable is None and characteristic.can_read:
+                            readable = (service.uuid, characteristic.uuid)
+                        if notify is None and characteristic.can_notify:
+                            notify = (service.uuid, characteristic.uuid)
+                detail = [f"{len(tree.services)} service(s)"]
+                if readable:
+                    value = await link.read(target.address, *readable)
+                    detail.append(f"read {len(value)} B")
+                if notify:
+                    subscribed = await link.subscribe(target.address, *notify)
+                    detail.append("subscribed" if subscribed else "subscribe refused")
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline:
+                        current = link.connection(target.address)
+                        if current and current.notifications:
+                            detail.append(f"{len(current.notifications)} notification(s)")
+                            break
+                        await asyncio.sleep(0.2)
+                    await link.subscribe(target.address, *notify, enable=False)
+            finally:
+                await link.disconnect(target.address)
+            if (link.connection(target.address) or connection).state == "connected":
+                raise AssertionError("the peripheral is still connected after disconnect")
+            return f"{target.address}: " + ", ".join(detail) + "; disconnected cleanly"
+        finally:
+            await link.close()
+
+    async def check_sensors(self) -> str:
+        """Discover, stream two sensors, verify sequence numbers and release."""
+        link = SensorLink(self.session, interval_us=20000)
+        try:
+            registry = await link.refresh()
+            if not registry.sensors:
+                raise AssertionError("the phone reported no sensors at all")
+            chosen = [info.id for info in registry.ordered()][:2]
+            if not await link.start(chosen):
+                raise AssertionError(f"the phone refused to stream: {link.snapshot().detail}")
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                snapshot = link.snapshot()
+                stats = snapshot.stats or {}
+                if all(
+                    stats.get(str(sensor_id), {}).get("received", 0) >= 2
+                    for sensor_id in chosen
+                ):
+                    break
+                await asyncio.sleep(0.1)
+            snapshot = link.snapshot()
+            stats = snapshot.stats or {}
+            received = {
+                sensor_id: stats.get(str(sensor_id), {}).get("received", 0)
+                for sensor_id in chosen
+            }
+            if not any(count >= 2 for count in received.values()):
+                raise AssertionError(
+                    f"no readings arrived in 6 s (state {snapshot.state}: {snapshot.detail})"
+                )
+            for sensor_id in chosen:
+                if stats.get(str(sensor_id), {}).get("invalid", 0):
+                    raise AssertionError(f"sensor {sensor_id} delivered invalid frames")
+                if stats.get(str(sensor_id), {}).get("duplicates", 0):
+                    raise AssertionError(f"sensor {sensor_id} delivered duplicate sequences")
+            interval = link.interval_us
+            readings = snapshot.registry.readings if snapshot.registry else {}
+            await link.stop()
+            if link.state != "idle":
+                raise AssertionError(f"stop left the link in state {link.state!r}")
+            if len(readings) < len([c for c in received.values() if c]):
+                raise AssertionError("a streamed sensor produced no reading")
+            return (
+                f"{len(registry.sensors)} sensor(s) reported, {len(chosen)} streamed at "
+                f"{interval}us, {sum(received.values())} frames with unique sequences, "
+                "stopped and released"
+            )
+        finally:
+            await link.close()
+
+    async def check_file_send(self) -> str:
+        """Send a real file and confirm the phone verified the hash."""
+        import hashlib
+        import tempfile
+
+        # 40 KiB: small enough to be quick, large enough to be a real file.
+        payload = bytes(range(256)) * 160
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "selftest.bin"
+            source.write_bytes(payload)
+            manager = TransferManager(self.session)
+            try:
+                stats = await manager.send_file(source)
+            finally:
+                await manager.close()
+        if stats.state != "complete":
+            raise AssertionError(f"transfer ended {stats.state}: {stats.error}")
+        if not stats.verified:
+            raise AssertionError("the phone did not confirm the SHA-256 of the stored file")
+        if stats.sha256 != hashlib.sha256(payload).hexdigest():
+            raise AssertionError("the verified hash is not the hash of what we sent")
+        return (
+            f"{len(payload)} B in {stats.bytes_done} B of chunks, sha256 verified by the "
+            f"phone ({stats.sha256[:12]}…), {stats.retries} retries"
+        )
+
+    async def check_file_receive(self) -> str:
+        """Ask the phone for a file and verify what arrived, byte for byte."""
+        import hashlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TransferManager(self.session, destination=directory)
+            try:
+                stats = await manager.request_file()
+                deadline = time.monotonic() + 30.0
+                while time.monotonic() < deadline:
+                    current = manager.get(stats.transfer_id)
+                    if current is None:  # pragma: no cover - defensive
+                        break
+                    stats = current
+                    if stats.state in {"complete", "failed", "cancelled"}:
+                        break
+                    await asyncio.sleep(0.1)
+            except SessionError as exc:
+                raise AssertionError(f"the phone refused to send a file: {exc}") from exc
+            finally:
+                await manager.close()
+            if stats.state != "complete":
+                raise AssertionError(f"transfer ended {stats.state}: {stats.error}")
+            if not stats.verified:
+                raise AssertionError("the received file did not verify")
+            received = Path(stats.path)
+            if not received.is_file():
+                raise AssertionError(f"{received} is not on disk after a verified transfer")
+            data = received.read_bytes()
+            if hashlib.sha256(data).hexdigest() != stats.sha256:
+                raise AssertionError("the file on disk does not match the reported hash")
+        return (
+            f"{stats.name}: {len(data)} B received, sha256 matches the file on disk "
+            f"({stats.sha256[:12]}…) and the .part file was renamed atomically"
         )
 
 

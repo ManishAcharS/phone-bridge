@@ -36,6 +36,9 @@ over USB with no adb and no extra protocol.
 │    phonebridge.camera.frames  (Phase 4: JPEG wire format)  │
 │    phonebridge.camera.stream  (Phase 4: start/stop/preview)│
 │    phonebridge.camera.preview (Phase 4: optional Pillow)   │
+│    phonebridge.bluetooth.*    (Phase 5: BLE scan + GATT)   │
+│    phonebridge.sensors.*      (Phase 5: readings, stats)   │
+│    phonebridge.files.*        (Phase 5: chunked, hashed)   │
 │  Not yet written:                                          │
 │    video/camera_sink.py       (pyvirtualcam virtual camera)│
 └────────────────────────────────────────────────────────────┘
@@ -124,8 +127,9 @@ hardware-accelerated. The design does not depend on the curve choice.
 
 * No PySide6 window: the GUI is Tk (`controller/ui/app.py`), which needs no extra
   dependency on a stock Windows Python.
-* No virtual camera device — the preview is a window, not a webcam. Audio and
-  camera modules exist (Phases 2 and 4); the *sinks* for third-party apps do not.
+* No virtual camera device — the preview is a window, not a webcam. Audio,
+  camera, Bluetooth, sensor and file modules exist (Phases 2, 4 and 5); the
+  *sinks* for third-party apps (a virtual camera, a virtual microphone) do not.
   Their interfaces are described in the
   roadmap so the protocol does not need to change to accommodate them.
 * No UDP media transport — added in Phase 2 only if measurements justify it.

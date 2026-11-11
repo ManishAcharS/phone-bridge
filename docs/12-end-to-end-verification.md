@@ -37,7 +37,7 @@ checked by parsing it; `device` = run on a handset (never claimed here).
 | 1 | Authenticated phone ↔ PC connection (handshake, pairing, pinning, refusal) | yes, §2–4 | impl, device **outstanding** | verified | `test_e2e_workflows.py::test_first_connection_pairs_and_pins`, `test_second_connection_authenticates_without_pairing`, `test_protocol_version_refusal_is_terminal`; Phase-1 tests for pin changes and refusals | **PASS** (PC side), device run outstanding |
 | 2 | Phone information (`system.info`) | yes, §6 + device block | impl, device **outstanding** | verified | `test_system_info_schema`, `test_system_info_device_block_is_complete`, `test_handshake_and_rpc_report_the_same_capabilities`, `test_protocol_contract.py::test_kotlin_result_has_every_key_the_docs_require` | **PASS** (PC side), device run outstanding |
 | 3 | Capability inspection (`hardware.*` / usable / `detail.*`) | yes, §6 | impl, device **outstanding** | verified | `test_capability_contract_shape`, `test_capability_usability_follows_the_permission`, `test_selftest_catches_a_capability_that_contradicts_the_hardware` | **PASS** (PC side), device run outstanding |
-| 4 | Permission reporting and gating (`RECORD_AUDIO`, `BLUETOOTH_CONNECT`, `POST_NOTIFICATIONS`) | yes, §6 | impl, device **outstanding** | verified | `test_permissions_report_only_declared_runtime_permissions`, `test_permission_change_is_visible_without_reconnecting`, `test_android_completion.py` (manifest ↔ model ↔ request sites) | **PASS** (PC side), device run outstanding |
+| 4 | Permission reporting and gating (`RECORD_AUDIO`, `BLUETOOTH_CONNECT`, `BLUETOOTH_SCAN`, `ACCESS_FINE_LOCATION` ≤30, `CAMERA`, `POST_NOTIFICATIONS`) | yes, §6 | impl, device **outstanding** | verified | `test_permissions_report_only_declared_runtime_permissions`, `test_permission_change_is_visible_without_reconnecting`, `test_android_completion.py` (manifest ↔ model ↔ request sites) | **PASS** (PC side), device run outstanding |
 | 5 | Session statistics (`session.stats`) | yes, §6 | impl, device **outstanding** | verified | `test_session_stats_schema_and_live_counters` | **PASS** (PC side), device run outstanding |
 | 6 | Bluetooth headset status (`bluetooth.headset.status`) | yes, §6 | impl, device **outstanding** | verified | `test_headset_status_schema` | **PASS** (PC side), device run outstanding |
 | 7 | Audio relay *state* (`audio.route.bluetooth`, honest placeholder) | yes, §6 | impl (placeholder), device **outstanding** | verified | `test_relay_state_is_an_honest_placeholder` | **PASS as a placeholder**; audio itself is #12 |
@@ -45,14 +45,18 @@ checked by parsing it; `device` = run on a handset (never claimed here).
 | 9 | Ping / RTT (`MSG_PING`/`MSG_PONG`) | yes, §5 | impl, device **outstanding** | verified | `test_selftest_passes_every_supported_workflow` (ping row), `test_regressions.py::test_concurrent_pings_all_resolve` | **PASS** (PC side), device run outstanding |
 | 10 | Binary data integrity (BLOB echo, 1 B … 1 MiB, stream isolation) | yes, §5 | impl (`MSG_BLOB` echo), device **outstanding** | verified | `test_blob_echo_is_byte_exact`, `test_zero_length_blob_round_trips`, `test_stream_ids_are_isolated`, `test_interleaved_streams_arrive_on_their_own_stream` | **PASS** (PC side), device run outstanding |
 | 11 | Error contract (unknown method, bad params, internal, timeout, drop) | yes, §6 | impl, device **outstanding** | verified | `test_unknown_method_returns_method_not_found_and_keeps_the_session`, `test_bad_parameters_are_reported_as_bad_params`, `test_a_crashing_handler_becomes_an_internal_error`, `test_a_client_timeout_fails_the_call_not_the_session`, `test_a_dropped_link_fails_quickly_instead_of_hanging` | **PASS** (PC side), device run outstanding |
-| 12 | Audio capture / playback (relay) | **no** | none | none | — (matrix row `NOT IMPLEMENTED`, Phase 2) | **NOT IMPLEMENTED** |
-| 13 | File transfer, PC → phone | **no** | none | none | — (Phase 5) | **NOT IMPLEMENTED** |
-| 14 | File transfer, phone → PC | **no** | none | none | — (Phase 5) | **NOT IMPLEMENTED** |
-| 15 | Camera capture / retrieval | **no** | none | none | — (Phase 4) | **NOT IMPLEMENTED** |
-| 16 | Sensor data retrieval | **no** | none | none | — (Phase 5) | **NOT IMPLEMENTED** |
+| 12 | Audio relay (playback + microphone) | yes, §6 (`MSG_AUDIO`, stream 1/2) | impl, device **outstanding** | verified | `test_audio.py` (62), `test_phase2_e2e.py`, self-test row "audio relay state" | **PASS** (PC side), device run outstanding |
+| 13 | File transfer, PC → phone | yes, §6 (`MSG_FILE`, stream 5) | impl, device **outstanding** | verified | `test_files.py`, `test_phase5_e2e.py::test_send_file_to_the_phone_verifies`, self-test row "file transfer PC -> phone" | **PASS** (PC side), device run outstanding |
+| 14 | File transfer, phone → PC | yes, §6 (`MSG_FILE`, stream 6) | impl, device **outstanding** | verified | `test_files.py` (resume, cancel, wrong hash), `test_phase5_e2e.py::test_receive_file_from_the_phone_verifies`, self-test row "file transfer phone -> PC" | **PASS** (PC side), device run outstanding |
+| 15 | Camera capture / retrieval | yes, §6 (`MSG_VIDEO`, stream 3) | impl, device **outstanding** | verified | `test_camera.py` (66), `test_phase4_e2e.py`, self-test has no camera row (a stream, not an RPC workflow) | **PASS** (PC side), device run outstanding |
+| 16 | Sensor data retrieval | yes, §6 (`MSG_SENSOR`, stream 4) | impl, device **outstanding** | verified | `test_sensors.py` (31), `test_phase5_e2e.py::test_sensor_stream_*`, self-test row "sensor discovery and stream" | **PASS** (PC side), device run outstanding |
+| 17 | Bluetooth LE scan lifecycle | yes, §6 | impl, device **outstanding** | verified | `test_bluetooth.py` (scan lifecycle, denial, radio off, duplicates, RSSI), self-test row "bluetooth scan lifecycle" | **PASS** (PC side), device run outstanding |
+| 18 | Bluetooth GATT lifecycle | yes, §6 | impl, device **outstanding** | verified | `test_bluetooth.py` (connect, discover, read, write, subscribe, disconnect, timeout), `test_phase5_e2e.py`, self-test row "bluetooth GATT lifecycle" | **PASS** (PC side), device run outstanding |
 
-Rows 12–16 are what the self-test prints as `NOT IMPLEMENTED`. They are not
-`SKIP`: skipping would imply the operation exists and was not tried.
+Every row the self-test prints is now a `PASS` against a compliant phone: the
+`NOT IMPLEMENTED` state is empty (`selftest.UNSUPPORTED_WORKFLOWS == ()`), and
+`test_the_self_test_does_not_invent_workflows` fails if a row ever reappears
+while the phone still dispatches the methods it disclaims.
 
 ---
 
@@ -198,25 +202,31 @@ logic.
 
 ---
 
-## 6. Why file transfer, camera, sensors and audio have no workflow
+## 6. Media planes: no workflow was invented, and nothing is left out
 
-`docs/03` §6 defines seven methods and lists the message kinds `0x30 AUDIO`,
-`0x40 VIDEO`, `0x50 FILE`, `0x60 SENSOR` as **reserved numbers only** - no body
-format, no handler, no state machine. The verification confirms this in three
-places rather than assuming it:
+`docs/03` §6 now defines all four media planes with a body format and a handler:
+`0x30 AUDIO` (streams 1/2), `0x40 VIDEO` (3), `0x50 FILE` (5/6) and
+`0x60 SENSOR` (4). `PROTOCOL_VERSION` stayed at **1** — a new message kind and a
+new RPC are additive, and an old client never sends them; the version is bumped
+only when an existing frame changes shape.
 
-* `test_media_message_kinds_are_reserved_without_a_handler` - `BridgeServer.kt`
-  and the reference phone never reference those constants; only `Messages.kt` /
-  `messages.py` declare them.
-* `test_the_self_test_does_not_invent_workflows` - the phone dispatches no
-  method containing "file", "camera" or "sensor".
-* `test_the_cli_calls_nothing_the_protocol_does_not_define` - every method string
-  the CLI sends is one of the seven (plus one deliberate bad name used to prove
-  the error path).
+Three checks keep the matrix honest in the other direction, so a row cannot claim
+a feature that has no handler:
 
-Implementing them is a protocol change with a `PROTOCOL_VERSION` bump and an
-Android implementation (Phases 4 and 5), not a client-side chore. Inventing a
-method here would produce a CLI that "succeeds" against nothing.
+* `test_every_implemented_media_kind_has_a_handler` — every kind the capability
+  table calls implemented is referenced by `BridgeServer.kt`, by the Python
+  constants and by the reference phone.
+* `test_the_self_test_does_not_invent_workflows` — the disclaimer list must be
+  empty while the phone dispatches audio, camera, Bluetooth, sensor and file
+  methods; a stale "not implemented" row would fail it.
+* `test_the_cli_calls_nothing_the_protocol_does_not_define` — every method string
+  the CLI sends is one of the documented ones (plus one deliberate bad name that
+  proves the error path).
+
+The inverse rule still holds too: no device run is claimed anywhere in this
+document. Every Phase 4 and Phase 5 row is `PASS` for *the PC against a compliant
+phone*, and the Android column stays `device outstanding` until the checklists in
+`docs/20` §9, `docs/21` §10, `docs/22` §10 and `docs/23` §11 are executed.
 
 ---
 

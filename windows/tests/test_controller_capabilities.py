@@ -114,7 +114,7 @@ def test_unknown_inputs_stay_unknown() -> None:
 def test_registry_covers_every_documented_capability() -> None:
     registry = build_registry({})
     assert [c.key for c in registry] == list(KEYS)
-    assert len(registry) == 8
+    assert len(registry) == 9
     assert all(c.label for c in registry)
 
 

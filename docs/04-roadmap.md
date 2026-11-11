@@ -8,16 +8,21 @@ Legend: `[x]` implemented and tested · `[~]` partially implemented ·
 | | |
 | --- | --- |
 | Version | `1.0.0` (PC package and Android app) |
-| Gate status | 927 tests (1 skipped), ruff, mypy, `verify.py` 8/8 — all green |
+| Gate status | 1132 tests (1 skipped), ruff, mypy, `verify.py` 8/8 — all green |
 | Open blockers | **B1** no physical-device run · **B2** release APK not built here (plus B3–B6: Play `targetSdk`, keystore, Windows/PowerShell run, Kotlin stub compile) |
 | Ship/no-ship | **Not shippable until B1 and B2 are cleared.** See [`14-release-readiness.md`](14-release-readiness.md). |
 
 Milestones 1–3 of the hardware roadmap (the one-click Windows controller, and the
 USB/hotspot diagnosis pass) are in [`docs/17`](17-connection-controller.md):
 connection manager, transport choice, pairing in the window, reconnection, the
-five-state capability registry, and the USB verdict engine. Feature phases
-(audio, camera, Bluetooth, sensors, files) are still ahead — the table below is
-the honest position, updated as each one lands.
+five-state capability registry, and the USB verdict engine.
+
+Every feature phase is now implemented in software: audio
+([`19`](19-audio.md)), camera ([`20`](20-camera.md)), Bluetooth LE
+([`21`](21-bluetooth.md)), sensors ([`22`](22-sensors.md)) and file transfer
+([`23`](23-file-transfer.md)). What is still missing is the thing no amount of
+software can supply here: **a physical run** (B1). The table below is the honest
+position, updated as each phase landed.
 
 Scope delivered in 1.0.0: Phase 0 (feasibility, architecture, protocol), Phase 1
 (encrypted PC ↔ phone channel, CLI, Android app), the end-to-end verification
@@ -36,14 +41,15 @@ Note 14 Pro+; nothing in this table is marked tested on hardware unless it was.
 | Android Open Accessory | `[ ]` | investigated and documented in [`16`](16-known-limitations.md), deliberately not wired in |
 | Hotspot stability: health checks, bounded backoff, drop explanation, one session per socket | `[x]` | `controller/manager.py`; proven by tests, **not yet proven on a real hotspot** |
 | Wi-Fi discovery, pairing, AES-256-GCM, transport switching, saved endpoints | `[x]` | unchanged from 1.0.0; manual endpoint never defaults to loopback |
-| Separate logical channels (control / audio / camera / BT / sensors / files) | `[ ]` | protocol reserves the message kinds, one RPC channel exists today |
+| Separate logical channels (control / audio / camera / BT / sensors / files) | `[x]` | `stream_id` 0 control, 1/2 audio, 3 video, 4 sensors, 5/6 files; each plane has its own bounded queue, so a stalled plane cannot starve the others |
 | Audio PC → phone (WASAPI loopback → AudioTrack) | `[x]` | Phase 2: `phonebridge/audio/*`, GUI Audio section; 62 automated tests, **not device-tested** |
 | Audio phone → PC (AudioRecord → PC monitor) | `[x]` | Phase 2; the in-app monitor only — no virtual microphone (documented, not claimed) |
 | Camera streaming and Windows preview | `[x]` | Phase 4: `phonebridge/camera/*`, GUI Camera section; 66 automated tests + 10 end-to-end against the reference phone, **not device-tested** |
-| Bluetooth (BLE scan/GATT), sensors | `[ ]` | Phase 5 |
-| File transfer (SAF, chunked, SHA-256, resume) | `[ ]` | Phase 5 |
+| Bluetooth LE scan and GATT (read/write/subscribe) | `[x]` | Phase 5: `BleEngine.kt`, `phonebridge/bluetooth/*`, GUI **Bluetooth** tab; 36 unit + end-to-end tests, **not device-tested** |
+| Sensors (13 kinds, dynamic discovery, per-sensor rates) | `[x]` | Phase 5: `SensorEngine.kt`, `phonebridge/sensors/*`, GUI **Sensors** tab; 31 unit + end-to-end tests, **not device-tested** |
+| File transfer both ways (SAF, chunked, SHA-256, resume, atomic) | `[x]` | Phase 5: `FileTransferEngine.kt`, `phonebridge/files/*`, GUI **Files** tab; 51 unit + 18 end-to-end tests (18 of those cover all three planes), **not device-tested** |
 | Launcher `PhoneBridge-Start.bat` | `[x]` | one-click, self-checking, never resets work |
-| Window sections | `[~]` | Connection, Diagnostics and **Audio** exist; Camera, Bluetooth, Sensors and Files are not drawn until they work |
+| Window sections | `[x]` | Connection, Diagnostics, Audio, Camera and a Phase 5 notebook (**Bluetooth** / **Sensors** / **Files**) — every section is drawn only because the feature behind it works |
 | Android lifecycle audit (compileSdk/targetSdk, foreground-service types, permissions at point of use) | `[ ]` | not started |
 
 No row is marked `[x]` on the strength of a plan, and no window section exists
@@ -172,14 +178,28 @@ Shipped in the camera half (see [`docs/20-camera.md`](20-camera.md)):
 - [ ] Phone microphone as a standalone PC mic (independent of the Bluetooth path)
 - [ ] Document the VB-CABLE routing once, and check it against Discord/Zoom/Meet/OBS
 
-## Phase 5 — File transfer, Bluetooth manager, sensors
+## Phase 5 — Bluetooth LE, sensors, file transfer ✅ (software)
 
-- [ ] File browser limited to what MediaStore/SAF permits (no root)
-- [ ] Chunked upload/download with progress, resume, checksums
-- [ ] BLE scan + device list + authorised GATT read/write
-      `[!]` connecting/pairing arbitrary devices is not exposed to third-party apps
-- [ ] Sensors: accelerometer, gyroscope, orientation, rotation vector
-- [ ] GPS with foreground location permission
+Shipped; the three documents are [`21-bluetooth.md`](21-bluetooth.md),
+[`22-sensors.md`](22-sensors.md) and [`23-file-transfer.md`](23-file-transfer.md).
+
+- [x] File transfer limited to what SAF permits (no root, no storage permission)
+- [x] Chunked transfer both ways with progress, pause/resume, cancel, SHA-256 and
+      atomic completion; `.part` + sidecar resume
+- [x] BLE scan, deduplicated device list, RSSI, advertised services, live GUI updates
+- [x] GATT connect / discover / read / write / subscribe / unsubscribe / disconnect,
+      with timeouts and clean teardown
+      `[!]` bonding and pairing by the app are not attempted: a peripheral that
+      requires a bond fails with the platform's own reason, by design
+- [x] Sensors: 13 kinds including accelerometer, gyroscope, magnetometer, gravity,
+      linear acceleration, rotation vector, game rotation vector, orientation,
+      proximity, light, pressure, step counter and step detector; per-sensor
+      metadata, selectable rate, live readings with sequence numbers
+- [ ] GPS with foreground location permission — **not implemented**: location is
+      not part of this phase, and `ACCESS_FINE_LOCATION` is declared only as the
+      Android ≤11 spelling of Bluetooth scanning (capped at `maxSdkVersion="30"`)
+- [ ] **Manual hardware run** — the checklists in `docs/21` §10, `docs/22` §10 and
+      `docs/23` §11 have not been executed
 
 ## Phase 6 — Reliability and polish
 
@@ -200,8 +220,11 @@ Shipped in the camera half (see [`docs/20-camera.md`](20-camera.md)):
 | Phone as a real Bluetooth adapter for the PC | `[!]` Not possible | A2DP sink is not in the public Android SDK |
 | Phone mic → Discord etc. | Planned (Phase 4) | Needs a VB-CABLE-class device on the PC |
 | Phone camera → PC preview | ✅ Implemented (Phase 4) | 720p/15 JPEG over the encrypted session; verified against the reference phone, not yet on hardware |
+| Bluetooth LE scan / GATT from the PC | ✅ Implemented (Phase 5) | The phone is the radio; the PC drives it over the authenticated session. Real peripherals not yet tested |
+| Phone sensors on the PC | ✅ Implemented (Phase 5) | 13 kinds, per-sensor rate and sequence numbers; real sensors not yet tested |
+| File transfer both ways | ✅ Implemented (Phase 5) | 64 KiB chunks, SHA-256, resume, atomic rename; real storage not yet tested |
 | Phone camera → Zoom/Meet | Planned (later) | Needs OBS Virtual Camera or Unity Capture; the preview is not a virtual device |
-| Arbitrary Bluetooth device management | `[!]` Limited | Scan/BLE GATT yes; connect/pair generally no |
+| Arbitrary Bluetooth device management | `[!]` Limited | Scan and BLE GATT yes (Phase 5); bonding and classic pairing are not attempted |
 | Everything offline, no accounts | ✅ Already true | No network calls leave the machine |
 
 ## Dependency notes
@@ -210,7 +233,7 @@ Phase 1 (installed already): `websockets`, `cryptography`.
 Phase 2: `soundcard` (WASAPI loopback, Windows-only), `sounddevice` (playback to
 a specific endpoint), `numpy`, `av` (bundles libopus — avoids a separate libopus
 install on Windows).
-Phase 3: `PySide6`.
+Phase 3: `PySide6` (not needed — the window stayed tkinter).
 Phase 4: `pyvirtualcam` + OBS Studio or Unity Capture; `opencv-python` if any
 image processing is needed.
 External, not Python: **VB-Audio Cable** (free) or VoiceMeeter for the virtual

@@ -47,11 +47,35 @@ PROTOCOL_V1_METHODS: tuple[str, ...] = (
     "camera.stop",
     "camera.switch",
     "camera.status",
+    # Phase 5: Bluetooth (scan + GATT), sensors and file transfer.
+    "bluetooth.adapter.status",
+    "bluetooth.scan.start",
+    "bluetooth.scan.stop",
+    "bluetooth.scan.results",
+    "bluetooth.gatt.connect",
+    "bluetooth.gatt.services",
+    "bluetooth.gatt.read",
+    "bluetooth.gatt.write",
+    "bluetooth.gatt.subscribe",
+    "bluetooth.gatt.disconnect",
+    "bluetooth.gatt.status",
+    "sensor.list",
+    "sensor.start",
+    "sensor.stop",
+    "sensor.status",
+    "file.offer",
+    "file.request",
+    "file.complete",
+    "file.progress",
+    "file.cancel",
+    "file.pause",
+    "file.resume",
 )
 
 NO_VERB_NOTE = (
-    "file transfer, camera streaming and sensor streams have no RPC in protocol v1, "
-    "so this CLI offers no command that pretends to do them (see docs/04-roadmap.md)."
+    "Phase 5 added Bluetooth, sensors and file transfer to protocol v1; every method "
+    "this CLI calls is listed in docs/03, and anything the protocol does not define "
+    "still has no command (see docs/04-roadmap.md)."
 )
 
 _FLAG = {True: "yes", False: "no", None: "?"}

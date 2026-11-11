@@ -34,6 +34,7 @@ from ..view import (
     build_view,
     parse_endpoint,
 )
+from .planes import PlanesPanel
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,8 @@ class PhoneBridgeApp:
         #: Debounce handle for the volume slider, so a drag is one RPC.
         self._volume_after: str | None = None
         self._last_view: View | None = None
+        #: Counter for the Phase 5 panels' once-a-second redraw.
+        self._ticks = 0
 
         self.runtime = BackgroundRuntime(
             lambda: ConnectionManager(
@@ -96,8 +99,8 @@ class PhoneBridgeApp:
     def _build(self) -> None:
         root = self.root
         root.title(TITLE)
-        root.geometry("960x720")
-        root.minsize(820, 600)
+        root.geometry("1000x840")
+        root.minsize(880, 720)
         root.configure(bg=BACKGROUND)
 
         base = tkfont.nametofont("TkDefaultFont")
@@ -325,6 +328,13 @@ class PhoneBridgeApp:
         self._camera_shown_seq: int | None = None
         self._camera_shown_state: str = "idle"
 
+        # ---- Phase 5: Bluetooth, sensors, files ------------------------ #
+        planes = ttk.Notebook(outer, height=250)
+        planes.pack(fill="both", expand=False, pady=(0, 10))
+        self.planes = PlanesPanel(planes, self.runtime, report=self._report)
+        for title, frame in self.planes.tabs():
+            planes.add(frame, text=title)
+
         caps = ttk.LabelFrame(outer, text="Capabilities", padding=10)
         caps.pack(fill="both", expand=True)
         self.summary_label = tk.Label(
@@ -370,6 +380,10 @@ class PhoneBridgeApp:
     # ------------------------------------------------------------------ #
     # commands
     # ------------------------------------------------------------------ #
+    def _report(self, text: str) -> None:
+        """Say something in the message line without disturbing the snapshot."""
+        self.message_label.configure(text=text)
+
     def _connect(self) -> None:
         self.runtime.connect()
 
@@ -533,6 +547,12 @@ class PhoneBridgeApp:
                 break
         if latest is not None:
             self._apply(build_view(latest))
+        # Phase 5 panels poll the manager (never the network) once a second: a
+        # scan filling up, a sensor reading ticking over and a transfer's byte
+        # count are all changes that produce no snapshot of their own.
+        self._ticks += 1
+        if self._ticks % 12 == 0:
+            self.planes.refresh()
         self.root.after(80, self._pump)
 
     def _apply(self, view: View) -> None:

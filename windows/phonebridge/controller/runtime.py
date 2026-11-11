@@ -202,6 +202,93 @@ class BackgroundRuntime:
         manager = self._manager
         return manager.audio_status() if manager is not None else {}
 
+    # ---- Phase 5: Bluetooth, sensors, files ------------------------------ #
+    def bluetooth_status(self) -> dict[str, object]:
+        manager = self._manager
+        return manager.bluetooth_status() if manager is not None else {}
+
+    def sensor_status(self) -> dict[str, object]:
+        manager = self._manager
+        return manager.sensor_status() if manager is not None else {}
+
+    def files_status(self) -> dict[str, object]:
+        manager = self._manager
+        return manager.files_status() if manager is not None else {}
+
+    def set_files_destination(self, directory: str) -> None:
+        manager = self._manager
+        if manager is not None:
+            manager.set_files_destination(directory)
+
+    def set_sensor_interval(self, interval_us: int) -> None:
+        manager = self._manager
+        if manager is not None:
+            manager.set_sensor_interval(interval_us)
+
+    def start_scan(self, duration_ms: int = 10_000) -> None:
+        """Scan on the phone. Nothing is connected; results are just a list."""
+        self.submit(lambda manager: manager.start_scan(duration_ms=duration_ms))
+
+    def stop_scan(self) -> None:
+        self.submit(lambda manager: manager.stop_scan())
+
+    def connect_device(self, address: str) -> None:
+        """Connect GATT to *this* peripheral, because the user picked it."""
+        self.submit(lambda manager: manager.connect_device(address))
+
+    def disconnect_device(self, address: str) -> None:
+        self.submit(lambda manager: manager.disconnect_device(address))
+
+    def browse_services(self, address: str) -> None:
+        self.submit(lambda manager: manager.gatt_services(address))
+
+    def read_characteristic(self, address: str, service: str, characteristic: str) -> None:
+        self.submit(lambda manager: manager.gatt_read(address, service, characteristic))
+
+    def write_characteristic(
+        self, address: str, service: str, characteristic: str, data: bytes
+    ) -> None:
+        self.submit(
+            lambda manager: manager.gatt_write(address, service, characteristic, data)
+        )
+
+    def subscribe(self, address: str, service: str, characteristic: str, enable: bool) -> None:
+        self.submit(
+            lambda manager: manager.gatt_subscribe(
+                address, service, characteristic, enable=enable
+            )
+        )
+
+    def refresh_sensor_list(self) -> None:
+        """Ask the phone which sensors it has. Cheap, and never starts a stream."""
+
+        async def run(manager: ConnectionManager) -> None:
+            if manager.sensors is not None:
+                await manager.sensors.refresh()
+
+        self.submit(run)
+
+    def start_sensors(self, sensor_ids: list[int] | None = None) -> None:
+        self.submit(lambda manager: manager.start_sensors(sensor_ids))
+
+    def stop_sensors(self) -> None:
+        self.submit(lambda manager: manager.stop_sensors())
+
+    def send_file(self, path: str) -> None:
+        self.submit(lambda manager: manager.send_file(path))
+
+    def receive_file(self, name_hint: str = "") -> None:
+        self.submit(lambda manager: manager.request_file(name_hint))
+
+    def pause_transfer(self, transfer_id: int) -> None:
+        self.submit(lambda manager: manager.pause_transfer(transfer_id))
+
+    def resume_transfer(self, transfer_id: int) -> None:
+        self.submit(lambda manager: manager.resume_transfer(transfer_id))
+
+    def cancel_transfer(self, transfer_id: int) -> None:
+        self.submit(lambda manager: manager.cancel_transfer(transfer_id))
+
     def diagnose_usb(self) -> None:
         """Run the whole USB chain in the controller thread and log the report."""
         self.submit(lambda manager: manager.diagnose_usb())

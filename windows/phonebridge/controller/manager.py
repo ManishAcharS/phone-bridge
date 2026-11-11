@@ -35,6 +35,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from ..audio import ERROR as AUDIO_ERROR
@@ -45,6 +46,8 @@ from ..audio import (
     default_sink_factory,
     default_source_factory,
 )
+from ..bluetooth import BluetoothLink, BluetoothSnapshot
+from ..bluetooth.frames import AdapterStatus, ScanState
 from ..camera import CameraStream, VideoConfig
 from ..camera import preview as camera_preview
 from ..camera.stream import ACTIVE as CAMERA_ACTIVE
@@ -57,6 +60,11 @@ from ..core.session import (
     SessionError,
     TerminalSessionError,
 )
+from ..files import COMPLETE as FILE_COMPLETE
+from ..files import TransferManager
+from ..files.frames import TransferStats
+from ..sensors import SensorLink, SensorSnapshot
+from ..sensors.link import ACTIVE as SENSOR_ACTIVE
 from ..transport.link import DEFAULT_PORT, websocket_uri
 from .adb import Adb
 from .capabilities import Capability, build_registry
@@ -283,6 +291,19 @@ class ConnectionManager:
         self._audio: AudioLink | None = None
         self._camera: CameraStream | None = None
         self._camera_config = VideoConfig()
+        #: Phase 5 planes: Bluetooth, sensors, files. Built with the session and
+        #: closed with it, exactly like audio and the camera — none of them owns a
+        #: socket, so there is still only one authenticated connection.
+        self._bluetooth: BluetoothLink | None = None
+        self._sensors: SensorLink | None = None
+        self._transfers: TransferManager | None = None
+        self._bluetooth_snapshot = BluetoothSnapshot(
+            adapter=AdapterStatus(), scan=ScanState()
+        )
+        self._sensor_snapshot = SensorSnapshot()
+        self._files_directory: Path | None = None
+        self._sensor_ids: list[int] = []
+        self._active_at_publish: set[str] = set()
         self._audio_snapshot = AudioSnapshot()
         self._audio_state_at: float = 0.0
         #: Injected in tests; the real ones need WASAPI/sounddevice on Windows.
@@ -676,6 +697,309 @@ class ConnectionManager:
             pnp=self._device_tree(),
             system=self._system,
         )
+
+    # ------------------------------------------------------------------ #
+    # Bluetooth, sensors and files (Phase 5)
+    #
+    # Each plane is a thin client over the one session: the phone is the radio
+    # endpoint and this PC is the remote control. Two rules hold everywhere here:
+    # nothing connects to a peripheral the user did not pick, and nothing reports
+    # "done" before the phone confirmed it.
+    # ------------------------------------------------------------------ #
+    @property
+    def bluetooth(self) -> BluetoothLink | None:
+        """The live Bluetooth plane, or ``None`` while there is no session."""
+        return self._bluetooth
+
+    @property
+    def sensors(self) -> SensorLink | None:
+        return self._sensors
+
+    @property
+    def transfers(self) -> TransferManager | None:
+        return self._transfers
+
+    def bluetooth_status(self) -> dict[str, Any]:
+        """Everything the Bluetooth section draws, as plain data."""
+        link = self._bluetooth
+        connected = self._session is not None and self._session_established
+        if link is None:
+            return {
+                "available": False,
+                "detail": "not connected: Bluetooth needs a live session",
+                **self._bluetooth_snapshot.to_dict(),
+            }
+        return {"available": connected, **link.snapshot().to_dict()}
+
+    def sensor_status(self) -> dict[str, Any]:
+        """The sensor registry plus the newest reading for each sensor."""
+        link = self._sensors
+        if link is None:
+            return {
+                "available": False,
+                "detail": "not connected: sensors need a live session",
+                **self._sensor_snapshot.to_dict(),
+            }
+        snapshot = link.snapshot()
+        return {
+            "available": self._session is not None and self._session_established,
+            **snapshot.to_dict(),
+            "interval_us": link.interval_us,
+        }
+
+    def files_status(self) -> dict[str, Any]:
+        """Live transfers, finished history and where incoming files land."""
+        manager = self._transfers
+        if manager is None:
+            return {
+                "available": False,
+                "detail": "not connected: file transfer needs a live session",
+                "transfers": [],
+                "history": [],
+                "destination": str(self._files_directory or ""),
+            }
+        return {
+            "available": self._session is not None and self._session_established,
+            "detail": "",
+            "transfers": [stats.to_dict() for stats in manager.transfers],
+            "history": [stats.to_dict() for stats in manager.history()[-20:]],
+            "destination": str(self._files_directory or ""),
+        }
+
+    def set_files_destination(self, directory: str | Path) -> Path:
+        """Where incoming files are written. Chosen by the user, never guessed."""
+        self._files_directory = Path(directory).expanduser()
+        if self._transfers is not None:
+            self._transfers.set_destination(self._files_directory)
+        return self._files_directory
+
+    def _bluetooth_or_explain(self, action: str) -> BluetoothLink | None:
+        if self._bluetooth is None:
+            self._log(f"Bluetooth: {action} needs a connected phone")
+            return None
+        return self._bluetooth
+
+    async def start_scan(
+        self, *, duration_ms: int = 10_000, filter_uuids: list[str] | None = None
+    ) -> bool:
+        """Start a BLE scan on the phone. It stops itself, or on ``stop_scan``."""
+        link = self._bluetooth_or_explain("scanning")
+        if link is None:
+            return False
+        try:
+            started = await link.start_scan(duration_ms=duration_ms, filter_uuids=filter_uuids)
+        except Exception as exc:  # noqa: BLE001 - the sentence is the product
+            self._log(f"Bluetooth: could not start a scan: {exc}")
+            return False
+        self._log(
+            "Bluetooth: scanning for peripherals"
+            if started
+            else f"Bluetooth: the scan did not start ({link.snapshot().detail})"
+        )
+        return started
+
+    async def stop_scan(self) -> bool:
+        link = self._bluetooth_or_explain("stopping a scan")
+        if link is None:
+            return False
+        return await link.stop_scan()
+
+    async def connect_device(self, address: str) -> bool:
+        """Connect GATT to one peripheral the user picked from the list."""
+        link = self._bluetooth_or_explain("connecting a peripheral")
+        if link is None:
+            return False
+        try:
+            connection = await link.connect(address)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"Bluetooth: could not connect to {address}: {exc}")
+            return False
+        self._log(f"Bluetooth: connected to {address} ({connection.state})")
+        return connection.state == "connected"
+
+    async def disconnect_device(self, address: str) -> bool:
+        link = self._bluetooth_or_explain("disconnecting a peripheral")
+        if link is None:
+            return False
+        ok = await link.disconnect(address)
+        self._log(f"Bluetooth: {'disconnected' if ok else 'was not connected'} {address}")
+        return ok
+
+    async def gatt_services(self, address: str) -> Any:
+        link = self._bluetooth_or_explain("browsing GATT services")
+        return await link.services(address) if link is not None else None
+
+    async def gatt_read(self, address: str, service: str, characteristic: str) -> bytes | None:
+        link = self._bluetooth_or_explain("reading a characteristic")
+        if link is None:
+            return None
+        return await link.read(address, service, characteristic)
+
+    async def gatt_write(
+        self,
+        address: str,
+        service: str,
+        characteristic: str,
+        data: bytes,
+        *,
+        with_response: bool = True,
+    ) -> int | None:
+        link = self._bluetooth_or_explain("writing a characteristic")
+        if link is None:
+            return None
+        return await link.write(
+            address, service, characteristic, data, with_response=with_response
+        )
+
+    async def gatt_subscribe(
+        self, address: str, service: str, characteristic: str, *, enable: bool = True
+    ) -> bool:
+        link = self._bluetooth_or_explain("changing a subscription")
+        if link is None:
+            return False
+        subscribed = await link.subscribe(address, service, characteristic, enable=enable)
+        self._log(
+            f"Bluetooth: notifications {'on' if subscribed else 'off'} for {characteristic}"
+        )
+        return subscribed
+
+    async def start_sensors(self, sensor_ids: list[int] | None = None) -> bool:
+        """Start the stream for the sensors the user ticked. Never all silently."""
+        link = self._sensors
+        if link is None:
+            self._log("sensors: starting a stream needs a connected phone")
+            return False
+        ids = list(sensor_ids if sensor_ids is not None else self._sensor_ids)
+        try:
+            started = await link.start(ids or None)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"sensors: could not start: {exc}")
+            return False
+        self._sensor_ids = ids
+        registry = link.snapshot().registry
+        active_ids = list(registry.active) if registry is not None else []
+        self._log(
+            f"sensors: streaming {len(active_ids)} sensor(s)"
+            if started
+            else f"sensors: the phone refused ({link.snapshot().detail})"
+        )
+        return started
+
+    async def stop_sensors(self) -> None:
+        if self._sensors is not None:
+            await self._sensors.stop("stopped by the user")
+
+    def set_sensor_interval(self, interval_us: int) -> int:
+        """Sampling interval. Takes effect on the next start, and says so."""
+        if self._sensors is None:
+            return max(1000, int(interval_us))
+        return self._sensors.set_interval(interval_us)
+
+    async def send_file(self, path: str | Path) -> TransferStats | None:
+        manager = self._transfers
+        if manager is None:
+            self._log("files: sending needs a connected phone")
+            return None
+        return await manager.send_file(Path(path))
+
+    async def request_file(self, name_hint: str = "") -> TransferStats | None:
+        manager = self._transfers
+        if manager is None:
+            self._log("files: receiving needs a connected phone")
+            return None
+        return await manager.request_file(name_hint)
+
+    async def pause_transfer(self, transfer_id: int) -> bool:
+        return bool(self._transfers and await self._transfers.pause(transfer_id))
+
+    async def resume_transfer(self, transfer_id: int) -> bool:
+        return bool(self._transfers and await self._transfers.resume(transfer_id))
+
+    async def cancel_transfer(self, transfer_id: int) -> None:
+        if self._transfers is not None:
+            await self._transfers.cancel(transfer_id)
+
+    def _on_bluetooth(self, snapshot: BluetoothSnapshot) -> None:
+        self._bluetooth_snapshot = snapshot
+        self._publish_active()
+
+    def _on_sensors(self, snapshot: SensorSnapshot) -> None:
+        self._sensor_snapshot = snapshot
+        if snapshot.state == "error":
+            self._log(f"sensors: {snapshot.detail}")
+        self._publish_active()
+
+    def _on_transfer(self, stats: TransferStats) -> None:
+        """Called for every chunk; logs only the transitions worth reading."""
+        if stats.state == FILE_COMPLETE:
+            verdict = "hash verified" if stats.verified else "hash NOT confirmed"
+            self._log(f"files: {stats.name} ({stats.direction}) complete - {verdict}")
+        elif stats.state == "failed":
+            self._log(f"files: {stats.name} failed - {stats.error}")
+        self._publish_active()
+
+    def _active_plane_keys(self) -> set[str]:
+        """Which Phase 5 capabilities are *running* right now.
+
+        A radio that scanned a moment ago is not active; a scan in progress is. The
+        same distinction holds for GATT (only while a link is up), sensors (only
+        while frames flow) and files (only while a transfer is moving).
+        """
+        active = set(self._active)
+        bluetooth = self._bluetooth.snapshot() if self._bluetooth is not None else None
+        scanning = bool(bluetooth and bluetooth.scan.scanning)
+        linking = bool(bluetooth and bluetooth.connections)
+        sensors = self._sensors.snapshot() if self._sensors is not None else None
+        streaming = bool(sensors and sensors.state == SENSOR_ACTIVE)
+        moving = bool(
+            self._transfers
+            and any(
+                stats.state not in {"complete", "failed", "cancelled"}
+                for stats in self._transfers.transfers
+            )
+        )
+        for key, running in (
+            ("bluetooth_scan", scanning),
+            ("bluetooth_gatt", linking),
+            ("sensors", streaming),
+            ("file_transfer", moving),
+        ):
+            if running:
+                active.add(key)
+            else:
+                active.discard(key)
+        if active == self._active:
+            return active
+        self._active = active
+        return active
+
+    def _publish_active(self) -> None:
+        """Republish the capability table only when an Active flag changed.
+
+        Transfer managers call their listener for every chunk; republishing on each
+        one would rebuild the table thousands of times per file.
+        """
+        if self._active_plane_keys() != self._active_at_publish:
+            self._active_at_publish = set(self._active)
+            self._publish(capabilities=self._capabilities_with_active())
+
+    async def _close_planes(self, reason: str) -> None:
+        """Release all three Phase 5 planes, oldest first, without raising."""
+        bluetooth, self._bluetooth = self._bluetooth, None
+        sensors, self._sensors = self._sensors, None
+        transfers, self._transfers = self._transfers, None
+        for name, plane in (("bluetooth", bluetooth), ("sensors", sensors), ("files", transfers)):
+            if plane is None:
+                continue
+            try:
+                await plane.close(reason)
+            except Exception as exc:  # noqa: BLE001 - teardown must not raise
+                self._log(f"{name}: cleanup failed: {exc}")
+        self._bluetooth_snapshot = BluetoothSnapshot(
+            adapter=AdapterStatus(), scan=ScanState()
+        )
+        self._sensor_snapshot = SensorSnapshot()
+        self._publish_active()
 
     # ------------------------------------------------------------------ #
     # audio (Phase 2)
@@ -1179,6 +1503,16 @@ class ConnectionManager:
             sink_factory=self._sink_factory,
             on_change=self._on_audio,
         )
+        # Phase 5. Same session, same envelope: the phone is the radio endpoint,
+        # so nothing here opens a socket of its own. Nothing scans, streams or
+        # connects until the user asks.
+        self._bluetooth = BluetoothLink(session, on_change=self._on_bluetooth)
+        self._sensors = SensorLink(session, on_change=self._on_sensors)
+        self._transfers = TransferManager(
+            session,
+            destination=self._files_directory,
+            on_change=self._on_transfer,
+        )
         self._active_audio_keys()
         self._log(
             f"connected over {candidate.kind} at {candidate.endpoint}; "
@@ -1276,6 +1610,7 @@ class ConnectionManager:
         # must be gone before the session object is dropped.
         await self._close_camera("session ended")
         await self._close_audio("session ended")
+        await self._close_planes("session ended")
         heartbeat, self._heartbeat = self._heartbeat, None
         if heartbeat is not None and not heartbeat.done():
             heartbeat.cancel()

@@ -17,15 +17,15 @@ Last verified: 2026-11-08.
 
 | Gate | State |
 | --- | --- |
-| Automated tests (Python) | ✅ 575 passed |
+| Automated tests (Python) | ✅ 1132 passed, 1 skipped |
 | Lint (ruff) | ✅ clean, whole repo |
-| Type check (mypy) | ✅ clean, 19 files |
-| Vectors / protocol conformance | ✅ `tools/verify.py` 7/7 |
+| Type check (mypy) | ✅ clean, 53 files |
+| Vectors / protocol conformance | ✅ `tools/verify.py` 8/8 (added: camera frame path) |
 | Package installs from a clean venv | ✅ verified twice (editable and wheel) |
 | CLI commands, help and exit codes | ✅ 28-case sweep, 0 failures |
 | Android sources parse, no new compiler diagnostics | ✅ stub compile, differential |
 | Android app built into an APK | ⛔ **B2** |
-| Android app exercised on a handset | ⛔ **B1** |
+| Android app exercised on a handset | ⛔ **B1** — now including every Phase 5 hardware check (BLE peripheral, real sensors, real storage) |
 | PowerShell workflows executed on Windows | ⛔ **B4** |
 | Play Store submission | ⛔ **B3** (targetSdk) + **B5** (keystore/assets) |
 

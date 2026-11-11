@@ -44,6 +44,7 @@ KEYS: tuple[str, ...] = (
     "sensors",
     "file_transfer",
     "bluetooth_scan",
+    "bluetooth_gatt",
 )
 
 LABELS: Mapping[str, str] = {
@@ -55,6 +56,7 @@ LABELS: Mapping[str, str] = {
     "sensors": "Sensors",
     "file_transfer": "File transfer",
     "bluetooth_scan": "Bluetooth scanning",
+    "bluetooth_gatt": "Bluetooth GATT",
 }
 
 #: The roadmap phase each capability belongs to, shown as context.
@@ -67,6 +69,7 @@ PHASES: Mapping[str, int] = {
     "sensors": 5,
     "file_transfer": 5,
     "bluetooth_scan": 5,
+    "bluetooth_gatt": 5,
 }
 
 #: Which Android runtime permission gates a capability.
@@ -79,6 +82,12 @@ REQUIRED_PERMISSIONS: Mapping[str, str] = {
     # Phase 4: a lens is only usable when the user has allowed the camera.
     "camera.back": "CAMERA",
     "camera.front": "CAMERA",
+    # Phase 5. A radio is one capability and *talking GATT* is another: a phone
+    # can scan without being able to connect, and the two need different
+    # permissions on Android 12+. On Android 11 and older both are spelled
+    # ACCESS_FINE_LOCATION, which the phone resolves in `Permissions.effective`.
+    "bluetooth_scan": "BLUETOOTH_SCAN",
+    "bluetooth_gatt": "BLUETOOTH_CONNECT",
 }
 
 #: Permission values as the phone spells them (``Permissions.Status`` lowercased).
@@ -238,3 +247,49 @@ def blockers(capability: Capability) -> list[str]:
     if capability.implemented is None:
         out.append("not reported by the phone")
     return out
+
+
+#: Prefix for the per-sensor rows. A sensor is a capability of its own: the
+#: aggregate ``sensors`` row answers "may I stream anything", and each row below
+#: answers "may I stream *this* one, and is it streaming now".
+SENSOR_PREFIX = "sensor."
+
+
+def sensor_capability(row: Mapping[str, Any]) -> Capability:
+    """One ``sensor.list`` entry as a five-state capability.
+
+    The phone sends ``available`` plus, from Phase 5 onwards, the individual
+    inputs. Older payloads only carried ``available``, which is still honest:
+    present/permitted/implemented stay ``None`` (unreported) rather than being
+    filled in with guesses.
+    """
+    sensor_id = row.get("id", row.get("sensor_id", 0))
+    try:
+        numeric_id = int(str(sensor_id))
+    except (TypeError, ValueError):
+        numeric_id = 0
+    label = str(row.get("label") or row.get("name") or f"sensor {numeric_id}")
+    reported = bool(_as_bool(row.get("available")))
+    present = _as_bool(row.get("present"))
+    permitted = _as_bool(row.get("permitted"))
+    implemented = _as_bool(row.get("implemented"))
+    if implemented is None and reported:
+        implemented = True
+    detail = row.get("detail")
+    return Capability(
+        key=f"{SENSOR_PREFIX}{numeric_id}",
+        label=label,
+        present=present,
+        permitted=permitted,
+        implemented=implemented,
+        available=reported,
+        active=bool(row.get("active")),
+        detail=detail if isinstance(detail, str) else None,
+        phase=5,
+        reported_available=reported,
+    )
+
+
+def sensor_registry(rows: Iterable[Mapping[str, Any]]) -> tuple[Capability, ...]:
+    """Every reported sensor, in the order the phone listed them."""
+    return tuple(sensor_capability(row) for row in rows)

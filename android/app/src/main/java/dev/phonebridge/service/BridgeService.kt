@@ -102,7 +102,7 @@ class BridgeService : Service() {
 
         val srv = BridgeServer(this, identity, pairingStore, port)
         server = srv
-        BridgeState.bind(srv, scope)
+        BridgeState.bind(srv, scope, applicationContext)
         BridgeState.setPort(port)
 
         val started = srv.start()

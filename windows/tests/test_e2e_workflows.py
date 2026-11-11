@@ -28,7 +28,15 @@ from phonebridge.core.session import BridgeSession, SessionError, TerminalSessio
 from phonebridge.protocol.messages import ProtocolError
 from phonebridge.transport.link import websocket_uri
 
-PHONE_PERMISSIONS = {"RECORD_AUDIO", "POST_NOTIFICATIONS", "BLUETOOTH_CONNECT"}
+#: The runtime permissions the app declares (Phase 5 added CAMERA's Phase 4 entry
+#: to this list's sibling test, and the two Bluetooth powers).
+PHONE_PERMISSIONS = {
+    "RECORD_AUDIO",
+    "POST_NOTIFICATIONS",
+    "BLUETOOTH_CONNECT",
+    "BLUETOOTH_SCAN",
+    "CAMERA",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -214,9 +222,14 @@ async def test_permissions_report_only_declared_runtime_permissions(connected):
     permissions = (await session.call("system.info"))["permissions"]
     assert set(permissions) <= PHONE_PERMISSIONS
     assert set(permissions.values()) <= st.PERMISSION_STATES
-    # A permission the app never declared must not be invented.
-    assert "CAMERA" not in permissions
-    assert "BLUETOOTH_SCAN" not in permissions
+    # A permission the app never declared must not be invented. Phase 5 made both
+    # of these real (scanning and the camera), so the honest check is now that a
+    # *storage* permission never appears: file transfer goes through SAF.
+    assert "READ_EXTERNAL_STORAGE" not in permissions
+    assert "MANAGE_EXTERNAL_STORAGE" not in permissions
+    assert "ACCESS_FINE_LOCATION" not in permissions, (
+        "location is the Android 11 spelling of the scan permission, not a separate one"
+    )
 
 
 async def test_permission_change_is_visible_without_reconnecting(connected):
@@ -413,22 +426,29 @@ async def test_selftest_passes_every_supported_workflow(connected):
     failures = [row for row in rows if row.status == st.FAIL]
     assert not failures, "\n".join(f"{row.workflow}: {row.evidence}" for row in failures)
     supported = [row for row in rows if row.category == "supported"]
-    assert len(supported) == 12
+    assert len(supported) == 17
     assert all(row.status == st.PASS for row in supported)
     assert all(row.evidence for row in supported), "a PASS row must say what happened"
 
 
-async def test_selftest_marks_unimplemented_workflows_without_counting_them(connected):
+async def test_selftest_has_nothing_left_to_call_unimplemented(connected):
+    """Phase 5 implemented the last three areas, so the matrix is all checks.
+
+    The mechanism is still asserted to exist: a future phase that drops a feature
+    has to be able to say so, and this test would then fail loudly instead of the
+    row quietly turning into a PASS.
+    """
     _phone, session = connected
     rows = await st.run_selftest(session, frames=2)
-    unsupported = [row for row in rows if row.category == "unsupported"]
-    assert {row.status for row in unsupported} == {st.NOT_IMPLEMENTED}
-    areas = " ".join(row.workflow for row in unsupported)
-    for area in ("file transfer", "sensor"):
-        assert area in areas
-    assert "audio" not in areas, "Phase 2 implemented audio: it is no longer unimplemented"
-    assert "camera" not in areas, "Phase 4 implemented the camera: it is no longer unimplemented"
-    assert st.summarise(rows)[st.NOT_IMPLEMENTED] == len(st.UNSUPPORTED_WORKFLOWS)
+    assert st.UNSUPPORTED_WORKFLOWS == ()
+    assert [row for row in rows if row.category == "unsupported"] == []
+    assert st.summarise(rows)[st.NOT_IMPLEMENTED] == 0
+    workflows = " ".join(row.workflow for row in rows)
+    for area in ("bluetooth", "sensor", "file transfer"):
+        assert area in workflows, f"Phase 5 {area} workflow is missing from the matrix"
+    assert all(row.status == st.PASS for row in rows), "\n".join(
+        f"{row.workflow}: {row.evidence}" for row in rows if row.status != st.PASS
+    )
 
 
 async def test_selftest_reports_a_phone_that_cannot_answer(connected):

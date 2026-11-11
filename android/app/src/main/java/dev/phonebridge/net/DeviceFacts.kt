@@ -9,6 +9,7 @@ import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.os.Build
 import android.util.Log
+import dev.phonebridge.Permissions
 import dev.phonebridge.protocol.Framing
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -178,6 +179,7 @@ object DeviceFacts {
             PackageManager.FEATURE_BLUETOOTH,
             PackageManager.FEATURE_BLUETOOTH_LE,
         )
+        val bluetoothLe = hasAnyFeature(context, PackageManager.FEATURE_BLUETOOTH_LE)
         val headset = AudioProbe.headsetConnected(context)
 
         return listOf(
@@ -224,29 +226,45 @@ object DeviceFacts {
                 note = "streams JPEG frames to a paired PC on request",
                 permission = android.Manifest.permission.CAMERA,
             ),
+            // Phase 5. Hardware, permission and implementation are three separate
+            // facts for each of these, and the PC shows all three.
             CapabilityRow(
                 key = "sensors",
                 label = "sensors",
                 hardware = sensors.isNotEmpty(),
-                implemented = false,
-                phase = 5,
-                note = if (sensors.isEmpty()) "none reported" else "present: ${sensors.joinToString(", ")}",
+                implemented = true,
+                note = if (sensors.isEmpty()) {
+                    "none reported"
+                } else {
+                    "streams the ${sensors.size} sensor(s) this phone reports, on request"
+                },
             ),
             CapabilityRow(
                 key = "file_transfer",
                 label = "file transfer",
-                hardware = true, // storage is what it is; the feature is what is missing
-                implemented = false,
-                phase = 5,
-                note = "chunked transfer with checksums is Phase 5",
+                hardware = true, // storage is what it is; the permission is about a folder
+                implemented = true,
+                note = "chunked, SHA-256 verified transfers into a folder you choose (SAF)",
             ),
             CapabilityRow(
                 key = "bluetooth_scan",
                 label = "Bluetooth scanning",
-                hardware = bluetoothRadio,
-                implemented = false,
-                phase = 5,
-                note = "BLE scan and GATT are Phase 5",
+                hardware = bluetoothLe,
+                implemented = true,
+                note = if (bluetoothLe) {
+                    "scans for BLE peripherals on request; never connects by itself"
+                } else {
+                    "this device has no Bluetooth LE radio"
+                },
+                permission = android.Manifest.permission.BLUETOOTH_SCAN,
+            ),
+            CapabilityRow(
+                key = "bluetooth_gatt",
+                label = "Bluetooth GATT",
+                hardware = bluetoothLe,
+                implemented = true,
+                note = "connect, browse, read, write and subscribe to a peripheral you name",
+                permission = android.Manifest.permission.BLUETOOTH_CONNECT,
             ),
         )
     }
@@ -267,10 +285,15 @@ object DeviceFacts {
         }
         val out = linkedMapOf<String, Any?>()
         for (row in capabilityRows(context)) {
-            val allowed = if (row.permission == android.Manifest.permission.CAMERA) {
-                cameraGranted
-            } else {
-                granted
+            // One resolution point for "did the user allow this?", including the
+            // Android 12 Bluetooth split (BLUETOOTH_SCAN vs ACCESS_FINE_LOCATION)
+            // and the Phase 5 storage permission (SAF, granted by picking a folder).
+            val gate = row.permission
+            val allowed = when (gate) {
+                null -> true
+                android.Manifest.permission.CAMERA -> cameraGranted
+                android.Manifest.permission.RECORD_AUDIO -> granted
+                else -> Permissions.effectiveGranted(context, gate)
             }
             out[row.key] = row.available(allowed)
             out["hardware.${row.key}"] = row.hardware
@@ -285,6 +308,24 @@ object DeviceFacts {
         out["implemented.camera.back"] = true
         out["implemented.camera.front"] = true
         out["permitted.camera"] = cameraGranted
+        // Phase 5: implementation is stated outright for every Bluetooth, sensor
+        // and file row, so a PC never has to infer it from a conjunction.
+        out["implemented.sensors"] = true
+        out["implemented.file_transfer"] = true
+        out["implemented.bluetooth_scan"] = true
+        out["implemented.bluetooth_gatt"] = true
+        out["permitted.bluetooth_scan"] = Permissions
+            .effectiveGranted(context, android.Manifest.permission.BLUETOOTH_SCAN)
+        out["permitted.bluetooth_gatt"] = Permissions
+            .effectiveGranted(context, android.Manifest.permission.BLUETOOTH_CONNECT)
+        // File transfer is usable only after the user picked a folder: that is a
+        // permission the platform granted, not one this app can request.
+        out["permitted.file_transfer"] = SafStore.canReceive(context)
+        out["detail.file_transfer"] = if (SafStore.canReceive(context)) {
+            "receiving into '${SafStore.destinationLabel(context)}'"
+        } else {
+            "present, but no folder has been chosen for receiving"
+        }
         // Existing string-valued key (the PC prints it as the active profile).
         out["audio.bluetooth_profile"] = AudioProbe.bluetoothProfileName(context)
         out["protocol_version"] = Framing.PROTOCOL_VERSION
