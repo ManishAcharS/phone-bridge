@@ -8,7 +8,7 @@ Legend: `[x]` implemented and tested · `[~]` partially implemented ·
 | | |
 | --- | --- |
 | Version | `1.0.0` (PC package and Android app) |
-| Gate status | 754 tests (1 skipped), ruff, mypy, `verify.py` 7/7 — all green |
+| Gate status | 783 tests (1 skipped), ruff, mypy, `verify.py` 7/7 — all green |
 | Open blockers | **B1** no physical-device run · **B2** release APK not built here (plus B3–B6: Play `targetSdk`, keystore, Windows/PowerShell run, Kotlin stub compile) |
 | Ship/no-ship | **Not shippable until B1 and B2 are cleared.** See [`14-release-readiness.md`](14-release-readiness.md). |
 
@@ -31,7 +31,7 @@ Note 14 Pro+; nothing in this table is marked tested on hardware unless it was.
 
 | Area | Status | Where it stands |
 | --- | --- | --- |
-| USB verdict (identify the obstacle, not just "no device") | `[x]` | `controller/usbcheck.py` + two window rows; unit-tested, **not device-tested** |
+| USB verdict (identify the obstacle, not just "no device") | `[x]` | `controller/usbcheck.py`, staged A–H report, `phonebridge usb`, **Diagnose USB** button; 53 unit tests, **not device-tested** |
 | USB forwarding / transport choice, user-owned forwards preserved | `[x]` | `controller/transports.py`; forwards PhoneBridge owned are released, others left alone |
 | Android Open Accessory | `[ ]` | investigated and documented in [`16`](16-known-limitations.md), deliberately not wired in |
 | Hotspot stability: health checks, bounded backoff, drop explanation, one session per socket | `[x]` | `controller/manager.py`; proven by tests, **not yet proven on a real hotspot** |

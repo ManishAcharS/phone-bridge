@@ -468,6 +468,31 @@ class Adb:
             raise AdbError(result.stderr.strip() or "adb devices failed")
         return parse_devices(result.stdout)
 
+    def probe_devices(self) -> tuple[list[AdbDevice], str, str]:
+        """Everything the USB report needs from one adb call, and never a raise.
+
+        Returns ``(devices, error, server)`` where ``server`` says whether the
+        daemon was already running. A broken daemon is a *state* to report, not an
+        exception to escape: the user's next action depends on the difference
+        between "server dead" and "no phone attached".
+        """
+        if not self.available():
+            return [], "adb is not installed", "not running (adb missing)"
+        try:
+            result = self._exec(["devices", "-l"])
+        except AdbError as exc:
+            return [], str(exc), "unreachable"
+        text = f"{result.stdout}\n{result.stderr}".lower()
+        if "cannot connect to daemon" in text or "failed to start daemon" in text:
+            return [], (result.stderr or result.stdout).strip(), "cannot connect to daemon"
+        if "daemon not running" in text or "starting it now" in text:
+            server = "was not running (started by this check)"
+        else:
+            server = "running"
+        if result.returncode != 0:
+            return [], (result.stderr or "adb devices failed").strip(), server
+        return parse_devices(result.stdout), "", server
+
     def usb_devices(self) -> list[AdbDevice]:
         """Only the devices on a cable (or emulator-free USB state).
 

@@ -418,6 +418,30 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # identity / devices / discovery
 # --------------------------------------------------------------------------- #
+def cmd_usb(args: argparse.Namespace) -> int:
+    """The whole USB chain, without opening the window.
+
+    Read-only by construction: it queries adb and Windows and prints where the
+    chain stops. It never kills the adb server, deletes a key or touches a driver.
+    """
+    from ..controller.adb import Adb  # noqa: PLC0415 - keeps CLI startup light
+    from ..controller.usbcheck import collect, format_report  # noqa: PLC0415
+
+    adb = Adb(executable=args.adb) if args.adb else Adb()
+    report = collect(adb)
+
+    if args.json:
+        _json(report.as_dict())
+        return 0 if report.ok else 1
+
+    print(format_report(report))
+    print()
+    stage = f"stage {report.stage}: " if report.stage else ""
+    print(f"  {stage}{report.action}")
+    print("  Full explanation and the stage table: docs/18-usb-recovery.md")
+    return 0 if report.ok else 1
+
+
 def cmd_identity(args: argparse.Namespace) -> int:
     store = _store(args)
     if args.name is not None:
@@ -1047,6 +1071,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="inspect this PC's development environment")
     doctor.add_argument("--json", action="store_true", help="machine-readable output")
 
+    usb = sub.add_parser(
+        "usb",
+        help="full USB diagnostic: Windows devices, ADB interface, driver, adb",
+        description="Says where the USB chain stops (stage A-H) and the one next "
+                    "action. Read-only: no driver install, no adb key changes.",
+    )
+    usb.add_argument("--json", action="store_true", help="machine-readable output")
+    usb.add_argument("--adb", default=None, metavar="PATH",
+                     help="use this adb executable instead of searching")
+
     ident = sub.add_parser("identity", help="show (or name) this PC and its pinned phones")
     ident.add_argument("--name", metavar="NAME", default=None,
                        help="set this PC's device name (what the phone displays)")
@@ -1201,6 +1235,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         return cmd_gui(args)
     if args.command == "doctor":
         return cmd_doctor(args)
+    if args.command == "usb":
+        return cmd_usb(args)
     if args.command == "identity":
         return cmd_identity(args)
     if args.command == "forget":

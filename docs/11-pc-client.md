@@ -57,6 +57,18 @@ phonebridge doctor --json          # same, for scripts
 script is on PATH, which optional packages are missing and what each is for, and
 -if it is a Windows machine- audio devices, OBS, adb, JDK and the Android SDK.
 
+USB has its own command, because "no device" is not an answer:
+
+```powershell
+phonebridge usb            # Windows devices, ADB interface, driver, adb server
+phonebridge usb --json     # same, for scripts (exit 1 when not ready)
+```
+
+It prints a staged report (stage A-H), the one next action, and nothing else. It
+is read-only: no driver install, no `adb kill-server`, no key deletion. The full
+stage table and the HyperOS settings are in
+[`18-usb-recovery.md`](18-usb-recovery.md).
+
 A clean-environment install was run as part of this work (fresh virtualenv, no
 other packages, `pip install windows` from a directory outside the repo):
 
@@ -98,6 +110,7 @@ The build previously emitted a setuptools deprecation warning
 | --- | --- | --- |
 | `gui` | desktop controller: one Connect button, auto-reconnect (`--auto-connect`, `--endpoint HOST[:PORT]`, `--discovery-timeout`, `--config-dir`) | no |
 | `doctor` | is this PC set up? | no |
+| `usb` | where does the USB chain stop, and what is the next action? | no |
 | `identity` | who is this PC, which phones are pinned? | no |
 | `devices` | what do I know, and what is announcing itself? | no (beacons optional) |
 | `discover` | who is on this network right now? | no |

@@ -231,6 +231,12 @@ localised `Get-PnpDevice` cannot crash discovery. Two rules keep this honest:
 Nothing here installs a driver, enables debugging, or runs anything elevated: the
 window names the obstacle and the fix, and the user decides.
 
+The **Diagnose USB** button runs the whole chain again with every cache bypassed,
+so it can be pressed after a replug, a driver install or a USB-mode change. The
+same report is available without the window as `phonebridge usb`. The stage
+table, the reason the RSA prompt can be missing entirely, and the HyperOS
+settings are in [`18-usb-recovery.md`](18-usb-recovery.md).
+
 ---
 
 ## 6. Hotspot: why it failed, and what changed
@@ -333,6 +339,7 @@ tests' vocabulary.
 | Authenticated | `yes — pinned key verified, AES-256-GCM in use`, `not authenticated`, `not yet` | *Connected* from *authenticated* |
 | Last discovery error | the reason, or `none` | why nothing was found |
 | Last connection error | the reason, or `none` | why the attempt failed — including a drop's gateway/answer verdict |
+| USB stops at | `A` … `H`, or `—` | which link of the chain broke: no phone, no ADB interface, driver, adb server, authorisation, offline, wireless-only, settings |
 | USB diagnosis | `USB is usable…`, `no Android device in Windows' USB tree`, `a driver problem (Code 28)`, `USB debugging is off`, `not inspected` | the four cable failures that all used to read *no device* |
 | USB next step | the concrete action, or `—` | what to actually do about it |
 
@@ -475,7 +482,7 @@ failures happened (§7) and `Phone address` is the direct fallback.
 
 ```powershell
 cd windows
-python -m pytest -q                      # 754 tests, 1 skipped (tkinter, Linux CI)
+python -m pytest -q                      # 783 tests, 1 skipped (tkinter, Linux CI)
 python -m pytest -q tests/test_controller_manager.py tests/test_controller_e2e.py
 cd .. ; python tools/verify.py           # 7 checks
 ```
