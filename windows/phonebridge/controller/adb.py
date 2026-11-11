@@ -59,6 +59,11 @@ _MDNS_SERIAL = re.compile(r"^adb-[^.]*\._adb-tls-(?:connect|pairing)\._tcp$", re
 _EMULATOR_SERIAL = re.compile(r"^(?:emulator-\d+|localhost:\d+)$")
 
 
+def state_help(state: str) -> str:
+    """What the user should do about one ``adb devices`` state."""
+    return _STATE_HELP.get(state, "run `adb devices` for details")
+
+
 @dataclass(frozen=True)
 class AdbResult:
     """The parts of a finished process we care about."""

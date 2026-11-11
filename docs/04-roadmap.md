@@ -8,19 +8,45 @@ Legend: `[x]` implemented and tested · `[~]` partially implemented ·
 | | |
 | --- | --- |
 | Version | `1.0.0` (PC package and Android app) |
-| Gate status | 575 tests, ruff, mypy, `verify.py` 7/7 — all green |
+| Gate status | 754 tests (1 skipped), ruff, mypy, `verify.py` 7/7 — all green |
 | Open blockers | **B1** no physical-device run · **B2** release APK not built here (plus B3–B6: Play `targetSdk`, keystore, Windows/PowerShell run, Kotlin stub compile) |
 | Ship/no-ship | **Not shippable until B1 and B2 are cleared.** See [`14-release-readiness.md`](14-release-readiness.md). |
 
-Milestone 1 of the hardware roadmap (the one-click Windows controller) is in
-[`docs/17`](17-connection-controller.md): connection manager, transport choice,
-pairing in the window, reconnection and the five-state capability registry.
-Phases 2–5 (audio, camera, Bluetooth, files) are still ahead.
+Milestones 1–3 of the hardware roadmap (the one-click Windows controller, and the
+USB/hotspot diagnosis pass) are in [`docs/17`](17-connection-controller.md):
+connection manager, transport choice, pairing in the window, reconnection, the
+five-state capability registry, and the USB verdict engine. Feature phases
+(audio, camera, Bluetooth, sensors, files) are still ahead — the table below is
+the honest position, updated as each one lands.
 
 Scope delivered in 1.0.0: Phase 0 (feasibility, architecture, protocol), Phase 1
 (encrypted PC ↔ phone channel, CLI, Android app), the end-to-end verification
 pass ([`12`](12-end-to-end-verification.md)) and the security hardening pass
-([`13`](13-security-review.md)). Phases 2–5 are untouched.
+([`13`](13-security-review.md)).
+
+## Master implementation status
+
+Legend as above. "Device-tested" means it has been run against the Redmi
+Note 14 Pro+; nothing in this table is marked tested on hardware unless it was.
+
+| Area | Status | Where it stands |
+| --- | --- | --- |
+| USB verdict (identify the obstacle, not just "no device") | `[x]` | `controller/usbcheck.py` + two window rows; unit-tested, **not device-tested** |
+| USB forwarding / transport choice, user-owned forwards preserved | `[x]` | `controller/transports.py`; forwards PhoneBridge owned are released, others left alone |
+| Android Open Accessory | `[ ]` | investigated and documented in [`16`](16-known-limitations.md), deliberately not wired in |
+| Hotspot stability: health checks, bounded backoff, drop explanation, one session per socket | `[x]` | `controller/manager.py`; proven by tests, **not yet proven on a real hotspot** |
+| Wi-Fi discovery, pairing, AES-256-GCM, transport switching, saved endpoints | `[x]` | unchanged from 1.0.0; manual endpoint never defaults to loopback |
+| Separate logical channels (control / audio / camera / BT / sensors / files) | `[ ]` | protocol reserves the message kinds, one RPC channel exists today |
+| Audio PC → phone and phone → PC | `[ ]` | Phase 2 |
+| Camera streaming and Windows preview | `[ ]` | Phase 4 |
+| Bluetooth (BLE scan/GATT), sensors | `[ ]` | Phase 5 |
+| File transfer (SAF, chunked, SHA-256, resume) | `[ ]` | Phase 5 |
+| Launcher `PhoneBridge-Start.bat` | `[x]` | one-click, self-checking, never resets work |
+| Window sections (Audio, Camera, Bluetooth, Sensors, Files) | `[ ]` | Connection and Diagnostics exist; the rest are not drawn until they work |
+| Android lifecycle audit (compileSdk/targetSdk, foreground-service types, permissions at point of use) | `[ ]` | not started |
+
+No row is marked `[x]` on the strength of a plan, and no window section exists
+without the feature behind it.
 
 ## Phase 0 — Technical feasibility ✅
 

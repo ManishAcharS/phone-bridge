@@ -78,3 +78,13 @@ Full analysis with severities: [`13-security-review.md`](13-security-review.md).
 | No Bluetooth headset attached | Audio measurements on all three handsets (`docs/09`). |
 | No fuzzing | The parsers are size- and shape-limited and well tested, but not fuzzed. |
 | Single-machine end-to-end | Every end-to-end test uses loopback; real Wi-Fi loss, MTU issues and roaming are untested. |
+
+## USB diagnosis (milestone 3)
+
+| Limitation | Why, and what would remove it |
+| --- | --- |
+| The USB verdict is a Windows-only conclusion | it reads `Get-PnpDevice`; on Linux/macOS the row says *not inspected* rather than inventing an answer |
+| Problem codes are mapped, not fixed | `Code 28` means no driver is installed; the app will not install one silently, and installing a kernel driver without the user's knowledge is out of scope by instruction |
+| Android Open Accessory was investigated, not implemented | AOA needs the phone to expose accessory mode and the PC to claim the interface with a USB driver; it would only help where adb cannot, and it cannot be validated without the handset. It is not wired in, and the app does not claim it |
+| `adb devices -l` can be stale | a phone that was unplugged may linger as `offline` until `adb kill-server`; the window says so instead of reporting a healthy cable |
+| The descriptor names are shown, not interpreted | a cable that only charges usually produces *no Android row at all*; the window can say Windows never saw the phone, but it cannot distinguish a dead cable from a dead port |

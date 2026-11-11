@@ -10,9 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..transport.link import DEFAULT_PORT
 from .capabilities import Capability
+from .endpoints import EndpointError, is_loopback, parse_endpoint
 from .manager import Snapshot, State
+
+#: Re-exported for the window and the tests; the definitions live in ``endpoints``
+#: so the manager can use them without importing the view layer.
+__all__ = ["EndpointError", "build_view", "is_loopback", "parse_endpoint"]
 
 #: Tone names rather than colours: the window owns the palette.
 TONE_OK = "ok"
@@ -81,6 +85,8 @@ class View:
     # read "no phone found".
     adb_path: str = "—"
     usb: str = "—"
+    usb_diagnosis: str = "—"
+    usb_action: str = "—"
     wifi: str = "—"
     server: str = "—"
     auth_ok: str = "—"
@@ -138,34 +144,6 @@ def discovery_text(snapshot: Snapshot) -> str:
 
 def connection_text(snapshot: Snapshot) -> str:
     return snapshot.last_connection_error or "none"
-
-
-class EndpointError(ValueError):
-    """What the user typed is not an address we can try."""
-
-
-def parse_endpoint(text: str, default_port: int = DEFAULT_PORT) -> tuple[str, int]:
-    """``"10.0.0.5"`` or ``"10.0.0.5:8765"`` -> ``(host, port)``.
-
-    Deliberately strict about the port and permissive about the host: a hostname
-    is a valid thing to type, a nonsense port is not.
-    """
-    cleaned = text.strip()
-    if not cleaned:
-        raise EndpointError("type the phone's address, for example 192.168.1.20:8765")
-    host, separator, port_text = cleaned.partition(":")
-    host = host.strip()
-    if not host or " " in host:
-        raise EndpointError(f"'{text.strip()}' is not a host address")
-    if not separator or not port_text.strip():
-        return host, default_port
-    port_text = port_text.strip()
-    if not port_text.isdigit():
-        raise EndpointError(f"'{port_text}' is not a port number")
-    port = int(port_text)
-    if not 1 <= port <= 65535:
-        raise EndpointError(f"port {port} is outside 1-65535")
-    return host, port
 
 
 def cell(value: bool | None, *, not_required: bool = False) -> str:
@@ -260,6 +238,8 @@ def build_view(snapshot: Snapshot) -> View:
         diagnostics="\n".join(snapshot.diagnostics) or "Nothing logged yet.",
         adb_path=adb_path_text(snapshot),
         usb=usb_text(snapshot),
+        usb_diagnosis=snapshot.usb_diagnosis or "not checked yet",
+        usb_action=snapshot.usb_action or "—",
         wifi=snapshot.wifi_status or "not checked yet",
         server=server_text(snapshot),
         auth_ok=auth_text(snapshot),

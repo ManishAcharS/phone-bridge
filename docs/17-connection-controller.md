@@ -196,6 +196,41 @@ prompt on the phone), `offline` (replug, or `adb kill-server`), `no permissions`
 (Linux udev rules), `connecting`/`authorizing` (wait a moment). adb being absent
 is a *state*, not an exception: Wi-Fi keeps working and the row says so.
 
+### When adb sees nothing: which obstacle is it?
+
+`adb devices -l` answers "is there a device?", not "why not". The three failures
+that all read *no device on USB* — a charge-only cable, a missing driver, and USB
+debugging switched off — have three different fixes, so `controller/usbcheck.py`
+combines adb with Windows' own USB tree (`Get-PnpDevice` via PowerShell) and names
+one of them:
+
+| Verdict | What Windows sees | What the window says to do |
+| --- | --- | --- |
+| `ready` | an Android row, `adb` happy | nothing — the cable path is offered |
+| `unauthorized` | an Android row, adb says `unauthorized` | unlock the phone, accept *Allow USB debugging?* |
+| `offline` | an Android row, adb says `offline` | replug, or `adb kill-server` then plug in |
+| `driver` | an Android row with a problem code (`10`, `28`, `43`, `52`) | `28`: install the phone's USB driver; `43`: try another cable/port |
+| `debugging-off` | a healthy Android row, adb blind | 7 taps on *Build number*, then *USB debugging*, then *File transfer* mode |
+| `no-device` | no Android row at all | cable, port, or the phone end — Windows never saw it |
+| `wireless-only` | nothing on USB, adb has a Wi-Fi serial | that is Wi-Fi debugging, not a cable |
+| `adb-missing` | irrelevant | adb is not installed; Wi-Fi is unaffected |
+| `unknown` | not inspected (not Windows, or the query failed) | says so, rather than guessing a Windows conclusion |
+
+An Android device is recognised by `AndroidUsbDeviceClass`, by a known vendor ID
+(`2717` Xiaomi, `18d1` Google, `04e8` Samsung, `22b8` Motorola, `12d1` Huawei,
+`2a70` OPPO/OnePlus, `0e8d` MediaTek) or by its name; the parse is defensive, so a
+localised `Get-PnpDevice` cannot crash discovery. Two rules keep this honest:
+
+- **The device tree is only read on Windows.** On any other OS, or if PowerShell
+  fails, the verdict is `unknown` with *the device tree was not inspected* — never
+  a Windows conclusion drawn from silence.
+- **Diagnosis is cheap first, expensive second.** The adb-only verdict runs on
+  every discovery; the PowerShell query runs only when adb alone cannot decide,
+  and its result is cached for 30 s so a retry loop cannot spawn processes.
+
+Nothing here installs a driver, enables debugging, or runs anything elevated: the
+window names the obstacle and the fix, and the user decides.
+
 ---
 
 ## 6. Hotspot: why it failed, and what changed
@@ -248,6 +283,34 @@ entirely — then even the gateway probe fails and no address will work), and a
 firewall policy that blocks both UDP and inbound sessions. The window distinguishes
 those two from a beacon problem, which is what makes them diagnosable at all.
 
+### After a drop: from `1006` to a sentence
+
+A WebSocket close code of `1006` says the socket died; it never says why. When a
+session that reached `connected` ends without being asked to, the controller asks
+two cheap questions and reports the pair:
+
+| Question | How | What the window says |
+| --- | --- | --- |
+| Is this still the same network? | the PC's gateway + interface fingerprint, captured at connect time and compared now | `the network changed (10.174.54.152 -> 192.168.1.1)` or `the network is unchanged` |
+| Does anything still answer there? | one TCP connect to the address that just failed | `the phone still answers on that address` or `nothing answers at that address now` (+ the HyperOS battery hint, which is the usual cause) |
+
+The sentence is published as `last_connection_error` and is also carried into the
+final `gave up after N attempt(s): …` message, so the reason survives the retry
+ladder instead of being overwritten by the last generic failure. A deliberate
+`disconnect()` is *not* a drop: it is logged as `session closed on request` and
+reports no error.
+
+Two related corrections in the same area:
+
+- **A drop re-enters the ladder.** It used to return to the supervisor as if the
+  attempt had succeeded; now it raises the same retry path as a failed attempt, so
+  a flaky minute is retried with backoff instead of immediately looping.
+- **A real session resets the backoff.** A link that worked and then dropped starts
+  the ladder over (0.5 s, not the 15 s cap a long outage had built up).
+- **One socket is tried once.** Several sources legitimately name the same phone
+  (beacon, gateway probe, saved address); candidates are de-duplicated by
+  `host:port` before ranking, so one pass cannot open two sessions to one phone.
+
 Still not claimed: whether a specific phone's hotspot works. §11 has the steps
 that would prove it, and none of them has been run against the handset.
 
@@ -269,7 +332,9 @@ tests' vocabulary.
 | Phone server reachable | `yes — the phone app answered on TCP`, `no — nothing is listening at that address`, `not checked yet` | discovery failure from reachability failure |
 | Authenticated | `yes — pinned key verified, AES-256-GCM in use`, `not authenticated`, `not yet` | *Connected* from *authenticated* |
 | Last discovery error | the reason, or `none` | why nothing was found |
-| Last connection error | the reason, or `none` | why the attempt failed |
+| Last connection error | the reason, or `none` | why the attempt failed — including a drop's gateway/answer verdict |
+| USB diagnosis | `USB is usable…`, `no Android device in Windows' USB tree`, `a driver problem (Code 28)`, `USB debugging is off`, `not inspected` | the four cable failures that all used to read *no device* |
+| USB next step | the concrete action, or `—` | what to actually do about it |
 
 `Not checked yet` and `unknown` are used wherever the honest answer is "nobody has
 looked", which is why `Connected` alone no longer prints "Pinned key verified" —
@@ -410,7 +475,7 @@ failures happened (§7) and `Phone address` is the direct fallback.
 
 ```powershell
 cd windows
-python -m pytest -q                      # 712 tests, 1 skipped (tkinter, Linux CI)
+python -m pytest -q                      # 754 tests, 1 skipped (tkinter, Linux CI)
 python -m pytest -q tests/test_controller_manager.py tests/test_controller_e2e.py
 cd .. ; python tools/verify.py           # 7 checks
 ```
