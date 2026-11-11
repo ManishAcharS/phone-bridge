@@ -61,6 +61,17 @@
         android:name="android.permission.ACCESS_FINE_LOCATION"
         android:maxSdkVersion="30" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+    <!--
+      Sensors: Android 12+ gates sampling faster than 200 Hz (and some vendors gate
+      more) behind HIGH_SAMPLING_RATE_SENSORS. It is a *normal* permission, granted
+      at install with no prompt, so declaring it costs the user nothing and lets
+      `sensor.list` report a measured "permitted" instead of a constant. Without the
+      declaration `checkSelfPermission` always answers "denied" and streaming would
+      be refused for a reason that was never true.
+    -->
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+    <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="false" />
     <uses-permission
         android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />

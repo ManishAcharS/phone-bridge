@@ -311,6 +311,12 @@ def test_declared_permissions_are_exactly_the_ones_the_code_uses():
         # Phase 5: BLE scanning, and the Android 11-and-older spelling of it.
         "android.permission.BLUETOOTH_SCAN",
         "android.permission.ACCESS_FINE_LOCATION",
+        # Phase 5.1: a *normal* permission (granted at install, never prompted)
+        # that gates high-rate sensor sampling on Android 12+. The sensor engine
+        # reads it with checkSelfPermission to report a measured state instead of
+        # a hardcoded `permitted: true`, so it has to be declared or the answer
+        # would always be "denied" on a device that is perfectly capable.
+        "android.permission.HIGH_SAMPLING_RATE_SENSORS",
     }
     declared = permissions()
     assert declared == expected, (

@@ -2,6 +2,7 @@ package dev.phonebridge.net
 
 import android.content.Context
 import android.net.Uri
+import android.os.SystemClock
 import java.io.InputStream
 import java.io.OutputStream
 import java.security.MessageDigest
@@ -64,8 +65,24 @@ class FileTransferEngine(
         /** Chunks buffered from the reader thread before the writer catches up. */
         const val INBOUND_QUEUE = 8
 
-        /** How long the reader waits for the writer before failing the transfer. */
-        const val INBOUND_WAIT_MS = 5_000L
+        /**
+         * How long the session reader waits for the writer before failing.
+         *
+         * Deliberately short: this runs on the connection's read thread, so every
+         * millisecond here is a millisecond in which heartbeats, acknowledgements
+         * and control replies are not being read. A slow card is a reason to fail
+         * a transfer with a sentence, not to stall the session.
+         */
+        const val INBOUND_WAIT_MS = 250L
+
+        /**
+         * How long the sender holds its first chunk waiting for the PC's resume
+         * decision. A phone->PC download starts streaming the moment it answers
+         * `file.request`, which used to make a resume impossible; waiting briefly
+         * makes the handshake deterministic, and the window is short enough that a
+         * PC which never asks (an older build) sees no delay worth noticing.
+         */
+        const val RESUME_GRACE_MS = 1_000L
 
         /** Files the user picked for sending, announced to the PC on request. */
         const val MAX_SELECTION = 16
@@ -76,6 +93,7 @@ class FileTransferEngine(
         const val KEY_DIGEST = "digest"
         const val KEY_PART = "part_uri"
         const val KEY_BYTES = "bytes"
+        const val KEY_CHUNK = "chunk_size"
         const val APPEND_HINT = " (the folder permission may have been revoked)"
     }
 
@@ -159,6 +177,20 @@ class FileTransferEngine(
     private var writer: Thread? = null
     @Volatile
     private var inboundQueue: LinkedBlockingQueue<FileFrames.Chunk>? = null
+
+    /**
+     * The phone->PC resume handshake.
+     *
+     * `requested` holds the offset the PC asked for before the sender committed to
+     * one; `started` remembers the offset it actually began at, so a *late*
+     * `file.resume` is answered with the truth instead of a number the receiver
+     * would use to truncate good bytes. `decided` is the "the sender has committed"
+     * marker that makes both answers deterministic.
+     */
+    private val resumeLock = Object()
+    private val requested = HashMap<Int, Long>()
+    private val started = HashMap<Int, Long>()
+    private val decided = HashSet<Int>()
 
     // ------------------------------------------------------------------ //
     // observation
@@ -269,9 +301,7 @@ class FileTransferEngine(
         }
 
         val id = nextId.getAndIncrement()
-        val resumeFrom = resumeOffsetFor(name, size, digest)
-        val partName = FileFrames.partName(name)
-        val partUri = SafStore.createDocument(context, partName, SafStore.mimeFor(name))
+        val (resumeFrom, partUri) = openPart(name, size, digest, chunkSize)
         val transfer = Transfer(
             id = id,
             direction = TO_PHONE,
@@ -284,6 +314,9 @@ class FileTransferEngine(
             partUri = partUri.toString(),
         )
         synchronized(lock) { transfers[id] = transfer }
+        // Record the identity before a single chunk arrives: a transfer that dies
+        // during the first window must still be findable on the next attempt.
+        rememberResume(transfer)
         ensureWriter()
         publish()
         log("INFO", "offered $name ($size B) as transfer $id")
@@ -298,29 +331,71 @@ class FileTransferEngine(
     /**
      * Resume metadata, kept in preferences rather than in a sidecar document.
      *
-     * Only a transfer that died mid-flight with the *same* name, size and digest
-     * may resume: resuming anything else would append new bytes to an old file.
-     * The part document's actual size is checked too, so a part the user deleted
-     * (or a folder that was revoked) restarts from zero instead of lying.
+     * A record may only be used when *everything* that identifies the transfer
+     * matches: the name, the size, the digest and the chunk size. The chunk size is
+     * part of the identity because a resume offset is a chunk boundary — bytes
+     * written as 64 KiB chunks cannot be continued as a 16 KiB-chunk transfer.
      */
-    private fun resumeOffsetFor(name: String, size: Long, digest: String): Long {
+    private data class ResumeRecord(
+        val name: String,
+        val size: Long,
+        val sha256: String,
+        val partUri: String,
+        val bytes: Long,
+        val chunkSize: Int,
+    )
+
+    private fun resumeRecord(): ResumeRecord? {
         val prefs = context.getSharedPreferences(RESUME_PREFS, Context.MODE_PRIVATE)
-        if (prefs.getString(KEY_NAME, null) != name) return 0
-        if (prefs.getLong(KEY_SIZE, -1) != size) return 0
-        if (prefs.getString(KEY_DIGEST, null) != digest) return 0
-        val storedUri = prefs.getString(KEY_PART, null) ?: return 0
-        val bytes = prefs.getLong(KEY_BYTES, 0)
-        if (bytes <= 0) return 0
-        return try {
-            val uri = Uri.parse(storedUri)
-            val actual = SafStore.sizeOf(context, uri)
-            // Chunk-aligned: a partial chunk would be written twice otherwise.
-            val aligned = (bytes / FileFrames.CHUNK_SIZE) * FileFrames.CHUNK_SIZE
-            if (actual >= 0 && actual >= aligned && aligned > 0) aligned else 0
-        } catch (e: Exception) {
-            log("WARN", "resume metadata could not be used: ${e.message}")
-            0
+        val name = prefs.getString(KEY_NAME, null) ?: return null
+        val digest = prefs.getString(KEY_DIGEST, null) ?: return null
+        val partUri = prefs.getString(KEY_PART, null) ?: return null
+        val size = prefs.getLong(KEY_SIZE, -1L)
+        val bytes = prefs.getLong(KEY_BYTES, 0L)
+        if (size <= 0L || bytes <= 0L) return null
+        return ResumeRecord(name, size, digest, partUri, bytes, prefs.getInt(KEY_CHUNK, 0))
+    }
+
+    /**
+     * Choose the document this transfer writes into, and where in it.
+     *
+     * A resumed transfer must continue in the **same** document. Creating a second
+     * `.part` and walking away from the first is how the previous release lost
+     * every resumed file: the metadata described bytes that were no longer being
+     * written to. The offset is aligned to the *negotiated* chunk size, and the
+     * document must hold exactly that many bytes, or the transfer starts over
+     * rather than appending to something that does not match.
+     */
+    private fun openPart(name: String, size: Long, digest: String, chunkSize: Int): Pair<Long, Uri> {
+        val previous = resumeRecord()
+        if (previous != null &&
+            previous.name == name &&
+            previous.size == size &&
+            previous.sha256 == digest &&
+            (previous.chunkSize == 0 || previous.chunkSize == chunkSize)
+        ) {
+            val aligned = if (chunkSize > 0) previous.bytes / chunkSize * chunkSize else 0L
+            val uri = runCatching { Uri.parse(previous.partUri) }.getOrNull()
+            val actual = if (uri != null) SafStore.sizeOf(context, uri) else -1L
+            if (uri != null && aligned > 0L && aligned < size && actual == aligned) {
+                log("INFO", "resuming $name at $aligned B in $uri")
+                return aligned to uri
+            }
+            log(
+                "WARN",
+                "not resuming $name: metadata says $aligned B, the part holds $actual B",
+            )
+            // The partial document is deliberately left alone: it is the user's
+            // data, and deleting it here would destroy a resume that a later
+            // attempt (with the right chunk size, say) could still use.
         }
+        val created = SafStore.createDocument(
+            context,
+            FileFrames.partName(name),
+            SafStore.mimeFor(name),
+        )
+        log("INFO", "receiving $name into a new .part document")
+        return 0L to created
     }
 
     private fun rememberResume(transfer: Transfer) {
@@ -331,6 +406,7 @@ class FileTransferEngine(
             .putString(KEY_DIGEST, transfer.sha256)
             .putString(KEY_PART, transfer.partUri)
             .putLong(KEY_BYTES, transfer.bytes)
+            .putInt(KEY_CHUNK, transfer.chunkSize)
             .apply()
     }
 
@@ -440,14 +516,16 @@ class FileTransferEngine(
             if (transfer.direction != TO_PHONE) continue
             if (transfer.state == CANCELLED || transfer.state == FAILED) continue
             if (synchronized(lock) { paused.contains(chunk.transferId) }) {
-                // A paused transfer must not write, but the chunk is not lost: it is
-                // re-queued so resume continues exactly where it stopped.
+                // A paused transfer must not write, but the chunk is not lost. It is
+                // put back with a *blocking* put, not an offer: dropping it here
+                // would silently corrupt the file, and the writer is this queue's
+                // only consumer, so the put cannot deadlock.
                 try {
                     Thread.sleep(100)
+                    queue.put(chunk)
                 } catch (e: InterruptedException) {
                     return
                 }
-                queue.offer(chunk)
                 continue
             }
             if (!writeChunk(transfer, chunk)) return
@@ -457,20 +535,27 @@ class FileTransferEngine(
     private fun writeChunk(transfer: Transfer, chunk: FileFrames.Chunk): Boolean {
         val id = transfer.id
         // Resume: the sender may continue at the offset we reported, so anything
-        // before that offset has already been written.
+        // before that offset is already on disk.
         val startIndex = (transfer.resumedFrom / transfer.chunkSize).toInt()
-        if (chunk.chunkIndex < startIndex) {
+        val expectedIndex = transfer.chunks + startIndex
+        if (chunk.chunkIndex < expectedIndex) {
+            // A duplicate — a retry, or a sender that restarted at zero because it
+            // could not honour the offset. Acknowledge it and never write it twice:
+            // appending it again would corrupt the file and fail the hash at the end.
             sendAck(id, chunk.chunkIndex)
+            log("DEBUG", "ignoring duplicate chunk ${chunk.chunkIndex} of transfer $id")
             return true
         }
-        val expectedIndex = transfer.chunks + startIndex
         if (chunk.chunkIndex > expectedIndex) {
             cancelInbound(id, "chunk ${chunk.chunkIndex} arrived before $expectedIndex")
             return true
         }
         val uri = Uri.parse(transfer.partUri)
         try {
-            val append = chunk.chunkIndex > startIndex
+            // Append for every chunk of a resumed transfer (the prefix is already in
+            // the document) and for every chunk after the first. `"wt"` truncates,
+            // so it is only correct for a brand-new part.
+            val append = transfer.resumedFrom > 0L || transfer.chunks > 0
             val stream = openPart(uri, if (append) "wa" else "wt")
                 ?: return failWrite(id, "the phone could not open ${transfer.name}$APPEND_HINT")
             stream.use { out ->
@@ -481,7 +566,7 @@ class FileTransferEngine(
             return failWrite(id, "writing ${transfer.name} failed: ${e.message}")
         }
         val digest = digests[id] ?: MessageDigest.getInstance("SHA-256").also { digests[id] = it }
-        if (chunk.chunkIndex == startIndex && transfer.resumedFrom > 0) {
+        if (chunk.chunkIndex == startIndex && transfer.resumedFrom > 0L) {
             // Continuing an earlier part: those bytes are already on disk, so the
             // digest has to be rebuilt from them *by streaming*, not by loading the
             // file into memory.
@@ -502,6 +587,7 @@ class FileTransferEngine(
         synchronized(lock) { transfers[id] = updated }
         if (chunk.chunkIndex % FileFrames.ACK_EVERY_CHUNKS == 0) rememberResume(updated)
         if (chunk.isEnd || written >= transfer.size) {
+            rememberResume(updated)
             finishInbound(updated)
             publish()
             return true
@@ -527,15 +613,23 @@ class FileTransferEngine(
         val digest = digests.remove(transfer.id)?.digest()
         val uri = Uri.parse(transfer.partUri)
         if (transfer.bytes != transfer.size) {
+            // A short file is an *incomplete* one, not a wrong one: keep the part
+            // and its metadata so the next attempt resumes from where this stopped.
             return failInbound(
                 transfer,
                 "the phone received ${transfer.bytes} of ${transfer.size} bytes",
-                "hash_mismatch",
+                keepPart = true,
             )
         }
         val actual = digest?.let { FileFrames.hex(it) } ?: ""
         if (actual.isEmpty() || actual != transfer.sha256) {
-            return failInbound(transfer, "the SHA-256 did not match the offer", "hash_mismatch")
+            // Wrong bytes are not resumable, so the part and its metadata go: a
+            // later attempt must start from zero rather than trust this prefix.
+            return failInbound(
+                transfer,
+                "the SHA-256 did not match the offer",
+                keepPart = false,
+            )
         }
         // Atomic completion: rename only after the bytes are known good.
         val renamed = SafStore.renameDocument(context, uri, transfer.name)
@@ -554,9 +648,20 @@ class FileTransferEngine(
         publish()
     }
 
-    private fun failInbound(transfer: Transfer, message: String, code: String) {
-        SafStore.deleteDocument(context, Uri.parse(transfer.partUri))
-        clearResume()
+    /**
+     * Fail a transfer, deciding honestly whether its partial data survives.
+     *
+     * `keepPart = true` is the incomplete case (a dropped link, a short file): the
+     * bytes are a valid prefix, so deleting them would throw away the only thing
+     * that makes resume possible. `false` is the corrupt case (a hash mismatch):
+     * those bytes can never be completed, so they go — as does the metadata that
+     * describes them — and the next attempt starts clean.
+     */
+    private fun failInbound(transfer: Transfer, message: String, keepPart: Boolean) {
+        if (!keepPart) {
+            SafStore.deleteDocument(context, Uri.parse(transfer.partUri))
+            clearResume()
+        }
         update(transfer.id) {
             it.copy(
                 state = FAILED,
@@ -565,12 +670,15 @@ class FileTransferEngine(
                 finishedAtMs = System.currentTimeMillis(),
             )
         }
-        log("WARN", "file transfer ${transfer.id} failed verification: $message")
+        log(
+            "WARN",
+            "file transfer ${transfer.id} failed: $message" +
+                if (keepPart) " (the partial file is kept for a resume)" else "",
+        )
         sendCatching(
             FileFrames.Chunk(transfer.id, 0, ByteArray(0), FileFrames.FLAG_CANCEL)
         )
         _state.value = _state.value.copy(lastError = message)
-        log("DEBUG", "verification failure reported as $code")
     }
 
     private fun cancelInbound(id: Int, reason: String) {
@@ -579,6 +687,8 @@ class FileTransferEngine(
             cancelled.add(id)
             paused.remove(id)
         }
+        digests.remove(id)
+        synchronized(resumeLock) { resumeLock.notifyAll() }
         if (transfer.partUri.isNotEmpty()) {
             SafStore.deleteDocument(context, Uri.parse(transfer.partUri))
         }
@@ -656,6 +766,11 @@ class FileTransferEngine(
             paused.remove(id)
             cancelled.remove(id)
         }
+        synchronized(resumeLock) {
+            requested.remove(id)
+            started.remove(id)
+            decided.remove(id)
+        }
         publish()
         Thread({ sender(id) }, "phonebridge-files-sender").apply {
             isDaemon = true
@@ -667,6 +782,7 @@ class FileTransferEngine(
             "size" to size,
             "sha256" to digest,
             "chunk_size" to FileFrames.CHUNK_SIZE,
+            "resume_from" to 0L,
         )
     }
 
@@ -675,10 +791,24 @@ class FileTransferEngine(
         val uri = Uri.parse(transfer.sourceUri)
         val chunkSize = transfer.chunkSize
         val total = ((transfer.size + chunkSize - 1) / chunkSize).toInt().coerceAtLeast(1)
-        update(id) { it.copy(state = ACTIVE) }
+        // Hold the first chunk until the PC has said where to start. Without this
+        // the phone is already streaming while the PC is still deciding, which is
+        // what made a resumed download impossible to negotiate.
+        val from = awaitResumeOffset(id, transfer)
+        if (from < 0L) {
+            log("INFO", "transfer $id was cancelled before it started")
+            publish()
+            return
+        }
+        val startIndex = if (chunkSize > 0) (from / chunkSize).toInt() else 0
+        synchronized(ackLock) { ackedUpTo[id] = startIndex - 1 }
+        update(id) {
+            it.copy(state = ACTIVE, bytes = from, chunks = startIndex, resumedFrom = from)
+        }
         try {
             context.contentResolver.openInputStream(uri)?.use { input ->
-                streamOut(id, input, total, chunkSize)
+                if (from > 0L) skipFully(input, from)
+                streamOut(id, input, total, chunkSize, startIndex)
             } ?: run {
                 update(id) {
                     it.copy(
@@ -702,9 +832,9 @@ class FileTransferEngine(
         publish()
     }
 
-    private fun streamOut(id: Int, input: InputStream, total: Int, chunkSize: Int) {
-        var index = 0
-        var sent = 0L
+    private fun streamOut(id: Int, input: InputStream, total: Int, chunkSize: Int, startIndex: Int) {
+        var index = startIndex
+        var sent = startIndex.toLong() * chunkSize
         while (index < total) {
             if (synchronized(lock) { cancelled.contains(id) }) {
                 update(id) {
@@ -772,6 +902,73 @@ class FileTransferEngine(
     }
 
     private fun nameOf(id: Int): String = transfer(id)?.name ?: "transfer $id"
+
+    /**
+     * Wait for the PC's resume decision, bounded by [RESUME_GRACE_MS].
+     *
+     * Returns the byte offset to start at, or `-1` when the transfer was cancelled
+     * or the session ended before it began. A PC that never asks (an older build)
+     * gets offset zero after the grace, i.e. exactly the old behaviour.
+     */
+    private fun awaitResumeOffset(id: Int, transfer: Transfer): Long {
+        val requestedOffset: Long
+        synchronized(resumeLock) {
+            val deadline = SystemClock.elapsedRealtime() + RESUME_GRACE_MS
+            while (id !in requested) {
+                if (synchronized(lock) { cancelled.contains(id) }) {
+                    decided.add(id)
+                    return -1L
+                }
+                val remaining = deadline - SystemClock.elapsedRealtime()
+                if (remaining <= 0L) break
+                try {
+                    resumeLock.wait(remaining.coerceAtMost(50L))
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    decided.add(id)
+                    return -1L
+                }
+            }
+            requestedOffset = requested.remove(id) ?: 0L
+            decided.add(id)
+            val offset = sanitiseOffset(transfer, requestedOffset)
+            started[id] = offset
+            return offset
+        }
+    }
+
+    /** A resume offset is only usable on a chunk boundary inside the file. */
+    private fun sanitiseOffset(transfer: Transfer, offset: Long): Long {
+        if (offset <= 0L) return 0L
+        if (offset >= transfer.size) {
+            log("WARN", "resume offset $offset is at or past the end of ${transfer.name}")
+            return 0L
+        }
+        val chunkSize = transfer.chunkSize
+        if (chunkSize <= 0) return 0L
+        val aligned = offset / chunkSize * chunkSize
+        if (aligned != offset) {
+            log("WARN", "resume offset $offset is not a multiple of $chunkSize; using $aligned")
+        }
+        return aligned
+    }
+
+    /** Skip exactly [count] bytes, or throw: a short skip would corrupt the file. */
+    private fun skipFully(input: InputStream, count: Long) {
+        var remaining = count
+        while (remaining > 0L) {
+            val skipped = input.skip(remaining)
+            if (skipped > 0L) {
+                remaining -= skipped
+                continue
+            }
+            // `skip` may return 0 at a stream boundary; read one byte to progress.
+            if (input.read() < 0) {
+                throw java.io.IOException("the file ended $remaining bytes before the resume offset")
+            }
+            remaining -= 1L
+        }
+    }
 
     /** Wait until [index] has been acknowledged, or fail with a sentence. */
     private fun waitForAck(id: Int, index: Int): Boolean {
@@ -847,7 +1044,21 @@ class FileTransferEngine(
             )
         }
         val pcVerified = params["verified"] as? Boolean
-        update(id) { it.copy(verified = pcVerified ?: it.verified) }
+        update(id) {
+            if (pcVerified == false) {
+                // The PC read the bytes back and they were wrong: the card must not
+                // keep saying "complete" while the only machine that verified it
+                // says otherwise.
+                it.copy(
+                    state = FAILED,
+                    verified = false,
+                    error = "the PC could not verify the file",
+                    finishedAtMs = System.currentTimeMillis(),
+                )
+            } else {
+                it.copy(verified = pcVerified ?: it.verified)
+            }
+        }
         return linkedMapOf(
             "ok" to true,
             "verified" to (pcVerified ?: false),
@@ -866,6 +1077,9 @@ class FileTransferEngine(
             cancelInbound(id, "cancelled by the PC")
         } else {
             synchronized(lock) { cancelled.add(id) }
+            // A sender still holding its first chunk must wake up and stop, or the
+            // cancel would be honoured only after the grace period.
+            synchronized(resumeLock) { resumeLock.notifyAll() }
             update(id) {
                 it.copy(state = CANCELLED, finishedAtMs = System.currentTimeMillis())
             }
@@ -883,6 +1097,16 @@ class FileTransferEngine(
         return linkedMapOf("ok" to true, "state" to PAUSED)
     }
 
+    /**
+     * Resume a transfer, optionally from a byte offset the receiver already holds.
+     *
+     * For a phone->PC download the offset is the negotiation: the sender holds its
+     * first chunk until this call (or the grace period) decides where to start, so
+     * the receiver never has to discard a prefix it asked us to skip. The reply
+     * always states the offset the sender will *actually* use — for a transfer that
+     * has already begun, that is where it began, not what was asked for, because
+     * the receiver uses this number to decide how much of its part file to keep.
+     */
     fun resume(params: Map<*, *>): Map<String, Any?> {
         val id = (params["transfer_id"] as? Number)?.toInt()
             ?: throw FileFailure("bad_params", "transfer_id is required")
@@ -891,12 +1115,42 @@ class FileTransferEngine(
         if (transfer.state == COMPLETE || transfer.state == CANCELLED) {
             throw FileFailure("bad_params", "transfer $id is ${transfer.state}; it cannot resume")
         }
+        val asked = (params["from_bytes"] as? Number)?.toLong() ?: 0L
+        if (asked < 0L || asked > transfer.size) {
+            throw FileFailure(
+                "bad_params",
+                "from_bytes $asked is outside this ${transfer.size} byte transfer",
+            )
+        }
+        if (transfer.direction == FROM_PHONE && transfer.chunkSize > 0 &&
+            asked % transfer.chunkSize != 0L
+        ) {
+            throw FileFailure(
+                "bad_params",
+                "from_bytes must be a multiple of the ${transfer.chunkSize} byte chunk size",
+            )
+        }
+        var applied = asked
+        if (transfer.direction == FROM_PHONE) {
+            synchronized(resumeLock) {
+                if (id in decided) {
+                    // Too late to change the start: report where it really began.
+                    applied = started[id] ?: 0L
+                } else {
+                    requested[id] = asked
+                    resumeLock.notifyAll()
+                }
+            }
+        } else {
+            applied = transfer.resumedFrom
+        }
         synchronized(lock) {
             paused.remove(id)
             cancelled.remove(id)
         }
         update(id) { it.copy(state = ACTIVE) }
-        return linkedMapOf("ok" to true, "from_bytes" to transfer.bytes, "state" to ACTIVE)
+        log("INFO", "transfer $id resumes at $applied B (asked for $asked)")
+        return linkedMapOf("ok" to true, "from_bytes" to applied, "state" to ACTIVE)
     }
 
     // ------------------------------------------------------------------ //
@@ -911,6 +1165,7 @@ class FileTransferEngine(
                 it.copy(state = CANCELLED, error = why, finishedAtMs = System.currentTimeMillis())
             }
         }
+        synchronized(resumeLock) { resumeLock.notifyAll() }
         log("INFO", "file transfers ended with the session ($why)")
     }
 
@@ -926,6 +1181,13 @@ class FileTransferEngine(
             ackedUpTo.clear()
             ackLock.notifyAll()
         }
+        synchronized(resumeLock) {
+            requested.clear()
+            started.clear()
+            decided.clear()
+            resumeLock.notifyAll()
+        }
+        digests.clear()
         inboundQueue = null
         writer?.interrupt()
         writer = null

@@ -77,8 +77,10 @@ object SensorFrames {
         13 to "ambient temperature is often a placeholder value",
         17 to "significant motion is an event, not a reading",
         19 to "step counter and detector are reported as they happen",
+        21 to "heart rate needs the BODY_SENSORS permission, which this build does not request",
         22 to "accelerometer uncalibrated is not streamed in this release",
         28 to "pose sensors are camera-dependent",
+        35 to "heart beat needs the BODY_SENSORS permission, which this build does not request",
     )
 
     data class Frame(

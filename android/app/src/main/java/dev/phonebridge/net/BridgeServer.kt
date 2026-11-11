@@ -19,10 +19,13 @@ import java.text.SimpleDateFormat
 import java.util.Collections
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -181,9 +184,30 @@ class BridgeServer(
         log = { level, message -> addLog(level, message) },
     )
 
-    private val phase5Executor = Executors.newFixedThreadPool(3) { runnable ->
-        Thread(runnable, "phonebridge-phase5").apply { isDaemon = true }
-    }
+    /**
+     * Worker pool for the blocking Phase 5 calls.
+     *
+     * Bounded on purpose: every GATT task can block for fifteen seconds, so an
+     * unbounded queue would let a handful of stalled reads delay every file and
+     * sensor call behind them — past the PC's own timeouts, which then report a
+     * timeout for work that succeeds later. A full queue answers `busy` at once.
+     */
+    private val phase5Executor = ThreadPoolExecutor(
+        3,
+        3,
+        30L,
+        TimeUnit.SECONDS,
+        ArrayBlockingQueue(12),
+        { runnable -> Thread(runnable, "phonebridge-phase5").apply { isDaemon = true } },
+    )
+
+    /** The PC that started the sensor stream, so its frames go to *that* session. */
+    @Volatile
+    private var sensorPeer: PeerSession? = null
+
+    /** The PC that owns the current file transfer, for the same reason. */
+    @Volatile
+    private var filePeer: PeerSession? = null
 
     fun cameraState() = camera.state
     fun sensorState() = sensors.state
@@ -220,7 +244,10 @@ class BridgeServer(
     }
 
     private fun sendSensorFrame(streamId: Int, body: ByteArray) {
-        val session = sessions.firstOrNull { it.isReady }
+        // The session that asked for the stream owns it. "First ready session" is
+        // wrong as soon as a `watch` or a second CLI is connected: the frames would
+        // go to whoever is first in the list and the owning PC would see nothing.
+        val session = sensorPeer?.takeIf { it.isReady } ?: sessions.firstOrNull { it.isReady }
         if (session == null) {
             // No session: the engine is being told to stop; dropping is correct,
             // and a single line here is what makes a stuck stream visible.
@@ -231,7 +258,7 @@ class BridgeServer(
     }
 
     private fun sendFileFrame(streamId: Int, body: ByteArray) {
-        val session = sessions.firstOrNull { it.isReady }
+        val session = filePeer?.takeIf { it.isReady } ?: sessions.firstOrNull { it.isReady }
         if (session == null) {
             addLog("WARN", "dropping a file frame: no authenticated session")
             return
@@ -248,17 +275,31 @@ class BridgeServer(
      * drop. The reply goes through the normal send path, which is thread-safe.
      */
     private fun answerLater(peer: PeerSession, id: Any?, block: () -> Map<String, Any?>) {
-        phase5Executor.execute {
-            val payload = try {
-                Messages.responseOk(id, block())
-            } catch (e: RpcFailure) {
-                addLog("INFO", "RPC refused off-thread: ${e.code} - ${e.message}")
-                Messages.responseErr(id, e.code, e.message ?: e.code)
-            } catch (e: Exception) {
-                addLog("ERROR", "RPC failed off-thread: ${e.message}")
-                Messages.responseErr(id, "internal", "${e.javaClass.simpleName}: ${e.message}")
+        try {
+            phase5Executor.execute {
+                val payload = try {
+                    Messages.responseOk(id, block())
+                } catch (e: RpcFailure) {
+                    addLog("INFO", "RPC refused off-thread: ${e.code} - ${e.message}")
+                    Messages.responseErr(id, e.code, e.message ?: e.code)
+                } catch (e: Exception) {
+                    addLog("ERROR", "RPC failed off-thread: ${e.message}")
+                    Messages.responseErr(id, "internal", "${e.javaClass.simpleName}: ${e.message}")
+                }
+                runCatching { peer.sendControl(payload) }
+                    .onFailure { addLog("DEBUG", "could not send a deferred reply: ${it.message}") }
             }
-            peer.sendControl(payload)
+        } catch (e: RejectedExecutionException) {
+            // Better a sentence than a request that waits for a queue that never
+            // drains: the PC can retry, and its own timeout stays meaningful.
+            addLog("WARN", "refusing an off-thread RPC: the Phase 5 queue is full")
+            peer.sendControl(
+                Messages.responseErr(
+                    id,
+                    "busy",
+                    "the phone is still busy with other Bluetooth or file work; retry shortly",
+                ),
+            )
         }
     }
 
@@ -581,6 +622,8 @@ class BridgeServer(
 
     internal fun unregisterSession(session: PeerSession) {
         sessions.remove(session)
+        if (sensorPeer === session) sensorPeer = null
+        if (filePeer === session) filePeer = null
         publishPeers()
         // The last PC leaving must not leave a microphone or an AudioTrack open.
         releaseAudioIfIdle()
@@ -886,17 +929,20 @@ class BridgeServer(
                     id,
                     mapOf(
                         "sensors" to sensors.entries().map { it.asMap() },
-                        "permitted" to true,
+                        // Measured, not assumed: a phone that cannot sample must not
+                        // advertise its sensors as usable.
+                        "permitted" to sensors.permitted(),
                         "interval_us" to SensorFrames.DEFAULT_INTERVAL_US,
-                        "detail" to if (sensors.entries().isEmpty()) {
-                            "this phone reported no sensors"
-                        } else {
-                            ""
+                        "detail" to when {
+                            !sensors.permitted() -> sensors.permissionDetail()
+                            sensors.entries().isEmpty() -> "this phone reported no sensors"
+                            else -> ""
                         },
                     ),
                 )
 
                 "sensor.start" -> {
+                    sensorPeer = peer
                     val ids = SensorFrames.parseIds(params)
                     val interval = (params["interval_us"] as? Number)?.toInt()
                         ?: SensorFrames.DEFAULT_INTERVAL_US
@@ -913,6 +959,7 @@ class BridgeServer(
 
                 "sensor.stop" -> {
                     val stopped = sensors.state.value.active
+                    sensorPeer = null
                     sensors.stop("stopped by the PC")
                     Messages.responseOk(
                         id,
@@ -924,11 +971,13 @@ class BridgeServer(
 
                 // --- Phase 5: file transfer ----------------------------- //
                 "file.offer" -> {
+                    filePeer = peer
                     answerLater(peer, id) { files.offer(params) }
                     null
                 }
 
                 "file.request" -> {
+                    filePeer = peer
                     answerLater(peer, id) { files.request(params) }
                     null
                 }
