@@ -134,7 +134,7 @@ Additive; `PROTOCOL_VERSION` stays **1**.
 * 2 message kinds with documented bodies: `MSG_FILE` (0x50) on streams 5/6,
   `MSG_SENSOR` (0x60) on stream 4.
 * Error codes: 15 new documented values (`bluetooth_off`, `ble_denied`,
-  `sensor_denied`, `file_hash_failed`, …) — enforced by
+  `sensor_denied`, `no_file`, …) — enforced by
   `test_kotlin_only_returns_documented_error_codes`.
 * Logical isolation: each plane has its own stream and its own bounded queue, so
   a stalled transfer cannot starve control traffic.

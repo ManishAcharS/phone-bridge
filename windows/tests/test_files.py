@@ -121,7 +121,19 @@ class FakePhone:
         if chunk.flags & (FLAG_CANCEL | 0x10):
             return
         self.chunks.append(chunk)
-        if chunk.chunk_index * self.chunk_size != len(self.data):
+        expected = chunk.chunk_index * self.chunk_size
+        if expected < len(self.data):
+            # A duplicate: the sender re-sent a chunk whose acknowledgement it
+            # never saw. A real phone acknowledges it again (that is the whole
+            # point of the retry) and writes nothing. Failing here would make the
+            # fake stricter than the device.
+            self.duplicates = getattr(self, "duplicates", 0) + 1
+            if self.ack_target is not None:
+                from phonebridge.files.frames import ack as ack_frame
+
+                self.ack_target.push(ack_frame(chunk.transfer_id, chunk.chunk_index).encode())
+            return
+        if expected != len(self.data):
             raise AssertionError(f"chunk {chunk.chunk_index} arrived out of order")
         self.data.extend(chunk.payload)
         if self.chunk_delay:

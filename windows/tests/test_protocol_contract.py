@@ -12,6 +12,7 @@ it, and if they disagree the test says which side moved.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -28,6 +29,9 @@ from phonebridge.protocol import framing
 REPO = Path(__file__).resolve().parents[2]
 KOTLIN = REPO / "android/app/src/main/java/dev/phonebridge"
 SERVER = KOTLIN / "net/BridgeServer.kt"
+BLE_ENGINE = KOTLIN / "net/BleEngine.kt"
+SENSOR_ENGINE = KOTLIN / "net/SensorEngine.kt"
+FILE_ENGINE = KOTLIN / "net/FileTransferEngine.kt"
 DEVICE_FACTS = KOTLIN / "net/DeviceFacts.kt"
 MESSAGES = KOTLIN / "protocol/Messages.kt"
 BLE = KOTLIN / "net/BleEngine.kt"
@@ -156,6 +160,7 @@ DOCUMENTED_ERROR_CODES = {
     "sensor_denied",
     "sensor_failed",
     "unknown_transfer",
+    "no_file",
     "hash_mismatch",
     "storage_denied",
     "cancelled",
@@ -279,13 +284,51 @@ def simulator() -> SimulatedPhone:
 
 
 def call_sites() -> set[str]:
-    """Every method string the Python client passes to session.call()."""
+    """Every method string the Python client passes to ``session.call()``.
+
+    Parsed, not pattern-matched: the old regex only matched `.call("name")` on one
+    line, so a call split across lines — or one using a keyword argument — was
+    invisible to the contract, and a method that does not exist could slip
+    through. `ast` has no opinion about formatting; a call whose method is not a
+    literal string (a computed name) is reported rather than silently skipped.
+    """
     found: set[str] = set()
-    pattern = re.compile(r'\.call\(\s*"([^"]+)"')
+    dynamic: list[tuple[str, str]] = []
     for path in sorted(CLI_PACKAGE.rglob("*.py")):
         if "__pycache__" in str(path):
             continue
-        found |= set(pattern.findall(read(path)))
+        tree = ast.parse(read(path), filename=str(path))
+        # `_call`-style private helpers forward a method name they were handed.
+        # That is fine: their callers pass literals, which this scan collects. A
+        # *public* method that computes an RPC name would be a hole in the
+        # contract, so that is what the assertion below refuses.
+        enclosing = {
+            id(child): node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for child in ast.walk(node)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute) or func.attr != "call":
+                continue
+            name = None
+            if node.args and isinstance(node.args[0], ast.Constant):
+                name = node.args[0].value
+            for keyword in node.keywords:
+                if keyword.arg == "method" and isinstance(keyword.value, ast.Constant):
+                    name = keyword.value.value
+            if isinstance(name, str):
+                found.add(name)
+            else:
+                dynamic.append((enclosing.get(id(node), "<module>"), f"{path.name}:{node.lineno}"))
+    public = [site for site in dynamic if not site[0].startswith("_")]
+    assert not public, (
+        "a public call site computes its RPC method name, so the contract cannot "
+        f"check it: {public}"
+    )
     return found
 
 
@@ -425,8 +468,24 @@ def test_the_docs_say_every_operation_is_implemented():
 # 3. error contract
 # --------------------------------------------------------------------------- #
 def test_kotlin_only_returns_documented_error_codes():
-    codes = set(re.findall(r'responseErr\([^,]+,\s*"([a-z_]+)"', read(SERVER)))
-    assert codes, "no responseErr calls found; the regex or the source changed"
+    """Every refusal the phone can send is a documented code.
+
+    Four classes raise them (``responseErr`` for the dispatcher,
+    ``BleFailure``/``SensorFailure``/``FileFailure`` for the engines), so all
+    four are scanned: checking only the dispatcher is how the file-transfer codes
+    drifted away from docs/23 in the first place.
+    """
+    patterns = {
+        "BridgeServer": (SERVER, r'responseErr\(\s*[^,()]+,\s*"([a-z_]+)"'),
+        "BleEngine": (BLE_ENGINE, r'BleFailure\(\s*"([a-z_]+)"'),
+        "SensorEngine": (SENSOR_ENGINE, r'SensorFailure\(\s*"([a-z_]+)"'),
+        "FileTransferEngine": (FILE_ENGINE, r'FileFailure\(\s*"([a-z_]+)"'),
+    }
+    codes: set[str] = set()
+    for name, (path, pattern) in patterns.items():
+        found = set(re.findall(pattern, read(path)))
+        assert found, f"no error codes found in {name}; the pattern or the source changed"
+        codes |= found
     assert codes <= DOCUMENTED_ERROR_CODES, (
         f"undocumented error codes: {sorted(codes - DOCUMENTED_ERROR_CODES)}"
     )

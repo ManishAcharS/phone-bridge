@@ -416,7 +416,11 @@ def test_an_invalid_frame_is_counted_and_the_stream_survives() -> None:
         await link.refresh()
         await link.start([1])
         link.push(b"\x00" * 4)
-        assert await wait_for(lambda: link.snapshot().stats.get("0", {}).get("invalid") == 1)
+        # The malformed frame is counted on the link. It must not invent a
+        # "sensor 0" row: that row was the defect this test now guards against.
+        assert await wait_for(lambda: link.snapshot().invalid_frames == 1)
+        assert "0" not in link.snapshot().stats
+        assert "malformed" in link.snapshot().detail
         link.push(body(1, 0))
         assert await wait_for(lambda: link.reading(1) is not None)
         assert link.snapshot().state == ACTIVE

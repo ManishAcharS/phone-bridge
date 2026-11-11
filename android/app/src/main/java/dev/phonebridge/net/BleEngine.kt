@@ -79,6 +79,15 @@ class BleEngine(
         /** GATT operations that never answer must not outlive this. */
         const val GATT_TIMEOUT_MS = 15_000L
 
+        /** Not a platform status: the operation was abandoned by us. */
+        const val ABORTED = -1
+
+        /** At most this many scan events per second, however busy the room is. */
+        const val MAX_SCAN_EVENTS_PER_SECOND = 20
+
+        /** Requested ATT MTU after connecting; 23 is the minimum every stack has. */
+        const val REQUESTED_MTU = 517
+
         /** A scan with no duration is capped, so a forgotten stop cannot scan forever. */
         const val MAX_SCAN_MS = 120_000L
         const val DEFAULT_SCAN_MS = 10_000L
@@ -111,7 +120,10 @@ class BleEngine(
 
     private data class Link(
         val address: String,
-        var state: String = "connecting",
+        // Written by the GATT callback thread and read by a worker waiting for it,
+        // so it must be volatile: without that the wait loop is a data race whose
+        // exit depends on the JIT.
+        @Volatile var state: String = "connecting",
         var gatt: BluetoothGatt? = null,
         var error: String = "",
         val subscriptions: MutableList<String> = ArrayList(),
@@ -133,6 +145,18 @@ class BleEngine(
     private var scanning = false
     private var scanCallback: ScanCallback? = null
     private var scanStopRunnable: Runnable? = null
+    private var scanStartedAt = 0L
+    private var scanDuration = 0L
+    private var scanFilterUuids: List<String> = emptyList()
+
+    /** Only devices whose advertised name starts with this are reported. */
+    @Volatile
+    private var namePrefix = ""
+
+    //: A rate limit on `bluetooth.device` events: a crowded room would otherwise
+    //: push thousands of messages a second down the same channel as the RPCs.
+    private var eventWindowStartedAt = 0L
+    private var eventWindowCount = 0
 
     // ------------------------------------------------------------------ //
     // adapter
@@ -239,18 +263,23 @@ class BleEngine(
     fun startScan(params: Map<*, *>): Map<String, Any?> {
         val radio = requireScanReady()
         if (scanning) {
-            return linkedMapOf(
-                "ok" to true,
-                "scanning" to true,
-                "started_at_ms" to 0L,
-                "duration_ms" to 0L,
-            )
+            // A second start is a *new* scan, not a no-op: the old callback and its
+            // timer are released first so a repeated Start cannot stack scans.
+            runCatching { stopScan() }
         }
         val duration = ((params["duration_ms"] as? Number)?.toLong() ?: DEFAULT_SCAN_MS)
             .coerceIn(0L, MAX_SCAN_MS)
-        val filters = (params["filter_uuids"] as? List<*>)
-            ?.mapNotNull { runCatching { UUID.fromString(it.toString()) }.getOrNull() }
-            .orEmpty()
+        val requested = (params["filter_uuids"] as? List<*>).orEmpty()
+        val filters = ArrayList<UUID>(requested.size)
+        for (raw in requested) {
+            val uuid = runCatching { UUID.fromString(raw.toString()) }.getOrNull()
+                ?: throw BleFailure("bad_params", "'$raw' is not a UUID to filter on")
+            filters.add(uuid)
+        }
+        // A filter that is silently ignored shows the user every device in the room
+        // while claiming to filter, so an unusable one is an error, not a shrug.
+        val prefix = (params["name_prefix"] as? String)?.trim().orEmpty()
+        namePrefix = prefix
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
@@ -277,6 +306,7 @@ class BleEngine(
         }
         scanCallback = callback
         devices.clear()
+        scanFilterUuids = filters.map { it.toString() }
         val scanner = radio.bluetoothLeScanner
             ?: throw BleFailure("no_bluetooth", "this phone has no Bluetooth LE scanner")
         try {
@@ -289,14 +319,22 @@ class BleEngine(
             throw BleFailure("bluetooth_off", "the Bluetooth stack is not ready: ${e.message}")
         }
         scanning = true
-        val startedAt = android.os.SystemClock.elapsedRealtime()
+        val startedAt = SystemClock.elapsedRealtime()
+        scanStartedAt = startedAt
+        scanDuration = duration
+        eventWindowStartedAt = startedAt
+        eventWindowCount = 0
         if (duration > 0) {
             val stop = Runnable { runCatching { stopScan() } }
             scanStopRunnable = stop
             handler.postDelayed(stop, duration)
         }
         emit("bluetooth.scan", mapOf("state" to "scanning", "detail" to ""))
-        log("INFO", "BLE scan started for ${if (duration > 0) "${duration}ms" else "until stopped"}")
+        log(
+            "INFO",
+            "BLE scan started for ${if (duration > 0) "${duration}ms" else "until stopped"}" +
+                if (prefix.isEmpty()) "" else ", names starting with '$prefix'",
+        )
         return linkedMapOf(
             "ok" to true,
             "scanning" to true,
@@ -375,14 +413,48 @@ class BleEngine(
             return
         }
         devices[key] = merged
+        if (!acceptsByName(merged.name)) return
+        if (!emitScanEvent()) return
         emit("bluetooth.device", merged.asMap())
+    }
+
+    /** The documented `name_prefix` filter, applied as devices are seen. */
+    private fun acceptsByName(name: String): Boolean {
+        val prefix = namePrefix
+        if (prefix.isEmpty()) return true
+        return name.isNotEmpty() && name.startsWith(prefix, ignoreCase = true)
+    }
+
+    /**
+     * Rate limit for `bluetooth.device` events.
+     *
+     * A room full of advertising peripherals can produce thousands of sightings a
+     * second; every one of them is a JSON message on the control channel, which is
+     * also carrying the RPC replies and heartbeats. Dropping the *surplus events*
+     * loses nothing: the device list is deduplicated on the phone and the PC polls
+     * `bluetooth.scan.results`, so the newest state per device always arrives.
+     */
+    private fun emitScanEvent(): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        if (now - eventWindowStartedAt >= 1_000L) {
+            eventWindowStartedAt = now
+            eventWindowCount = 0
+        }
+        if (eventWindowCount >= MAX_SCAN_EVENTS_PER_SECOND) return false
+        eventWindowCount += 1
+        return true
     }
 
     fun results(): Map<String, Any?> = linkedMapOf(
         "scanning" to scanning,
-        "state" to if (scanning) "scanning" else "stopped",
+        "state" to if (scanning) "scanning" else if (devices.isEmpty()) "idle" else "stopped",
         "devices" to devicesList(),
         "detail" to "",
+        "started_at_ms" to scanStartedAt,
+        "duration_ms" to scanDuration,
+        "filter_uuids" to scanFilterUuids,
+        "name_prefix" to namePrefix,
+        "error" to "",
     )
 
     private fun devicesList(): List<Map<String, Any?>> =
@@ -465,25 +537,23 @@ class BleEngine(
 
     fun read(params: Map<*, *>): Map<String, Any?> {
         val link = requireLink(params)
-        val (service, characteristic) = requireCharacteristic(link, params)
+        val (_, char) = requireCharacteristic(link, params)
         val gatt = link.gatt ?: throw BleFailure("not_connected", "${link.address} is not connected")
-        val char = characteristic
-        // API 33 uses readCharacteristic(); older releases need readCharacteristic() too
-        // but report the value through the same callback.
-        if (!gatt.readCharacteristic(char)) {
-            throw BleFailure("gatt_failed", "the phone refused to read ${shortUuid(char.uuid)}")
-        }
-        val deadline = android.os.SystemClock.elapsedRealtime() + GATT_TIMEOUT_MS
-        var value: ByteArray? = null
-        while (value == null) {
-            if (android.os.SystemClock.elapsedRealtime() > deadline) {
-                throw BleFailure("gatt_failed", "reading ${shortUuid(char.uuid)} timed out")
+        val bytes = runOperation(link, "read", char) { op ->
+            if (!gatt.readCharacteristic(char)) {
+                throw BleFailure("gatt_failed", "the phone refused to read ${shortUuid(char.uuid)}")
             }
-            value = readValues[Key(link.address, char.uuid.toString())]
-            if (value == null) Thread.sleep(20)
+            val result = awaitOperation(op)
+            if (result.status != BluetoothGatt.GATT_SUCCESS) {
+                // The platform's own reason, not "timed out": a peripheral that
+                // answers "insufficient authentication" says so.
+                throw BleFailure(
+                    "gatt_failed",
+                    "reading ${shortUuid(char.uuid)} failed: ${gattStatus(result.status ?: ABORTED)}",
+                )
+            }
+            result.value ?: ByteArray(0)
         }
-        readValues.remove(Key(link.address, char.uuid.toString()))
-        val bytes = value.copyOf()
         log("INFO", "GATT read ${shortUuid(char.uuid)}: ${bytes.size} B from ${link.address}")
         return linkedMapOf(
             "value_b64" to Base64.encodeToString(bytes, Base64.NO_WRAP),
@@ -517,17 +587,36 @@ class BleEngine(
             characteristic.writeType = type
             characteristic.value = bytes
         }
-        val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeCharacteristic(characteristic, bytes, type) == BluetoothGatt.GATT_SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            gatt.writeCharacteristic(characteristic)
-        }
-        if (!started) {
-            throw BleFailure("gatt_failed", "the phone refused to write ${shortUuid(characteristic.uuid)}")
+        // A write with response is only successful when Android says so in
+        // `onCharacteristicWrite`; the boolean below only means "accepted for
+        // transmission". Reporting success before the callback is how a rejected
+        // write used to look identical to a successful one.
+        runOperation(link, "write", characteristic) { op ->
+            val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(characteristic, bytes, type) == BluetoothGatt.GATT_SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                gatt.writeCharacteristic(characteristic)
+            }
+            if (!started) {
+                throw BleFailure(
+                    "gatt_failed",
+                    "the phone refused to write ${shortUuid(characteristic.uuid)}",
+                )
+            }
+            if (withResponse) {
+                val result = awaitOperation(op)
+                if (result.status != BluetoothGatt.GATT_SUCCESS) {
+                    throw BleFailure(
+                        "gatt_failed",
+                        "writing ${shortUuid(characteristic.uuid)} failed: " +
+                            gattStatus(result.status ?: ABORTED),
+                    )
+                }
+            }
         }
         log("INFO", "GATT write ${shortUuid(characteristic.uuid)}: ${bytes.size} B to ${link.address}")
-        return linkedMapOf("ok" to true, "bytes" to bytes.size)
+        return linkedMapOf("ok" to true, "bytes" to bytes.size, "confirmed" to withResponse)
     }
 
     fun subscribe(params: Map<*, *>): Map<String, Any?> {
@@ -537,8 +626,14 @@ class BleEngine(
         val enable = params["enable"] as? Boolean ?: true
         val key = characteristic.uuid.toString()
         if (!enable) {
-            gatt.setCharacteristicNotification(characteristic, false)
-            writeCccd(gatt, characteristic, false)
+            runCatching {
+                runOperation(link, "descriptor", characteristic) { op ->
+                    gatt.setCharacteristicNotification(characteristic, false)
+                    writeCccd(gatt, characteristic, false)
+                    // Best effort: an unsubscribed link is being torn down anyway.
+                    runCatching { awaitOperation(op) }
+                }
+            }
             synchronized(link) { link.subscriptions.remove(key) }
             log("INFO", "unsubscribed ${shortUuid(characteristic.uuid)} on ${link.address}")
             return linkedMapOf("ok" to true, "subscribed" to false)
@@ -553,10 +648,27 @@ class BleEngine(
         ) {
             throw BleFailure("gatt_failed", "${shortUuid(characteristic.uuid)} does not notify")
         }
-        if (!gatt.setCharacteristicNotification(characteristic, true)) {
-            throw BleFailure("gatt_failed", "the phone refused the notification registration")
+        runOperation(link, "descriptor", characteristic) { op ->
+            if (!gatt.setCharacteristicNotification(characteristic, true)) {
+                throw BleFailure("gatt_failed", "the phone refused the notification registration")
+            }
+            if (!writeCccd(gatt, characteristic, true)) {
+                throw BleFailure(
+                    "gatt_failed",
+                    "the phone refused the descriptor write for ${shortUuid(characteristic.uuid)}",
+                )
+            }
+            // The CCCD write is what actually enables notifications: a subscription
+            // is only real once Android confirms it.
+            val result = awaitOperation(op)
+            if (result.status != BluetoothGatt.GATT_SUCCESS) {
+                throw BleFailure(
+                    "gatt_failed",
+                    "subscribing to ${shortUuid(characteristic.uuid)} failed: " +
+                        gattStatus(result.status ?: ABORTED),
+                )
+            }
         }
-        writeCccd(gatt, characteristic, true)
         synchronized(link) { if (key !in link.subscriptions) link.subscriptions.add(key) }
         log("INFO", "subscribed ${shortUuid(characteristic.uuid)} on ${link.address}")
         return linkedMapOf("ok" to true, "subscribed" to true)
@@ -582,6 +694,7 @@ class BleEngine(
         linkedMapOf(
             "address" to it.address,
             "state" to it.state,
+            "mtu" to it.mtu,
             "subscriptions" to synchronized(it) { it.subscriptions.toList() },
             "error" to it.error,
         )
@@ -596,18 +709,56 @@ class BleEngine(
     }
 
     // ------------------------------------------------------------------ //
-    // callbacks
+    // operation bookkeeping
     // ------------------------------------------------------------------ //
-    private data class Key(val address: String, val uuid: String)
+    /**
+     * One outstanding GATT operation.
+     *
+     * Android delivers GATT results on a callback, so "did the write work?" is only
+     * answerable once `onCharacteristicWrite` arrives. Each operation therefore has
+     * its own monitor, which the waiting worker sleeps on and the callback notifies;
+     * the result is never inferred from the return value of the request call.
+     */
+    private class Op(val kind: String, val address: String, val uuid: String) {
+        var status: Int? = null
+        var value: ByteArray? = null
+        var done: Boolean = false
 
-    private val readValues = ConcurrentHashMap<Key, ByteArray>()
-    private val pending = ConcurrentHashMap<Key, Boolean>()
+        fun complete(status: Int, value: ByteArray? = null) {
+            synchronized(this) {
+                this.status = status
+                this.value = value
+                this.done = true
+                (this as Object).notifyAll()
+            }
+        }
+
+        fun abort() = complete(ABORTED)
+    }
+
+    private data class Key(val address: String, val uuid: String, val kind: String)
+
+    /** In-flight operations, keyed by target. At most one per key, by construction. */
+    private val operations = ConcurrentHashMap<Key, Op>()
+
+    /**
+     * One monitor per link: Android allows a single outstanding GATT operation per
+     * connection, so operations on the *same* peripheral are serialised while
+     * different peripherals still run in parallel. This is the queue docs/21
+     * describes; the previous release ran three at once and let the platform refuse
+     * the second with an error that looked like a peripheral fault.
+     */
+    private val linkLocks = ConcurrentHashMap<String, Any>()
+
+    private fun linkLock(address: String): Any = linkLocks.getOrPut(address) { Any() }
 
     private fun callback(link: Link) = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                link.state = "failed"
-                link.error = gattStatus(status)
+                // A failed link must not leak its client interface: Android allows a
+                // few dozen per app, and a GATT 133 is the most common BLE error
+                // there is, so a leak here bricks Bluetooth after a dozen drops.
+                failLink(link, gattStatus(status), close = true)
                 log("WARN", "GATT ${link.address} connection failed: ${link.error}")
                 emit("bluetooth.gatt", mapOf("address" to link.address, "state" to "failed", "error" to link.error))
                 return
@@ -618,17 +769,22 @@ class BleEngine(
                     // useless to the PC, and the discovery is what almost always fails
                     // on a flaky peripheral.
                     if (!gatt.discoverServices()) {
-                        link.state = "failed"
-                        link.error = "the peripheral refused service discovery"
+                        failLink(link, "the peripheral refused service discovery", close = true)
                         return
                     }
+                    // 23 is the ATT minimum; asking for more is what makes a long
+                    // characteristic readable in one round trip. Failure is fine.
+                    runCatching { gatt.requestMtu(REQUESTED_MTU) }
                     link.state = "connected"
                 }
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     val wasConnected = link.state == "connected"
+                    // Any operation still waiting on this link will never be answered.
+                    abortOperations(link.address)
                     link.state = "disconnected"
                     link.gatt = null
+                    links.remove(link.address)
                     runCatching { gatt.close() }
                     if (wasConnected) {
                         emit(
@@ -683,12 +839,15 @@ class BleEngine(
             value: ByteArray,
             status: Int,
         ) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                readValues[Key(link.address, characteristic.uuid.toString())] = value.copyOf()
-            } else {
-                link.error = "read failed (${gattStatus(status)})"
-                log("WARN", "GATT read on ${link.address} failed: ${link.error}")
-            }
+            // Hand the platform's status to the waiting caller, success or not: a
+            // failure reported as "timed out" fifteen seconds later is a lie.
+            completeOperation(
+                link.address,
+                characteristic.uuid.toString(),
+                "read",
+                status,
+                value.copyOf(),
+            )
         }
 
         @Deprecated("Deprecated in Java")
@@ -699,8 +858,32 @@ class BleEngine(
         ) {
             @Suppress("DEPRECATION")
             val value = characteristic.value
-            if (status == BluetoothGatt.GATT_SUCCESS && value != null) {
-                readValues[Key(link.address, characteristic.uuid.toString())] = value.copyOf()
+            completeOperation(
+                link.address,
+                characteristic.uuid.toString(),
+                "read",
+                status,
+                value?.copyOf(),
+            )
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            completeOperation(
+                link.address,
+                characteristic.uuid.toString(),
+                "write",
+                status,
+            )
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS && mtu > 0) {
+                link.mtu = mtu
+                log("INFO", "GATT ${link.address} negotiated a ${mtu}-byte MTU")
             }
         }
 
@@ -727,6 +910,14 @@ class BleEngine(
             descriptor: BluetoothGattDescriptor,
             status: Int,
         ) {
+            // The subscription is only real once this arrives; `subscribe()` waits
+            // for it instead of reporting success as soon as the write is queued.
+            completeOperation(
+                link.address,
+                descriptor.characteristic.uuid.toString(),
+                "descriptor",
+                status,
+            )
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 log("WARN", "CCCD write on ${link.address} failed (${gattStatus(status)})")
             }
@@ -765,8 +956,104 @@ class BleEngine(
         return null
     }
 
-    private fun writeCccd(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, enable: Boolean) {
-        val descriptor = characteristic.getDescriptor(CCCD) ?: return
+    /**
+     * Run one GATT operation on one link, serialised and cancelled cleanly.
+     *
+     * The monitor is held for the whole exchange — issue *and* callback — because
+     * `BluetoothGatt` accepts one operation at a time. Holding it while waiting does
+     * not deadlock: the callback only ever touches the operation's own monitor.
+     */
+    private fun <T> runOperation(
+        link: Link,
+        kind: String,
+        characteristic: BluetoothGattCharacteristic,
+        block: (Op) -> T,
+    ): T {
+        val key = Key(link.address, characteristic.uuid.toString(), kind)
+        val op = Op(kind, link.address, characteristic.uuid.toString())
+        synchronized(linkLock(link.address)) {
+            operations[key] = op
+            try {
+                return block(op)
+            } finally {
+                operations.remove(key)
+            }
+        }
+    }
+
+    /** Wait for the platform's answer, bounded; the operation is always discarded. */
+    private fun awaitOperation(op: Op, timeoutMs: Long = GATT_TIMEOUT_MS): Op {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        synchronized(op) {
+            while (!op.done) {
+                val remaining = deadline - SystemClock.elapsedRealtime()
+                if (remaining <= 0L) break
+                try {
+                    (op as Object).wait(remaining)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+        }
+        if (!op.done) {
+            log("WARN", "GATT ${op.kind} on ${shortUuidStr(op.uuid)} timed out after ${timeoutMs}ms")
+            throw BleFailure(
+                "gatt_failed",
+                "the peripheral did not answer the ${op.kind} on ${shortUuidStr(op.uuid)} in time",
+            )
+        }
+        return op
+    }
+
+    private fun completeOperation(
+        address: String,
+        uuid: String,
+        kind: String,
+        status: Int,
+        value: ByteArray? = null,
+    ) {
+        val op = operations[Key(address, uuid, kind)]
+        if (op == null) {
+            // A stale callback: the operation already timed out or the link was torn
+            // down. Dropping it is what keeps a late answer from completing a newer
+            // request for the same characteristic.
+            log("DEBUG", "ignoring a late $kind callback for $uuid on $address")
+            return
+        }
+        op.complete(status, value)
+    }
+
+    private fun abortOperations(address: String) {
+        for ((key, op) in operations) {
+            if (key.address == address) op.abort()
+        }
+    }
+
+    /** Fail a link: wake every waiter, close the client, forget the entry. */
+    private fun failLink(link: Link, why: String, close: Boolean) {
+        abortOperations(link.address)
+        link.state = "failed"
+        link.error = why
+        val gatt = link.gatt
+        link.gatt = null
+        synchronized(link) { link.subscriptions.clear() }
+        links.remove(link.address)
+        if (close && gatt != null) {
+            runCatching { gatt.disconnect() }
+            runCatching { gatt.close() }
+        }
+    }
+
+    private fun shortUuidStr(text: String): String = runCatching { shortUuid(UUID.fromString(text)) }
+        .getOrDefault(text)
+
+    private fun writeCccd(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        enable: Boolean,
+    ): Boolean {
+        val descriptor = characteristic.getDescriptor(CCCD) ?: return true
         val value = if (enable) {
             if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) {
                 BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
@@ -777,7 +1064,7 @@ class BleEngine(
             BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
         }
         @Suppress("DEPRECATION")
-        run {
+        return run {
             descriptor.value = value
             gatt.writeDescriptor(descriptor)
         }

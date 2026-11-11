@@ -36,6 +36,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -155,6 +156,11 @@ class TransferManager:
         self._destination = Path(destination).expanduser() if destination else None
         self._on_change = on_change
         self._chunk_size = max(MIN_CHUNK_SIZE, min(MAX_CHUNK_SIZE, int(chunk_size)))
+        #: Guards the transfer tables against the GUI thread. The GUI polls
+        #: `transfers`/`history` while this loop inserts into them; without the
+        #: lock that is a "dictionary changed size during iteration" crash in a
+        #: Tk callback, which looks like a random window failure.
+        self._lock = threading.RLock()
         self._stats: dict[int, TransferStats] = {}
         self._acks: dict[int, _Acks] = {}
         self._inbound: dict[int, _Inbound] = {}
@@ -169,6 +175,11 @@ class TransferManager:
         self._orphan_bytes = 0
         self._queue: asyncio.Queue[bytes | None] | None = None
         self._task: asyncio.Task[None] | None = None
+        #: Set by :meth:`close`: a sender parked on an acknowledgement must not
+        #: outlive the session it is parked on. Without this a dropped link left
+        #: `send_file` waiting out every ack timeout (a minute, with retries)
+        #: before it admitted the session was gone.
+        self._aborted = False
         self._next_local_id = 1
 
     # ------------------------------------------------------------------ #
@@ -176,25 +187,29 @@ class TransferManager:
     # ------------------------------------------------------------------ #
     @property
     def transfers(self) -> tuple[TransferStats, ...]:
-        return tuple(self._stats.values())
+        with self._lock:
+            return tuple(self._stats.values())
 
     def history(self) -> tuple[TransferStats, ...]:
-        return tuple(self._history)
+        with self._lock:
+            return tuple(self._history)
 
     def get(self, transfer_id: int) -> TransferStats | None:
-        return self._stats.get(transfer_id)
+        with self._lock:
+            return self._stats.get(transfer_id)
 
     def snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
-        return {
-            "active": [
-                t.to_dict(now=now) for t in self._stats.values()
-                if t.state in {PENDING, ACTIVE, PAUSED}
-            ],
-            "history": [t.to_dict(now=now) for t in self._history[-20:]],
-            "destination": str(self._destination) if self._destination else "",
-            "chunk_size": self._chunk_size,
-        }
+        with self._lock:
+            return {
+                "active": [
+                    t.to_dict(now=now) for t in self._stats.values()
+                    if t.state in {PENDING, ACTIVE, PAUSED}
+                ],
+                "history": [t.to_dict(now=now) for t in self._history[-20:]],
+                "destination": str(self._destination) if self._destination else "",
+                "chunk_size": self._chunk_size,
+            }
 
     def set_destination(self, directory: str | os.PathLike[str]) -> Path:
         path = Path(directory).expanduser()
@@ -224,7 +239,10 @@ class TransferManager:
                 f"{MAX_FILE_BYTES} bytes per file"
             )
         name = safe_name(source.name)
-        digest = sha256_of(source)
+        # Hashing a multi-gigabyte file takes seconds to minutes. Doing it here
+        # would stop the event loop dead: no heartbeat, no acknowledgements, no
+        # GUI refresh, and a session that looks hung. It runs on a worker.
+        digest = await asyncio.to_thread(sha256_of, source)
         chunk_size = max(MIN_CHUNK_SIZE, min(MAX_CHUNK_SIZE, int(chunk_size or self._chunk_size)))
 
         if not getattr(self._session, "is_open", False):
@@ -244,6 +262,20 @@ class TransferManager:
         resume_from = int(reply.get("resume_from") or 0)
         applied_chunk = int(reply.get("chunk_size") or chunk_size)
         applied_chunk = max(MIN_CHUNK_SIZE, min(MAX_CHUNK_SIZE, applied_chunk))
+        # The offset is a *chunk boundary* the sender will seek to. A phone that
+        # answers with something else (negative, past the end, or mid-chunk) is
+        # telling us to skip bytes we have not written, so treat that answer as
+        # "start over" rather than produce a file with a hole in it.
+        if resume_from < 0 or resume_from >= size or resume_from % applied_chunk:
+            if resume_from:
+                log.warning(
+                    "the phone offered resume_from=%s for %s; starting from zero "
+                    "because that is not a %d-byte chunk boundary within the file",
+                    resume_from,
+                    name,
+                    applied_chunk,
+                )
+            resume_from = 0
 
         stats = TransferStats(
             transfer_id=transfer_id,
@@ -257,7 +289,8 @@ class TransferManager:
             started_at=time.monotonic(),
             path=str(source),
         )
-        self._stats[transfer_id] = stats
+        with self._lock:
+            self._stats[transfer_id] = stats
         self._acks[transfer_id] = _Acks(acked=resume_from // applied_chunk - 1)
         self._publish(stats)
         await self._ensure_pump()
@@ -287,6 +320,8 @@ class TransferManager:
             stats.bytes_done = start_chunk * chunk_size
             index = start_chunk
             while index < total_chunks:
+                if self._aborted:
+                    raise TransferError("the session closed during the transfer")
                 if stats.transfer_id in self._cancelled:
                     raise TransferError("cancelled")
                 await self._wait_if_paused(stats.transfer_id)
@@ -311,9 +346,25 @@ class TransferManager:
                 # Backpressure: never more than WINDOW_CHUNKS unacknowledged.
                 if index - acks.acked >= WINDOW_CHUNKS:
                     granted = await acks.wait(ACK_TIMEOUT_S)
+                    if self._aborted:
+                        raise TransferError("the session closed during the transfer")
                     attempts = stats.retries
                     while not granted and attempts < MAX_RETRIES:
+                        # A missing acknowledgement usually means the *ack* was
+                        # lost, not the link: on a lossy hotspot the window used
+                        # to sit here and fail a transfer whose bytes all landed.
+                        # Re-send the newest chunk instead. The receiver
+                        # acknowledges duplicates it already holds, so one extra
+                        # chunk buys back the whole transfer.
                         stats.retries = attempts = attempts + 1
+                        log.info(
+                            "no ack for chunk %d after %.0fs; re-sending (retry %d/%d)",
+                            index,
+                            ACK_TIMEOUT_S,
+                            attempts,
+                            MAX_RETRIES,
+                        )
+                        await self._send(chunk, FILE_STREAM_TO_PHONE)
                         granted = await acks.wait(ACK_TIMEOUT_S)
                     if not granted:
                         raise TransferError(
@@ -414,23 +465,49 @@ class TransferManager:
             path=str(target),
         )
         part = part_path(target)
-        resumed_from = 0
-        keep_part = self._resume_offset(part, name, size, digest)
+        keep_part = self._resume_offset(part, name, size, digest, stats.chunk_size)
         if keep_part:
-            # Only a chunk-aligned prefix can be resumed: the phone restarts at a
+            # Only a chunk-aligned prefix can be resumed: the sender restarts at a
             # chunk boundary, so anything past one would be duplicated. Truncate
-            # rather than trust a half-written chunk.
+            # rather than trust a half-written chunk. The boundary is the
+            # *negotiated* chunk size, never the default.
             aligned = keep_part - (keep_part % stats.chunk_size)
             if aligned != keep_part:
                 log.info("truncating %s to the last whole chunk (%d bytes)", part.name, aligned)
                 with contextlib.suppress(OSError), open(part, "r+b") as short:
                     short.truncate(aligned)
             keep_part = aligned
-        if keep_part:
-            resumed_from = keep_part
-            if not await self._ask_resume(transfer_id, keep_part):
-                # The phone will send from the beginning: start over rather than
-                # append the beginning of the file to the end of a partial one.
+        # Ask the phone where to start *before* it streams, always: a phone that
+        # waits for this answer (Phase 5.1) then starts at the right chunk, and an
+        # older phone that has already begun is told to continue anyway. The reply
+        # is the only thing that releases the sender's first chunk.
+        resumed_from = keep_part
+        applied = await self._ask_resume(transfer_id, keep_part)
+        if applied is None:
+            if keep_part:
+                # The phone cannot resume: it will send from zero. Start over
+                # rather than append the beginning of the file to the end of a
+                # partial one.
+                resumed_from = 0
+                with contextlib.suppress(FileNotFoundError):
+                    part.unlink()
+        elif applied != keep_part:
+            # The phone will start somewhere else. Trust it, but only at a chunk
+            # boundary inside the bytes we actually hold.
+            boundary = applied - (applied % stats.chunk_size)
+            if 0 < boundary <= keep_part:
+                log.info(
+                    "the phone will resume %s at %d, not %d", name, boundary, keep_part
+                )
+                resumed_from = boundary
+                with contextlib.suppress(OSError), open(part, "r+b") as short:
+                    short.truncate(boundary)
+            else:
+                log.warning(
+                    "the phone answered resume_from=%s for %s; starting from zero",
+                    applied,
+                    name,
+                )
                 resumed_from = 0
                 with contextlib.suppress(FileNotFoundError):
                     part.unlink()
@@ -446,16 +523,9 @@ class TransferManager:
         digest_state = hashlib.sha256()
         if resumed_from:
             # Re-hash what is already on disk: a partial digest cannot be trusted
-            # across a session boundary, and re-reading the part file is cheap
-            # compared with trusting the wrong bytes.
-            with open(part, "rb") as existing:
-                remaining = resumed_from
-                while remaining > 0:
-                    block = existing.read(min(1024 * 1024, remaining))
-                    if not block:
-                        break
-                    digest_state.update(block)
-                    remaining -= len(block)
+            # across a session boundary. Off the event loop, because this reads a
+            # file the size of the transfer.
+            await asyncio.to_thread(_feed_digest, digest_state, part, resumed_from)
         inbound = _Inbound(
             stats=stats,
             handle=handle,
@@ -465,15 +535,24 @@ class TransferManager:
             next_index=resumed_from // stats.chunk_size,
         )
         self._inbound[transfer_id] = inbound
-        self._stats[transfer_id] = stats
-        self._write_sidecar(part, name, size, digest)
+        with self._lock:
+            self._stats[transfer_id] = stats
+        self._write_sidecar(part, name, size, digest, stats.chunk_size)
         self._publish(stats)
         await self._ensure_pump()
         self._drain_orphans(transfer_id)
         return stats
 
-    def _resume_offset(self, part: Path, name: str, size: int, digest: str) -> int:
-        """Bytes already on disk that belong to this exact file, if any."""
+    def _resume_offset(
+        self, part: Path, name: str, size: int, digest: str, chunk_size: int
+    ) -> int:
+        """Bytes already on disk that belong to this exact file, if any.
+
+        The sidecar must agree on the *transfer identity* (name, size, digest) and
+        on the chunk size: a different chunk size means the chunk boundaries the
+        sender will use do not line up with the bytes on disk, so the part is not
+        resumable even though the file is the same.
+        """
         sidecar = part.with_name(part.name + ".json")
         if not part.is_file() or not sidecar.is_file():
             return 0
@@ -486,21 +565,42 @@ class TransferManager:
         if meta.get("name") != name or meta.get("size") != size or meta.get("sha256") != digest:
             log.info("ignoring %s: it belongs to a different file", part.name)
             return 0
+        recorded_chunk = meta.get("chunk_size")
+        if recorded_chunk is not None and int(recorded_chunk) != chunk_size:
+            log.info(
+                "ignoring %s: it was written with %s-byte chunks, this transfer uses %d",
+                part.name,
+                recorded_chunk,
+                chunk_size,
+            )
+            return 0
         try:
             held = part.stat().st_size
         except OSError:
             return 0
         return held if 0 < held < size else 0
 
-    async def _ask_resume(self, transfer_id: int, from_bytes: int) -> bool:
+    async def _ask_resume(self, transfer_id: int, from_bytes: int) -> int | None:
+        """Tell the phone where to start; return the offset it will actually send.
+
+        ``None`` means the phone cannot honour a resume at all (an older build, or
+        a refusal), in which case the caller starts from zero. A number is the
+        offset the phone will stream from — normally the one we asked for, but the
+        phone is allowed to answer "zero" and the caller must believe it.
+        """
         try:
             reply = await self._session.call(
                 "file.resume", {"transfer_id": transfer_id, "from_bytes": from_bytes}
             )
         except Exception as exc:  # noqa: BLE001 - an older phone simply cannot
             log.info("the phone cannot resume (%s); starting from zero", exc)
-            return False
-        return isinstance(reply, dict) and reply.get("ok") is True
+            return None
+        if not isinstance(reply, dict) or reply.get("ok") is not True:
+            return None
+        answered = reply.get("from_bytes")
+        if isinstance(answered, (int, float)):
+            return int(answered)
+        return from_bytes
 
     # ------------------------------------------------------------------ #
     # control
@@ -666,7 +766,13 @@ class TransferManager:
     def _write_chunk(self, inbound: _Inbound, chunk: FileChunk) -> None:
         stats = inbound.stats
         if chunk.chunk_index < inbound.next_index:
-            return  # already have it (a retry, not an error)
+            # A duplicate: the sender retried, or it restarted at zero because it
+            # could not honour the resume offset. The bytes are already on disk, so
+            # do not write them again — but *do* acknowledge, because the sender's
+            # window only advances on acks and a silent skip is what used to stall
+            # every resumed download for fifteen seconds and then fail it.
+            self._ack_repeat(inbound, chunk.chunk_index)
+            return
         if chunk.chunk_index > inbound.next_index:
             stats.error = (
                 f"chunk {chunk.chunk_index} arrived before {inbound.next_index}; "
@@ -699,21 +805,60 @@ class TransferManager:
         self._publish(stats)
 
         if chunk.flags & FLAG_END:
-            self._finish_inbound(inbound)
+            self._start_finish(inbound)
             return
         if chunk.chunk_index % ACK_EVERY_CHUNKS == 0:
             asyncio.get_event_loop().create_task(
                 self._quiet_send(ack(stats.transfer_id, chunk.chunk_index), FILE_STREAM_TO_PHONE)
             )
 
-    def _finish_inbound(self, inbound: _Inbound) -> None:
+    def _ack_repeat(self, inbound: _Inbound, index: int) -> None:
+        """Acknowledge a chunk we already hold, so the sender's window advances.
+
+        Every repeat is acked: they arrive in short bursts (a restarted sender's
+        first window) and dropping even one is enough to stall a bounded window.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:  # pragma: no cover - no loop means no session to ack
+            return
+        if not loop.is_running():
+            return
+        loop.create_task(
+            self._quiet_send(ack(inbound.stats.transfer_id, index), FILE_STREAM_TO_PHONE)
+        )
+
+    def _start_finish(self, inbound: _Inbound) -> None:
+        """Verify and publish, off the event loop.
+
+        ``_finish_inbound`` re-reads the whole file to hash it, so it must not run
+        inline on the loop: a 4 GB receive would freeze heartbeats, acks and the
+        GUI for the duration.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:  # pragma: no cover - sync test harness
+            loop = None
+        if loop is not None and loop.is_running():
+            loop.create_task(self._finish_inbound(inbound))
+        else:  # pragma: no cover - only reachable outside asyncio
+            self._finish_inbound_blocking(inbound)
+
+    def _finish_inbound_blocking(self, inbound: _Inbound) -> None:  # pragma: no cover
+        """Synchronous fallback used when there is no running loop."""
+        try:
+            asyncio.get_event_loop().run_until_complete(self._finish_inbound(inbound))
+        except Exception:  # noqa: BLE001 - a verification failure is already recorded
+            log.exception("verification of %s failed", inbound.part)
+
+    async def _finish_inbound(self, inbound: _Inbound) -> None:
         stats = inbound.stats
         part = inbound.part
         expected = stats.sha256
         inbound.close()
         self._inbound.pop(stats.transfer_id, None)
         try:
-            actual = sha256_of(part)
+            actual = await asyncio.to_thread(sha256_of, part)
         except OSError as exc:
             stats.state = FAILED
             stats.error = f"could not read back {part}: {exc}"
@@ -723,6 +868,28 @@ class TransferManager:
             return
 
         stats.finished_at = time.monotonic()
+        try:
+            held = part.stat().st_size
+        except OSError:
+            held = -1
+        if 0 <= held < stats.size:
+            # The stream ended early. The bytes we hold are a *valid prefix* of the
+            # file, so they are exactly what a resume needs: keep the part and its
+            # sidecar, and say how far it got. Deleting them here is what used to
+            # make an interrupted download start from zero every time.
+            stats.state = FAILED
+            stats.verified = False
+            stats.error = (
+                f"the phone stopped after {held} of {stats.size} bytes; "
+                "the partial file was kept so the transfer can resume"
+            )
+            self._publish(stats)
+            self._record(stats)
+            asyncio.get_event_loop().create_task(
+                self._quiet_send(cancel(stats.transfer_id, 0), FILE_STREAM_TO_PHONE)
+            )
+            return
+
         if actual != expected:
             stats.state = FAILED
             stats.verified = False
@@ -798,11 +965,22 @@ class TransferManager:
             log.debug("%s failed: %s", method, exc)
             return None
 
-    def _write_sidecar(self, part: Path, name: str, size: int, digest: str) -> None:
+    def _write_sidecar(
+        self, part: Path, name: str, size: int, digest: str, chunk_size: int
+    ) -> None:
+        """Record the transfer identity next to the part file.
+
+        ``chunk_size`` is part of the identity on purpose: resume offsets are
+        chunk boundaries, so a part written with 64 KiB chunks cannot be continued
+        as a 16 KiB-chunk transfer.
+        """
         sidecar = part.with_name(part.name + ".json")
         with contextlib.suppress(OSError):
             sidecar.write_text(
-                json.dumps({"name": name, "size": size, "sha256": digest}), "utf-8"
+                json.dumps(
+                    {"name": name, "size": size, "sha256": digest, "chunk_size": chunk_size}
+                ),
+                "utf-8",
             )
 
     def _drop_sidecar(self, part: Path) -> None:
@@ -816,11 +994,18 @@ class TransferManager:
             self._on_change(stats)
 
     def _record(self, stats: TransferStats) -> None:
-        self._history.append(stats)
-        if len(self._history) > 50:
-            del self._history[: len(self._history) - 50]
+        with self._lock:
+            self._history.append(stats)
+            if len(self._history) > 50:
+                del self._history[: len(self._history) - 50]
 
     async def close(self, reason: str = "session closed") -> None:
+        self._aborted = True
+        # Wake every sender parked on an acknowledgement: its session is gone, so
+        # waiting for the phone to answer is waiting for something that cannot
+        # arrive.
+        for acks in list(self._acks.values()):
+            acks.event.set()
         self._abort_all(reason)
         task, self._task = self._task, None
         self._queue = None
@@ -828,6 +1013,18 @@ class TransferManager:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+
+
+def _feed_digest(digest: Any, path: Path, limit: int) -> None:
+    """Feed the first [limit] bytes of [path] into [digest], without buffering it."""
+    remaining = int(limit)
+    with open(path, "rb") as handle:
+        while remaining > 0:
+            block = handle.read(min(1024 * 1024, remaining))
+            if not block:
+                break
+            digest.update(block)
+            remaining -= len(block)
 
 
 def _explain(prefix: str, exc: Exception) -> str:

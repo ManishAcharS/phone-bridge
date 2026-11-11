@@ -261,7 +261,13 @@ class PlanesPanel:
         if payload is None:
             return
         self.runtime.write_characteristic(address, service, characteristic, payload)
-        self._report(f"writing {len(payload)} byte(s) to {pv.short_uuid(characteristic)}")
+        # A write is confirmed by `onCharacteristicWrite` on the phone, so this
+        # sentence says what was *asked for*. Claiming success here is what made a
+        # silently dropped write look like it had landed.
+        self._report(
+            f"write requested: {len(payload)} byte(s) to {pv.short_uuid(characteristic)}"
+            " (the answer appears in the log)"
+        )
 
     def _subscribe(self) -> None:
         address, picked = self._picked_device(), self._picked_characteristic()

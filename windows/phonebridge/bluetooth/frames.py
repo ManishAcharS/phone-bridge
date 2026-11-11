@@ -71,6 +71,19 @@ class BleError(ValueError):
     """A Bluetooth request or answer that cannot be trusted."""
 
 
+def normalise_address(text: str) -> str:
+    """Uppercase a Bluetooth address, or return it unchanged when it is not one.
+
+    Android reports and emits ``AA:BB:CC:DD:EE:FF``. If the PC stores the address
+    in whatever spelling a user typed, every event for that device misses its
+    lookup and the connection looks dead, so there is one spelling everywhere.
+    """
+    value = str(text or "").strip()
+    if _MAC_RE.match(value):
+        return value.upper()
+    return value
+
+
 def normalise_uuid(text: str) -> str:
     """Lowercase a UUID and expand the 16/32-bit short forms to 128-bit.
 

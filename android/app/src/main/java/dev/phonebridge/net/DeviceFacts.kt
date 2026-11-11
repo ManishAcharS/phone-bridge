@@ -233,6 +233,13 @@ object DeviceFacts {
                 label = "sensors",
                 hardware = sensors.isNotEmpty(),
                 implemented = true,
+                // Android 12+ gates high-rate sampling behind a normal permission;
+                // without it the phone must not advertise streaming as usable.
+                permission = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                    android.Manifest.permission.HIGH_SAMPLING_RATE_SENSORS
+                } else {
+                    null
+                },
                 note = if (sensors.isEmpty()) {
                     "none reported"
                 } else {
@@ -318,6 +325,17 @@ object DeviceFacts {
             .effectiveGranted(context, android.Manifest.permission.BLUETOOTH_SCAN)
         out["permitted.bluetooth_gatt"] = Permissions
             .effectiveGranted(context, android.Manifest.permission.BLUETOOTH_CONNECT)
+        // Sensors are gated per Android version: answer from the platform so the PC
+        // never has to infer "permitted" from "the hardware exists".
+        out["permitted.sensors"] =
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                Permissions.effectiveGranted(
+                    context,
+                    android.Manifest.permission.HIGH_SAMPLING_RATE_SENSORS,
+                )
+            } else {
+                true
+            }
         // File transfer is usable only after the user picked a folder: that is a
         // permission the platform granted, not one this app can request.
         out["permitted.file_transfer"] = SafStore.canReceive(context)

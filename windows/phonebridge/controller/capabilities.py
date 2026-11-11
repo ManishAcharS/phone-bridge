@@ -145,8 +145,19 @@ def _as_bool(value: Any) -> bool | None:
     return None
 
 
-def _permitted_for(key: str, info: Mapping[str, Any]) -> bool | None:
-    """True / False / None (None = this capability needs no permission)."""
+def _permitted_for(key: str, info: Mapping[str, Any], caps: Mapping[str, Any]) -> bool | None:
+    """True / False / None (None = this capability needs no permission).
+
+    Two sources, in order: the phone's own per-capability answer
+    (``permitted.<key>``), then the Android permission table. The per-capability
+    key exists because some gates are not Android permissions at all — receiving a
+    file needs a folder the *user* picked (SAF), which no runtime permission
+    describes. Ignoring that key made a phone with no destination folder look
+    ready to receive.
+    """
+    explicit = _as_bool(caps.get(f"permitted.{key}"))
+    if explicit is not None:
+        return explicit
     permission = REQUIRED_PERMISSIONS.get(key)
     if permission is None:
         return None
@@ -178,7 +189,7 @@ def build_registry(
     for key in keys:
         reported = bool(_as_bool(caps.get(key)))
         present = _as_bool(caps.get(f"hardware.{key}"))
-        permitted = _permitted_for(key, info)
+        permitted = _permitted_for(key, info, caps)
         explicit_implemented = _as_bool(caps.get(f"implemented.{key}"))
 
         if explicit_implemented is not None:

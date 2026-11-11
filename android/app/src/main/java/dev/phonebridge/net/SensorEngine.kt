@@ -1,10 +1,12 @@
 package dev.phonebridge.net
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.Build
 import android.os.SystemClock
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
@@ -58,6 +60,9 @@ class SensorEngine(
 
         /** Ids are assigned once per process so the PC's list stays stable. */
         const val MAX_SENSORS = 64
+
+        /** How often the phone's own card is refreshed while streaming. */
+        const val STATE_PUBLISH_MS = 250L
     }
 
     data class Entry(
@@ -108,6 +113,16 @@ class SensorEngine(
     )
 
     private val _state = MutableStateFlow(State())
+
+    /** Reasons that mean "the stream ended as intended", never "it broke". */
+    private val EXPECTED_STOPS = setOf(
+        "stopped",
+        "restarted",
+        "released",
+        "last session ended",
+        "nothing started",
+        "refused",
+    )
     val state: StateFlow<State> = _state.asStateFlow()
 
     private val lock = Any()
@@ -128,6 +143,7 @@ class SensorEngine(
     private val activeCount = AtomicInteger(0)
 
     private var startedAtNanos = 0L
+    private var statePublishedAt = 0L
     private var sender: Thread? = null
     private var queue: ArrayBlockingQueue<ByteArray>? = null
     private var listener: SensorEventListener? = null
@@ -159,6 +175,8 @@ class SensorEngine(
             val known = SensorFrames.KINDS.containsKey(sensor.type)
             val reason = when {
                 sensor.type == Sensor.TYPE_STRING -> "text sensors cannot be sent as numbers"
+                requiresBiometricPermission(sensor.type) ->
+                    "needs the BODY_SENSORS permission, which this build does not request"
                 SensorFrames.UNSUPPORTED_REASONS.containsKey(sensor.type) ->
                     SensorFrames.UNSUPPORTED_REASONS[sensor.type] ?: "not streamed"
                 !known -> "PhoneBridge has no name for sensor type ${sensor.type}"
@@ -190,6 +208,30 @@ class SensorEngine(
 
     fun hasHardware(): Boolean = !entries().isEmpty()
 
+    /**
+     * Whether sensor reads are allowed right now.
+     *
+     * Answered from the platform, never assumed: the previous release returned a
+     * constant `true`, so a phone that could not sample anything still told the PC
+     * it was permitted and the refusal only surfaced at `sensor.start`.
+     */
+    fun permitted(): Boolean {
+        val gate = highRatePermission() ?: return true
+        return try {
+            context.checkSelfPermission(gate) == PackageManager.PERMISSION_GRANTED
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** Why sampling is refused, or "" when it is allowed. */
+    fun permissionDetail(): String =
+        if (permitted()) {
+            ""
+        } else {
+            "the high sampling rate permission is not granted on this phone"
+        }
+
     fun minDelayUsFor(ids: List<Int>): Int {
         val delays = ids.mapNotNull { id -> byId[id]?.minDelay?.takeIf { it > 0 } }
         return delays.maxOrNull() ?: 0
@@ -208,6 +250,13 @@ class SensorEngine(
      */
     fun start(ids: List<Int>, intervalUs: Int): Int {
         val service = manager ?: throw SensorFailure("sensor_failed", "this phone has no sensor service")
+        if (!permitted()) {
+            throw SensorFailure(
+                "sensor_denied",
+                "this phone has not granted the high sampling rate permission " +
+                    "needed for sensor streaming",
+            )
+        }
         if (running.get()) stop("restarted")
         val catalogue = entries()
         if (catalogue.isEmpty()) {
@@ -241,6 +290,7 @@ class SensorEngine(
         listener = callback
 
         val applied = IntArray(1) { interval }
+        val registered = ArrayList<Int>(wanted.size)
         for (id in wanted) {
             val sensor = byId[id] ?: continue
             val accepted = try {
@@ -260,6 +310,7 @@ class SensorEngine(
                 )
             }
             activeCount.incrementAndGet()
+            registered.add(id)
             // The sensor may silently clamp the period; report the effective one.
             val floor = sensor.minDelay.coerceAtLeast(0)
             if (floor > applied[0]) applied[0] = floor
@@ -274,11 +325,11 @@ class SensorEngine(
             start()
         }
         _state.value = State(
-            active = wanted,
+            active = registered,
             intervalUs = applied[0],
             permitted = true,
         )
-        log("INFO", "streaming ${wanted.size} sensor(s) at ${applied[0]}us")
+        log("INFO", "streaming ${registered.size} sensor(s) at ${applied[0]}us")
         return applied[0]
     }
 
@@ -306,7 +357,11 @@ class SensorEngine(
         _state.value = _state.value.copy(
             active = emptyList(),
             registered = 0,
-            lastError = if (reason == "stopped" || reason == "restarted") "" else reason,
+            permitted = permitted(),
+            // A stream that ends because the session ended, or because the service
+            // is going away, is not an error: it is the expected end. Only a real
+            // failure is recorded as one.
+            lastError = if (reason in EXPECTED_STOPS) "" else reason,
         )
         if (wasActive > 0) log("INFO", "sensor stream stopped ($reason)")
     }
@@ -397,7 +452,14 @@ class SensorEngine(
             try {
                 sendFrame(SensorFrames.SENSOR_STREAM, body)
                 val sent = framesSent.incrementAndGet()
-                _state.value = _state.value.copy(framesSent = sent)
+                // Publish the counter at most four times a second. At 3 x 50 Hz the
+                // per-frame version re-emitted a StateFlow 150 times a second, and
+                // every emission recomposed the phone's Sensors card.
+                val now = SystemClock.elapsedRealtime()
+                if (now - statePublishedAt >= STATE_PUBLISH_MS) {
+                    statePublishedAt = now
+                    _state.value = _state.value.copy(framesSent = sent)
+                }
             } catch (e: Exception) {
                 // A send failure means the session is closing; stop rather than spin.
                 framesDropped.incrementAndGet()
@@ -412,6 +474,22 @@ class SensorEngine(
         "active" to _state.value.active,
         "interval_us" to _state.value.intervalUs,
         "frames_sent" to _state.value.framesSent,
-        "permitted" to true,
+        "permitted" to permitted(),
+        "detail" to permissionDetail(),
     )
 }
+
+/**
+ * Android 12+ gates sampling faster than 200 Hz behind a normal permission that a
+ * managed profile, a policy or a restricted device can still withhold.
+ */
+private fun highRatePermission(): String? =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        android.Manifest.permission.HIGH_SAMPLING_RATE_SENSORS
+    } else {
+        null
+    }
+
+/** Kinds that only work with a runtime permission this build never requests. */
+internal fun requiresBiometricPermission(kind: Int): Boolean =
+    kind == Sensor.TYPE_HEART_RATE || kind == Sensor.TYPE_HEART_BEAT
