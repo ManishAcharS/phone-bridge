@@ -374,6 +374,7 @@ residual risk: [`docs/13-security-review.md`](docs/13-security-review.md).
 | scan Bluetooth LE and talk GATT | [`docs/21-bluetooth.md`](docs/21-bluetooth.md) |
 | stream the phone's sensors | [`docs/22-sensors.md`](docs/22-sensors.md) |
 | send and receive files | [`docs/23-file-transfer.md`](docs/23-file-transfer.md) |
+| read the Phase 5 completion report | [`docs/24-phase5-completion-report.md`](docs/24-phase5-completion-report.md) |
 | read the Android completion notes | [`docs/10-android-app-completion.md`](docs/10-android-app-completion.md) |
 
 ## License
