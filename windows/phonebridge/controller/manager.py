@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import platform
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -47,7 +48,8 @@ from ..core.session import (
 from ..transport.link import DEFAULT_PORT, websocket_uri
 from .capabilities import Capability, build_registry
 from .diagnostics import Diagnostics
-from .netprobe import network_profile, tcp_probe
+from .endpoints import is_loopback
+from .netprobe import Gateway, default_gateways, network_profile, tcp_probe
 from .transports import (
     BeaconCandidates,
     Candidate,
@@ -57,6 +59,13 @@ from .transports import (
     UsbCandidates,
     default_providers,
     rank,
+)
+from .usbcheck import (
+    USB_UNKNOWN,
+    PnpDevice,
+    UsbDiagnosis,
+    diagnose,
+    query_pnp,
 )
 
 log = logging.getLogger(__name__)
@@ -118,6 +127,8 @@ class Snapshot:
     adb_path: str | None = None
     adb_detail: str = ""
     usb_available: bool = False
+    usb_diagnosis: str = ""
+    usb_action: str = ""
     wifi_status: str = "not checked yet"
     server_reachable: bool | None = None
     auth_ok: bool = False
@@ -184,6 +195,10 @@ class ConnectionManager:
         remember_endpoints: bool = True,
         diagnostics_limit: int = 200,
         sleeper: Callable[[float], Awaitable[None]] | None = None,
+        usb_probe: Callable[[], list[PnpDevice]] | None = None,
+        system: str | None = None,
+        gateways: Callable[[], list[Gateway]] | None = None,
+        probe: Callable[[str, int, float], Awaitable[bool]] | None = None,
     ) -> None:
         self._store = store
         self._listeners: list[Emitter] = [emit] if emit is not None else []
@@ -210,6 +225,21 @@ class ConnectionManager:
         self._last_found: list[Candidate] = []
         self._profile: str | None = None
         self._profile_at: float = 0.0
+        #: Windows' device tree is a subprocess; ask it at most every 30 s.
+        self._usb_probe = usb_probe or query_pnp
+        self._system = system or platform.system()
+        self._pnp: list[PnpDevice] = []
+        self._pnp_at: float = 0.0
+        #: Network fingerprint at the moment the session came up, so a drop can
+        #: say "the network changed" instead of "something went wrong".
+        self._gateways = gateways or default_gateways
+        self._probe = probe or tcp_probe
+        self._fingerprint: str | None = None
+        #: What the last failed session attempt was told about the drop.
+        self._last_drop_reason: str | None = None
+        #: Set once a session reached CONNECTED, so a drop after real success can
+        #: restart the backoff ladder instead of leaving it at the cap.
+        self._session_established = False
         self._session: BridgeSession | None = None
         self._task: asyncio.Task[None] | None = None
         self._heartbeat: asyncio.Task[None] | None = None
@@ -330,6 +360,13 @@ class ConnectionManager:
         self._manual = FixedCandidates(cleaned, port or DEFAULT_PORT)
         self._providers.append(self._manual)
         self._log(f"manual endpoint set to {cleaned}:{port or DEFAULT_PORT}")
+        if is_loopback(cleaned):
+            # Legitimate with an adb forward or the simulator; almost never what
+            # someone wants when the phone is on Wi-Fi.
+            self._log(
+                "note: that is a loopback address - it only reaches the phone "
+                "through an adb forward or a bridge running on this PC"
+            )
 
     def resolve_pairing(self, approve: bool) -> None:
         """Answer the pairing prompt (called from any thread)."""
@@ -383,6 +420,11 @@ class ConnectionManager:
                 except Exception as exc:  # noqa: BLE001 - a failed attempt is data
                     self._log(f"attempt {self._attempt} failed: {exc or type(exc).__name__}")
                     self._publish(last_error=str(exc) or type(exc).__name__)
+                    if self._session_established:
+                        # The link worked before it dropped: start the ladder over
+                        # so a flaky minute cannot leave the user waiting a minute.
+                        delays = self.policy.delays()
+                        self._session_established = False
 
                 if self._stop.is_set():
                     break
@@ -453,22 +495,33 @@ class ConnectionManager:
                 endpoint=candidate.endpoint,
                 server_reachable=reachable,
             )
+            # Any failure of one address is worth trying the next one; only a
+            # terminal verdict (changed key, protocol skew) stops the ladder.
+            # Catching the generic case matters: a raw OSError from the socket
+            # used to escape and throw away the candidate list and the reason.
             try:
                 session = await self._open(candidate)
-            except _RetryCandidate as exc:
+            except _Terminal:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one address failed, not the run
                 last = exc
                 self._publish(last_connection_error=str(exc))
                 self._log(f"{candidate.endpoint} ({candidate.kind}): {exc}")
                 continue
             try:
                 await self._run_session(candidate, session)
-            except _RetryCandidate as exc:
+            except _Terminal:
+                raise
+            except Exception as exc:  # noqa: BLE001 - see above
                 last = exc
                 self._publish(last_connection_error=str(exc))
                 self._log(f"{candidate.endpoint} ({candidate.kind}): {exc}")
                 continue
             return
-        raise _RetryCandidate(str(last) if last else "every candidate failed")
+        reason = str(last) if last else "every candidate failed"
+        if self._last_drop_reason and self._last_drop_reason not in reason:
+            reason = f"{reason} (last drop: {self._last_drop_reason})"
+        raise _RetryCandidate(reason)
 
     async def _discover(self) -> list[Candidate]:
         """Ask every source, then record *why* each one did or did not answer.
@@ -491,6 +544,14 @@ class ConnectionManager:
                 continue
             found.extend(result)
 
+        # Several sources often see the same phone (the beacon, the gateway and a
+        # saved address all name one socket). Trying it twice in one pass means
+        # two sessions to one phone, and a second "found" line that is not new.
+        unique: dict[tuple[str, int], Candidate] = {}
+        for candidate in found:
+            unique.setdefault((candidate.host, candidate.port), candidate)
+        found = list(unique.values())
+
         statuses = self._provider_status()
         for line in statuses["lines"]:
             self._log(line)
@@ -508,6 +569,8 @@ class ConnectionManager:
             adb_detail=statuses["adb_detail"],
             usb_available=statuses["usb_available"],
             wifi_status=statuses["wifi_status"],
+            usb_diagnosis=statuses["usb_diagnosis"].headline,
+            usb_action=statuses["usb_diagnosis"].action,
             last_discovery_error=(
                 statuses["discovery_error"] or (discovery_errors[0] if discovery_errors else None)
             ),
@@ -532,6 +595,43 @@ class ConnectionManager:
             "address below)"
         )
 
+    def _device_tree(self) -> list[PnpDevice]:
+        """Windows' USB device tree, cached; a subprocess per discovery is waste."""
+        now = time.monotonic()
+        if now - self._pnp_at > 30.0:
+            try:
+                self._pnp = list(self._usb_probe())
+            except Exception as exc:  # noqa: BLE001 - a diagnosis must never break discovery
+                self._log(f"could not read the USB device tree: {exc}")
+                self._pnp = []
+            self._pnp_at = now
+        return self._pnp
+
+    def _usb_diagnosis(self, devices: list[Any], adb_available: bool) -> UsbDiagnosis:
+        """Cheap verdict first; ask Windows only when adb has nothing to say."""
+        verdict = diagnose(
+            adb_devices=devices,
+            adb_available=adb_available,
+            pnp=None,
+            system=self._system,
+        )
+        if verdict.kind != USB_UNKNOWN:
+            return verdict
+        return diagnose(
+            adb_devices=devices,
+            adb_available=adb_available,
+            pnp=self._device_tree(),
+            system=self._system,
+        )
+
+    def _network_fingerprint(self) -> str:
+        """The set of default gateways — i.e. which networks this PC is on."""
+        try:
+            gateways = self._gateways()
+        except Exception:  # noqa: BLE001 - a missing route command is not a failure
+            return ""
+        return "|".join(sorted(g.address for g in gateways if g.address))
+
     def _provider_status(self) -> dict[str, Any]:
         """Summarise what each provider just observed, in one place."""
         lines: list[str] = []
@@ -542,6 +642,7 @@ class ConnectionManager:
         wifi_status = "not checked"
         discovery_error: str | None = None
         server_reachable: bool | None = None
+        usb_diagnosis = UsbDiagnosis(USB_UNKNOWN, "USB has not been checked yet")
 
         for provider in self._providers:
             if isinstance(provider, UsbCandidates):
@@ -556,7 +657,9 @@ class ConnectionManager:
                 adb_path = status.path
                 adb_detail = provider.summary()
                 usb_available = provider.usb_available
+                usb_diagnosis = self._usb_diagnosis(provider.last_devices, status.available)
                 lines.append(adb_detail)
+                lines.append(f"usb: {usb_diagnosis.line()}")
                 if not status.available:
                     discovery_error = discovery_error or (
                         status.error or "adb not found - USB unavailable, Wi-Fi unaffected"
@@ -598,6 +701,7 @@ class ConnectionManager:
             "wifi_status": wifi_status,
             "discovery_error": discovery_error,
             "server_reachable": server_reachable,
+            "usb_diagnosis": usb_diagnosis,
         }
 
     async def _provider_candidates(self, provider: CandidateProvider) -> list[Candidate]:
@@ -721,6 +825,8 @@ class ConnectionManager:
             auth_ok=True,
             server_reachable=True,
         )
+        self._session_established = True
+        self._fingerprint = self._network_fingerprint()
         self._log(
             f"connected over {candidate.kind} at {candidate.endpoint}; "
             f"{sum(1 for c in registry if c.available)} of {len(registry)} capabilities available"
@@ -728,11 +834,56 @@ class ConnectionManager:
         self._heartbeat = asyncio.create_task(
             self._heartbeat_loop(session), name="phonebridge-heartbeat"
         )
+        reason = ""
         try:
             reason = await session.wait_closed()
             self._log(f"the session closed: {reason}")
         finally:
             await self._teardown_session()
+
+        if self._stop.is_set():
+            # Disconnecting on purpose is not a drop; reporting one would make a
+            # normal exit look like a failure.
+            self._log("session closed on request")
+            return
+
+        # A close reason of "1006" says the socket died; it never says why. Two
+        # cheap facts turn it into something actionable: does the phone still
+        # answer, and is this still the same network? A dropped session then goes
+        # back through the retry ladder with backoff — it must not spin.
+        explanation = await self._explain_drop(candidate)
+        self._last_drop_reason = explanation
+        self._publish(last_connection_error=explanation)
+        self._log(f"why the link dropped: {explanation}")
+        raise _RetryCandidate(explanation)
+
+    async def _explain_drop(self, candidate: Candidate) -> str:
+        """Turn "the socket closed" into "the network moved" or "the phone went".
+
+        Deliberately two facts and no guessing, because the fixes differ: a moved
+        network needs a fresh address, a silent phone needs the app restarted (and
+        on HyperOS, the battery restriction lifted).
+        """
+        reachable = await self._probe(candidate.host, candidate.port, 1.0)
+        current = self._network_fingerprint()
+        was = self._fingerprint
+        self._fingerprint = current
+        parts: list[str] = []
+        if was and current and was != current:
+            parts.append(f"the network changed ({was} -> {current})")
+        elif was and current and was == current:
+            parts.append("the network is unchanged")
+        parts.append(
+            "the phone still answers on that address"
+            if reachable
+            else "nothing answers at that address now"
+        )
+        if not reachable:
+            parts.append(
+                "keep the bridge running in the foreground and allow PhoneBridge "
+                "unrestricted battery use (HyperOS stops background apps)"
+            )
+        return f"{candidate.kind} at {candidate.endpoint}: " + "; ".join(parts)
 
     async def _heartbeat_loop(self, session: BridgeSession) -> None:
         failures = 0

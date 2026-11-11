@@ -20,6 +20,7 @@ from tkinter import ttk
 from typing import Any
 
 from ...core.device_store import DeviceStore
+from ..endpoints import describe_endpoint
 from ..manager import ConnectionManager, Snapshot
 from ..runtime import BackgroundRuntime
 from ..view import (
@@ -187,6 +188,8 @@ class PhoneBridgeApp:
             ("adb", "adb"),
             ("adb_path", "adb path"),
             ("usb", "Physical USB"),
+            ("usb_diagnosis", "USB diagnosis"),
+            ("usb_action", "USB next step"),
             ("wifi", "Wi-Fi discovery"),
             ("server", "Phone server reachable"),
             ("authentication_ok", "Authenticated"),
@@ -270,6 +273,7 @@ class PhoneBridgeApp:
         except EndpointError as exc:
             self.message_label.configure(text=str(exc))
             return
+        self.message_label.configure(text=describe_endpoint(host, port))
         self.runtime.set_endpoint(host, port)
         self.runtime.connect()
 
@@ -315,6 +319,8 @@ class PhoneBridgeApp:
             ("adb", view.adb),
             ("adb_path", view.adb_path),
             ("usb", view.usb),
+            ("usb_diagnosis", view.usb_diagnosis),
+            ("usb_action", view.usb_action),
             ("wifi", view.wifi),
             ("server", view.server),
             ("authentication_ok", view.auth_ok),
