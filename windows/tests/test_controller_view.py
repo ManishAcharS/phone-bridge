@@ -161,7 +161,7 @@ def test_summary_counts_but_never_flatters() -> None:
         "permissions": {},
     }
     text = summary(snapshot(capabilities=build_registry(info)))
-    assert "0 of 8 capabilities usable" in text
+    assert "0 of 9 capabilities usable" in text
     assert "2 with hardware" in text
 
 

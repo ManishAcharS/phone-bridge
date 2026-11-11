@@ -101,7 +101,7 @@ async def test_pairing_then_connected_with_real_crypto(pc_config, phone) -> None
         assert snapshot.connected_at is not None
 
         capabilities = {c.key: c for c in snapshot.capabilities}
-        assert len(capabilities) == 8
+        assert len(capabilities) == 9
         # Phases 2 and 4 implement audio and the camera; the simulator's detail
         # still says the frames are synthetic, so "available" is never "hardware".
         assert capabilities["audio.bluetooth_sco"].available is True
@@ -109,9 +109,19 @@ async def test_pairing_then_connected_with_real_crypto(pc_config, phone) -> None
         assert capabilities["camera.back"].present is True
         assert "simulated" in (capabilities["camera.back"].detail or "")
         assert capabilities["audio.capture"].permitted is False
-        # Sensors and file transfer are still unimplemented on both sides.
-        assert capabilities["sensors"].available is False
-        assert capabilities["file_transfer"].available is False
+        # Phase 5 implemented sensors, files and both Bluetooth powers. The
+        # simulator says so, and its detail strings still say the data is synthetic:
+        # "available" never means "measured on this phone".
+        for key in ("sensors", "file_transfer", "bluetooth_scan", "bluetooth_gatt"):
+            capability = capabilities[key]
+            assert capability.implemented is True, f"{key} is implemented in Phase 5"
+            assert capability.available is True, f"{key} should be usable here"
+            assert "simulated" in (capability.detail or ""), (
+                f"{key} must say the simulator has no hardware behind it"
+            )
+        assert capabilities["audio.capture"].available is False, (
+            "denied RECORD_AUDIO must still block audio.capture"
+        )
         assert all(not c.active for c in snapshot.capabilities)
     finally:
         await manager.aclose()

@@ -417,7 +417,9 @@ def test_capabilities_prints_the_whole_contract(pc_config, running_phone, capsys
     for key in fmt.KNOWN_CAPABILITIES:
         assert key in out
     assert "simulated phone" in out
-    assert "no RPC in protocol v1" in " ".join(out.split())
+    # Phase 5: the "no verb" note now points at docs/03 rather than disclaiming
+    # features that exist.
+    assert "every method this CLI calls is listed in docs/03" in " ".join(out.split())
 
 
 def test_capabilities_json_is_machine_readable(pc_config, running_phone, capsys):
@@ -438,12 +440,14 @@ def test_require_passes_when_the_capability_is_usable(pc_config, running_phone, 
 
 
 def test_require_fails_with_the_reason(pc_config, running_phone, capsys):
-    # `sensors` is the honest example now: the Phase 4 camera *is* available on
-    # the simulator, so requiring it would succeed.
-    assert main(cli(pc_config, "capabilities", "--require", "sensors",
+    # `audio.capture` is the honest example: the simulator implements it but its
+    # RECORD_AUDIO permission is denied, so the conjunction the registry reports
+    # is "not available". Phase 5 made sensors and files available, so requiring
+    # either of those would (correctly) succeed now.
+    assert main(cli(pc_config, "capabilities", "--require", "audio.capture",
                     *target_args(running_phone))) == 4
     err = capsys.readouterr().err
-    assert "requirement not met: sensors" in err
+    assert "requirement not met: audio.capture" in err
 
 
 def test_require_warns_about_a_key_the_protocol_does_not_define(
@@ -549,11 +553,15 @@ def test_selftest_runs_every_supported_workflow(pc_config, running_phone, capsys
                     *target_args(running_phone))) == 0
     out = capsys.readouterr().out
     assert "WORKFLOW" in out and "RESULT" in out and "EVIDENCE" in out
-    assert "12 of 12 supported workflows passed" in out
+    assert "17 of 17 supported workflows passed" in out
     assert "authenticated connection" in out
     assert "binary integrity" in out
-    assert "NOT IMPLEMENTED" in out
-    assert "not in protocol v1" in out
+    assert "bluetooth scan lifecycle" in out
+    assert "sensor discovery" in out
+    assert "file transfer phone -> PC" in out
+    assert "NOT IMPLEMENTED" not in out, (
+        "Phase 5 implemented every remaining area; the matrix has no disclaimers left"
+    )
 
 
 def test_selftest_json_is_a_matrix_of_rows(pc_config, running_phone, capsys):
@@ -561,17 +569,12 @@ def test_selftest_json_is_a_matrix_of_rows(pc_config, running_phone, capsys):
                     *target_args(running_phone))) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["protocol_version"] == 1
-    assert payload["summary"]["PASS"] == 12
-    # Phase 2 removed audio and Phase 4 removed the camera: three remain.
-    assert payload["summary"]["NOT IMPLEMENTED"] == 3
+    assert payload["summary"]["PASS"] == 17
+    # Phase 5 implemented the last three areas (files, sensors, Bluetooth).
+    assert payload["summary"]["NOT IMPLEMENTED"] == 0
     statuses = {row["status"] for row in payload["rows"]}
-    assert statuses == {"PASS", "NOT IMPLEMENTED"}
-    unsupported = [row for row in payload["rows"] if row["category"] == "unsupported"]
-    assert len(unsupported) == 3
-    assert all("protocol v1" in row["evidence"] for row in unsupported)
-    assert not any("audio" in str(row).lower() for row in unsupported), (
-        "Phase 2 implemented audio; it must appear as a supported workflow"
-    )
+    assert statuses == {"PASS"}
+    assert [row for row in payload["rows"] if row["category"] == "unsupported"] == []
 
 
 def test_selftest_exits_one_when_a_workflow_cannot_run(pc_config, sim_state, capsys):
@@ -583,7 +586,7 @@ def test_selftest_exits_one_when_a_workflow_cannot_run(pc_config, sim_state, cap
         out = capsys.readouterr().out
         assert "session statistics" in out
         assert "FAIL" in out
-        assert "11 of 12 supported workflows passed, 1 failed" in out
+        assert "16 of 17 supported workflows passed, 1 failed" in out
     finally:
         _shutdown(phone)
 
@@ -724,13 +727,44 @@ def test_documented_methods_are_the_ones_the_reference_phone_implements(running_
     assert handlers - set(fmt.PROTOCOL_V1_METHODS) <= {"system.shutdown"}
 
 
-@pytest.mark.parametrize("verb", ["files", "camera", "sensors"])
+@pytest.mark.parametrize(
+    "verb", ["telepathy", "hologram", "camera", "hologram-export", "sensors-old"]
+)
 def test_there_is_no_command_for_a_protocol_v1_gap(pc_config, verb, capsys):
-    """No fake verbs: an unimplemented feature is absent, not stubbed to fail."""
+    """No fake verbs: anything the protocol does not define stays absent.
+
+    Phase 5 gave `files`, `sensors` and `bluetooth` real subcommands, so they are
+    no longer examples of a gap; `camera` (a *media kind*, never an RPC verb)
+    still is, and so is any name nobody defined.
+    """
     with pytest.raises(SystemExit) as exit_info:
         main(cli(pc_config, verb))
     assert exit_info.value.code == 2
     assert "invalid choice" in capsys.readouterr().err
+
+
+def test_the_phase_five_commands_exist_and_need_a_subcommand(pc_config, capsys):
+    for verb in ("bluetooth", "sensors", "files"):
+        with pytest.raises(SystemExit) as exit_info:
+            main(cli(pc_config, verb))
+        assert exit_info.value.code == 2
+        err = capsys.readouterr().err
+        assert verb in err and "required" in err
+
+
+def test_the_phase_five_commands_refuse_impossible_arguments_early(pc_config):
+    """Bad input fails in argparse (exit 2), before any connection is attempted."""
+    for argv in (
+        ["bluetooth", "scan", "--duration", "0"],
+        ["sensors", "stream", "--interval", "1us"],
+        ["files", "send", "--help"],
+    ):
+        try:
+            main(cli(pc_config, *argv))
+        except SystemExit as exc:
+            assert exc.code in (0, 2), argv
+        else:  # pragma: no cover - --help always raises SystemExit
+            pytest.fail(f"{argv} should have exited")
 
 
 def test_cli_text_is_ascii_so_a_legacy_console_cannot_crash(pc_config, capsys):

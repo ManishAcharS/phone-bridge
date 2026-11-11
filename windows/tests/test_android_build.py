@@ -308,6 +308,9 @@ def test_declared_permissions_are_exactly_the_ones_the_code_uses():
         "android.permission.BLUETOOTH_CONNECT",
         "android.permission.BLUETOOTH",
         "android.permission.CAMERA",
+        # Phase 5: BLE scanning, and the Android 11-and-older spelling of it.
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.ACCESS_FINE_LOCATION",
     }
     declared = permissions()
     assert declared == expected, (
@@ -317,20 +320,51 @@ def test_declared_permissions_are_exactly_the_ones_the_code_uses():
 
 
 def test_storage_and_scanning_permissions_are_not_requested():
-    """CAMERA left this list in Phase 4, when a feature started using it.
+    """CAMERA left this list in Phase 4; ACCESS_FINE_LOCATION left it in Phase 5.
 
-    Every remaining entry is a permission the app has no feature for: holding one
-    would be the same false capability claim the matrix is supposed to prevent.
+    Location is still declared, but only as the Android 11-and-older form of the
+    Bluetooth scan permission and capped at SDK 30 (see the dedicated test below),
+    so what this test forbids is *storage* access: file transfer goes through SAF,
+    which needs no storage permission at all.
     """
     forbidden = {
         "android.permission.MANAGE_EXTERNAL_STORAGE",
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.WRITE_EXTERNAL_STORAGE",
         "android.permission.READ_SMS",
-        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.QUERY_ALL_PACKAGES",
     }
     declared = permissions() & forbidden
     assert not declared, f"these are not needed for any implemented feature: {sorted(declared)}"
+    manifest = read(MANIFEST)
+    # SAF is the storage story: no legacy file permission may creep back in.
+    assert "MANAGE_EXTERNAL_STORAGE" not in manifest
+    assert "READ_EXTERNAL_STORAGE" not in manifest
+
+
+def test_location_is_only_declared_for_bluetooth_scanning_on_old_android():
+    """Phase 5 needs location on API <= 30 because that is where scanning lived.
+
+    The permission must be capped (Android 12+ has BLUETOOTH_SCAN and must not be
+    asked for location) and BLUETOOTH_SCAN must say it is not used for location.
+    """
+    text = read(MANIFEST)
+    match = re.search(
+        r'<uses-permission\s+android:name="android.permission.ACCESS_FINE_LOCATION"'
+        r'\s+android:maxSdkVersion="(\d+)"',
+        text,
+    )
+    assert match is not None, "ACCESS_FINE_LOCATION must be declared with maxSdkVersion"
+    assert match.group(1) == "30", "location is only needed on Android 11 and older"
+    scan = re.search(
+        r'<uses-permission\s+android:name="android.permission.BLUETOOTH_SCAN"\s+'
+        r'android:usesPermissionFlags="neverForLocation"',
+        text,
+    )
+    assert scan is not None, "BLUETOOTH_SCAN must declare neverForLocation"
+    assert 'android:name="android.hardware.bluetooth_le" android:required="false"' in text, (
+        "a device without BLE must still be able to install the app"
+    )
 
 
 def test_legacy_bluetooth_permission_is_capped_at_api_30():
