@@ -1,0 +1,6 @@
+; The frame server loads this DLL by CLSID and calls DllGetClassObject; the COM
+; loader only looks at the exports listed here.
+LIBRARY PhoneBridgeVcamSource
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
