@@ -240,7 +240,7 @@ def test_stream_attributes_describe_a_colour_capture_stream() -> None:
         "MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES",
     ):
         assert key in create, f"{key} must be set on the stream attribute store"
-    assert "MF_FRAMESOURCE_TYPES_COLOR" in create
+    assert "MFFrameSourceTypes_Color" in create
     assert "kPinNameVideoCapture" in create, "PINNAME_VIDEO_CAPTURE is the capture category"
     # Every Set call is result-checked, so a failed configuration cannot look like
     # a working source.
@@ -439,3 +439,44 @@ def test_every_sample_buffer_is_filled_through_its_real_pitch() -> None:
     assert "if (!data) return E_POINTER;" in pattern
     assert "< static_cast<LONG>(kWidth)" in pattern, "a short stride would write past the end"
     assert "stride" in pattern
+
+
+# ---------------------------------------------------------------------------
+# Spellings that the Windows SDK build rejected
+#
+# The first real compile of this source failed on three identifiers that read
+# plausibly but do not exist. They are pinned here so the *documented-looking*
+# spelling cannot come back: each one is a compile error, not a style choice.
+# ---------------------------------------------------------------------------
+
+
+def test_ks_control_comes_from_the_user_mode_header() -> None:
+    header = SOURCE_H.read_text(encoding="utf-8")
+    includes = body(header, "#include <windows.h>", "using Microsoft::WRL::ComPtr")
+    assert "#include <ks.h>" in includes, "the KS structures come from ks.h"
+    assert "#include <ksproxy.h>" in includes, (
+        "IKsControl is declared in ksproxy.h; ks.h alone leaves it undeclared"
+    )
+    assert includes.index("<ks.h>") < includes.index("<ksproxy.h>"), (
+        "ksproxy.h expects the KS structures to be defined first"
+    )
+
+
+def test_frame_source_type_uses_the_sdk_spelling() -> None:
+    source = SOURCE_CPP.read_text(encoding="utf-8")
+    assert "MFFrameSourceTypes_Color" in source
+    assert "MF_FRAMESOURCE_TYPES_COLOR" not in source, (
+        "MF_FRAMESOURCE_TYPES_COLOR does not exist in the SDK"
+    )
+
+
+def test_allocator_usage_uses_a_documented_enum_member() -> None:
+    source = SOURCE_CPP.read_text(encoding="utf-8")
+    assert "MFSampleAllocatorUsage_AllocatesSamples" not in source, (
+        "the SDK's MFSampleAllocatorUsage has no such member"
+    )
+    usage = method_body("MediaSource::GetAllocatorUsage")
+    members = re.findall(r"MFSampleAllocatorUsage_\w+", usage)
+    assert members == ["MFSampleAllocatorUsage_UsesProvidedAllocator"], (
+        f"unexpected allocator usage members: {sorted(set(members))}"
+    )

@@ -21,7 +21,11 @@
 #include <mfidl.h>
 #include <mfobjects.h>
 #include <mferror.h>
-#include <ks.h>   // IKsControl, KSPROPERTY/KSMETHOD/KSEVENT
+// ks.h declares the KS structures (KSPROPERTY/KSMETHOD/KSEVENT); the user-mode
+// interface IKsControl itself lives in ksproxy.h. Including only ks.h leaves
+// IKsControl undeclared - it does not declare the interface in the Windows SDK.
+#include <ks.h>
+#include <ksproxy.h>
 #include <wrl/client.h>
 #include <wrl/implements.h>
 
@@ -50,7 +54,7 @@ constexpr ULONG kSampleAllocatorBuffers = 10;
 constexpr DWORD kStreamId = 0;
 
 //: PINNAME_VIDEO_CAPTURE, the stream category the frame server expects for a
-//: colour capture stream. Written out rather than included from <ks.h> so this
+//: colour capture stream. Written out rather than taken from <ksmedia.h> so this
 //: file does not depend on the kernel-streaming headers being on the include path.
 //: {FB6C4281-0353-11D1-905F-0000C0CC16BA}
 constexpr GUID kPinNameVideoCapture = {

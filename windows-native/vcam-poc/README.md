@@ -323,6 +323,19 @@ Other decisions worth keeping:
   diverge from what the pipeline configured. `SetD3DManager` returns `E_NOTIMPL`
   on purpose: frames are CPU NV12, so the system-memory allocator is correct, and
   claiming a D3D manager that is never honoured would hang the pipeline instead.
+* **`ks.h` for the structures, `ksproxy.h` for `IKsControl`.** The two halves of
+  the kernel-streaming API live in different headers in the Windows SDK: `ks.h`
+  declares `KSPROPERTY`/`KSMETHOD`/`KSEVENT`, and the user-mode `IKsControl`
+  interface is declared in `ksproxy.h`. Including only `ks.h` is the mistake that
+  produced `IKsControl: undeclared identifier` on the first real build. Neither
+  header needs a library here: the interface is used through its vtable and its
+  IID comes from `__uuidof`, so nothing references `IID_IKsControl` at link time.
+* **Two SDK spellings that look right and are not:** the colour frame-source type
+  is `MFFrameSourceTypes_Color` (not `MF_FRAMESOURCE_TYPES_COLOR`), and the
+  allocator-usage enum in the shipping SDK has a single member,
+  `MFSampleAllocatorUsage_UsesProvidedAllocator` - there is no
+  `_AllocatesSamples` to fall back to, which is why "we allocate our own" is
+  expressed by the fallback in `RequestSample` rather than by an enum value.
 * **`FillSample` locks through `Lock2DSize` and passes the real pitch to
   `FillTestPattern`.** An allocator-provided surface is usually padded beyond the
   1280-pixel width; writing width-strided into it shears the picture. A stride

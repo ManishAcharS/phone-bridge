@@ -442,18 +442,20 @@ IFACEMETHODIMP MediaSource::SetDefaultAllocator(DWORD outputStreamId, IUnknown* 
 IFACEMETHODIMP MediaSource::GetAllocatorUsage(DWORD outputStreamId, DWORD* inputStreamId,
                                               MFSampleAllocatorUsage* usage) {
     if (!inputStreamId || !usage) return E_POINTER;
+    // Defined outputs even on the failure paths, so a caller that ignores the
+    // result cannot read an uninitialised enum. UsesProvidedAllocator is not just
+    // a default here: it is the only usage this source reports, because the
+    // pipeline's allocator is what RequestSample fills. "We allocate our own" is
+    // the fallback path inside RequestSample for consumers that supply nothing;
+    // the SDK's MFSampleAllocatorUsage offers no second member to say it with.
     *inputStreamId = 0;
-    *usage = MFSampleAllocatorUsage_AllocatesSamples;
+    *usage = MFSampleAllocatorUsage_UsesProvidedAllocator;
 
     std::lock_guard<std::mutex> guard(m_lock);
     if (m_shutdown) return MF_E_SHUTDOWN;
     if (outputStreamId != kStreamId) return MF_E_INVALIDSTREAMNUMBER;
 
-    // Honest answer: the pipeline's allocator is what RequestSample fills when it
-    // is given one. If none arrives we still produce frames from our own memory,
-    // but a caller that asked this question is going to supply one.
     *inputStreamId = outputStreamId;
-    *usage = MFSampleAllocatorUsage_UsesProvidedAllocator;
     return S_OK;
 }
 
@@ -511,7 +513,7 @@ HRESULT MediaSource::CreateStreamAttributes() {
     hr = attributes->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1);
     if (FAILED(hr)) return hr;
     hr = attributes->SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES,
-                               static_cast<UINT32>(MF_FRAMESOURCE_TYPES_COLOR));
+                               static_cast<UINT32>(MFFrameSourceTypes_Color));
     if (FAILED(hr)) return hr;
 
     m_streamAttributes = attributes;
