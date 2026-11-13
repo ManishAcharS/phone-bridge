@@ -279,17 +279,69 @@ There is no uninstaller because there is nothing installed.
 
 ## 6. Why the media source looks the way it does
 
-Three choices that are easy to get wrong, recorded so they are not "simplified"
-away later:
+The COM surface is not invented. It is copied from Microsoft's own virtual-camera
+sample, because every interface the frame server cannot find comes back from
+`IMFVirtualCamera::Start` as the *same* error - `0x80004002 (E_NOINTERFACE)`, with
+nothing to say which query failed:
+
+> `microsoft/Windows-Camera` → `Samples/VirtualCamera/VirtualCameraMediaSource`
+>
+> | Reference sample | This source |
+> |---|---|
+> | `SimpleMediaSource : IMFMediaSourceEx, IMFGetService, IKsControl, IMFSampleAllocatorControl` | same four, one class |
+> | `SimpleMediaStream : IMFMediaStream2` | `IMFMediaStream2` on the same object |
+
+Each of the three "control" interfaces does something real here; none is a stub
+added to silence a query:
+
+| Interface | What this source answers | Why |
+|---|---|---|
+| `IMFGetService` | `MF_E_UNSUPPORTED_SERVICE` | The QI has to succeed even though there is no service to give: callers reach this through `MFGetService`, which queries first, and a failed query is indistinguishable from a fatal error. |
+| `IKsControl` | `ERROR_SET_NOT_FOUND` from all three methods, after validating the header length | What an AVStream miniport returns for a control it never registered. No custom property set is claimed, so nothing can wait for a reply that will not come. |
+| `IMFSampleAllocatorControl` | `UsesProvidedAllocator`, and `RequestSample` writes into that allocator's buffers | The frame server hands the source the allocator it wants frames in; filling it directly is what makes a camera shared between two applications cost no copy. With no allocator supplied (a source reader, a plain pull consumer) it falls back to its own system-memory sample rather than refusing to produce. |
+
+Other decisions worth keeping:
 
 * **`ActivateObject` returns `MediaSource`, and the activator owns an attribute
   store.** The frame server writes configuration into the activator's
   `IMFAttributes`; a stub that ignores them yields a source that starts and then
   produces nothing.
-* **`Start` pushes `MENewStream` *then* `MEStreamStarted`,** in that order, and
-  `RequestSample` builds one sample per call with a monotonically increasing
-  timestamp. Reordering these is the usual reason a camera shows one frame and
+* **`Start` queues `MENewStream`, then `MEStreamStarted`, then `MESourceStarted`,
+  in that order,** and `RequestSample` builds one sample per call with a
+  monotonically increasing timestamp. `MESourceStarted` is the one a consumer
+  actually waits for: leave it out and `Start` returns `S_OK` while the pipeline
+  sits there. Reordering these is the usual reason a camera shows one frame and
   freezes.
-* **`FillTestPattern` writes into a buffer the caller has already locked.**
+* **The stream pointer in `MENewStream` comes from `QueryInterface`, never
+  `static_cast<IMFMediaStream*>(this)`.** With four interface roots, converting
+  a `this` pointer to the `IUnknown*` the event queue wants is ambiguous - it
+  does not compile, and it is the mistake the merged source/stream design invites.
+* **Source and stream attribute stores are created in the constructor**, before
+  `Start`, because that is when the frame server reads them, and released in
+  `Shutdown()`. `GetSourceAttributes` hands back a reference to the live store
+  (the same interface pointer, add-ref'd), not a clone - a copy would silently
+  diverge from what the pipeline configured. `SetD3DManager` returns `E_NOTIMPL`
+  on purpose: frames are CPU NV12, so the system-memory allocator is correct, and
+  claiming a D3D manager that is never honoured would hang the pipeline instead.
+* **`FillSample` locks through `Lock2DSize` and passes the real pitch to
+  `FillTestPattern`.** An allocator-provided surface is usually padded beyond the
+  1280-pixel width; writing width-strided into it shears the picture. A stride
+  shorter than one row is rejected rather than written past the end.
+* **`FillTestPattern` writes into a buffer someone else has already locked.**
   Locking inside the helper while the caller also holds the lock is a deadlock
   that only shows under a second stream — which the full version has.
+
+Deliberately *not* copied from the reference:
+
+* **Sensor profile collection** (`MF_DEVICEMFT_SENSORPROFILE_COLLECTION` with a
+  Legacy and a High-Frame-Rate profile). It matters for profile-aware applications
+  negotiating 60 fps; this source advertises one 30 fps format, so there is nothing
+  to negotiate, and adding it drags in the `ksmedia.h` GUIDs. This is the first
+  thing to add when profiles enter scope.
+* **The `PROPSETID_SIMPLEMEDIASOURCE_CUSTOMCONTROL` KS property set** the sample
+  uses to demo `IKsControl`. There is no user-facing control on a test pattern, so
+  the honest answer is the "unregistered control" error above.
+* **A separate stream object and a second RGB32 media type.** One class, one
+  format: both are correct for a proof of concept and both are the wrong shape for
+  the real source, which will need a stream per camera direction and the format
+  list the phone can actually produce.
