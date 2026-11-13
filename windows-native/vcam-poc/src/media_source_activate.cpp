@@ -1,4 +1,12 @@
-// PhoneBridge virtual camera — proof of concept, part 2 (implementation).
+// PhoneBridge virtual camera - proof of concept, part 2 (implementation).
+//
+// Lifetime rules that the rest of this file depends on:
+//   * Media Foundation is started lazily from DllGetClassObject, never from
+//     DllMain (MFStartup loads DLLs and creates threads: both unsafe inside the
+//     loader lock), and a failure there is returned rather than swallowed.
+//   * DllCanUnloadNow refuses to unload while any object this DLL created is
+//     still alive. The frame server asks this question, and answering "yes" too
+//     early means it calls into code that no longer exists.
 //
 // NOT COMPILED: no MSVC and no Windows SDK in the authoring environment.
 
@@ -6,6 +14,9 @@
 
 #include "media_source.h"
 
+#include <wrl/module.h>
+
+#include <atomic>
 #include <mutex>
 
 namespace {
@@ -19,28 +30,37 @@ namespace {
 std::atomic<bool> g_mfStarted{false};
 std::mutex g_mfLock;
 
-void EnsureMediaFoundation() {
+// Returns the result of starting Media Foundation in this process. Idempotent: the
+// first call starts it, later calls report the same outcome, including failure.
+HRESULT EnsureMediaFoundation() {
     std::lock_guard<std::mutex> guard(g_mfLock);
-    if (g_mfStarted) return;
-    if (SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) g_mfStarted = true;
+    if (g_mfStarted) return S_OK;
+    const HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    if (SUCCEEDED(hr)) g_mfStarted = true;
+    return hr;
 }
 
 }  // namespace
 
 namespace phonebridge {
 
-// {7F1B3C1E-9D62-4C2B-9E7A-5B4C0D2A6F31}
-const GUID kSourceClsid = {
-    0x7f1b3c1e, 0x9d62, 0x4c2b, {0x9e, 0x7a, 0x5b, 0x4c, 0x0d, 0x2a, 0x6f, 0x31}};
-const wchar_t* const kSourceClsidString = L"{7F1B3C1E-9D62-4C2B-9E7A-5B4C0D2A6F31}";
+// kSourceClsid / kSourceClsidString are defined once, in the header, so that the
+// host executable and this DLL cannot disagree about the CLSID.
 
 MediaSourceActivate::MediaSourceActivate() {
-    MFCreateAttributes(&m_attributes, 8);
+    // Checked, not dropped: this is the store the frame server writes its
+    // configuration into, and every forwarded method below depends on it.
+    m_attributeInitHr = MFCreateAttributes(&m_attributes, 8);
 }
 
 IFACEMETHODIMP MediaSourceActivate::ActivateObject(REFIID iid, void** object) {
     if (!object) return E_POINTER;
     *object = nullptr;
+    if (FAILED(m_attributeInitHr) || !m_attributes) {
+        // Better a clear failure here than a source that starts and then cannot be
+        // configured, which would look like a pipeline fault.
+        return FAILED(m_attributeInitHr) ? m_attributeInitHr : E_UNEXPECTED;
+    }
     if (m_activated) {
         // Activated twice with a different interface: hand back the same object,
         // which is what a real device enumerator expects.
@@ -200,15 +220,24 @@ IFACEMETHODIMP ClassFactory::LockServer(BOOL lock) {
 STDAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void** object) {
     if (!object) return E_POINTER;
     *object = nullptr;
-    if (clsid != phonebridge::kSourceClsid) return CLASS_E_CLASSNOTAVAILABLE;
-    EnsureMediaFoundation();
+    if (!IsEqualGUID(clsid, phonebridge::kSourceClsid)) return CLASS_E_CLASSNOTAVAILABLE;
+    const HRESULT mf = EnsureMediaFoundation();
+    if (FAILED(mf)) return mf;  // the frame server gets a real error, not a dead source
     auto factory = Microsoft::WRL::Make<phonebridge::ClassFactory>();
     if (!factory) return E_OUTOFMEMORY;
     return factory->QueryInterface(iid, object);
 }
 
 STDAPI DllCanUnloadNow() {
+    // Two independent reasons to stay loaded: a factory outstanding from
+    // IClassFactory::LockServer, and any RuntimeClass object this DLL created
+    // (WRL keeps that count). Unloading with either non-zero lets the frame server
+    // call into freed code.
     if (phonebridge::g_serverLocks.load() > 0) return S_FALSE;
+    if (Microsoft::WRL::Module<Microsoft::WRL::InProc>::GetModule().GetObjectCount() > 0) {
+        return S_FALSE;
+    }
+    // Nothing of ours is alive, so the platform we started can be shut down.
     if (g_mfStarted.exchange(false)) MFShutdown();
     return S_OK;
 }

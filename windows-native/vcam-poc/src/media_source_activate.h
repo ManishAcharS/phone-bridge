@@ -23,11 +23,20 @@
 
 namespace phonebridge {
 
-//: The CLSID of the custom media source. It must match the string handed to
-//: `MFCreateVirtualCamera` and the key written under `HKCU\Software\Classes`.
+//: The CLSID of the custom media source, defined here exactly once: the class
+//: factory answers to it, the host builds `HKCU\Software\Classes\CLSID\<string>`
+//: from it and hands the string to `MFCreateVirtualCamera`. A second copy of this
+//: literal anywhere is a defect, because registration and activation would then be
+//: able to drift apart silently.
+//:
+//: These are `inline constexpr` rather than `extern` definitions in the DLL: the
+//: host executable links neither the DLL nor its import library, so a symbol defined
+//: only in the media source would be an unresolved external at link time.
+//:
 //: {7F1B3C1E-9D62-4C2B-9E7A-5B4C0D2A6F31}
-extern const GUID kSourceClsid;
-extern const wchar_t* const kSourceClsidString;
+inline constexpr GUID kSourceClsid = {
+    0x7f1b3c1e, 0x9d62, 0x4c2b, {0x9e, 0x7a, 0x5b, 0x4c, 0x0d, 0x2a, 0x6f, 0x31}};
+inline constexpr wchar_t kSourceClsidString[] = L"{7F1B3C1E-9D62-4C2B-9E7A-5B4C0D2A6F31}";
 
 //: Non-zero while something holds the class factory, so `DllCanUnloadNow` can
 //: refuse to unload a DLL the frame server may still call into.
@@ -86,6 +95,10 @@ private:
 
     Microsoft::WRL::ComPtr<IMFAttributes> m_attributes;
     Microsoft::WRL::ComPtr<IUnknown> m_activated;
+    //: Result of creating the attribute store in the constructor. Recorded rather
+    //: than dropped: an activator with no store would silently answer every
+    //: configuration query with MF_E_ATTRIBUTENOTFOUND and look like a pipeline bug.
+    HRESULT m_attributeInitHr = E_PENDING;
 };
 
 //: The class factory `DllGetClassObject` returns.

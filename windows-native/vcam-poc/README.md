@@ -125,15 +125,52 @@ was skipped — the CMake configure error says exactly that.
 
 ---
 
+## 2b. What the host guarantees (and what it deliberately refuses to do)
+
+The host touches three things that outlive a process - a registry key, a device, and
+a COM object - so its failure behaviour is part of the design rather than an
+afterthought. Every clause below is asserted against the source in
+`windows/tests/test_vcam_host_safety.py`.
+
+| Situation | Behaviour |
+| --- | --- |
+| A registration for the CLSID already exists | It is printed (friendly name + `InprocServer32` path) and the host exits **4** without writing anything. Nothing is overwritten, ever. |
+| The existing registration points at *this* DLL, left over from an interrupted run | Still refused by default; `--reuse-existing` uses it as found and does **not** delete it on exit. |
+| The CLSID key appears between the check and the create | `RegCreateKeyExW` reports `REG_OPENED_EXISTING_KEY`, so the key is treated as somebody else's: exit **4**, key untouched. |
+| Any `RegSetValueExW` fails | Everything written so far is rolled back (the key is ours, so removing it is exact). Exit **1**. |
+| `PhoneBridgeVcamSource.dll` is missing, empty, or a directory | Exit **5** *before* any registry write. |
+| `MFCreateVirtualCamera` / `Start` fails | The camera object is released, the key is removed, `CoUninitialize`/`MFShutdown` run in order. Exit **6**. |
+| `Stop`, `Remove` or the final `Release` fails | Reported individually; the other calls are still attempted; exit **7**. A `Release` that returns a non-zero count means something still holds the object, which is reported rather than ignored. |
+| Press Enter | Normal path; cleanup runs. |
+| Press Ctrl+C / Ctrl+Break | Console handler signals the main thread, which owns the COM teardown, so cleanup still runs instead of being skipped. |
+| Close the console window, log off, shut down | The system terminates the process after the handler returns, so the device dies with the session but the registry key can survive. That is why the host prints the exact `reg delete` command up front. |
+| `--check` | Loads `mfsensorgroup.dll`, reads one export, frees it, inspects two file paths. No registry access at all, no camera created. |
+| `--machine` | Refused before COM is initialised and before anything is written. Exit **3**. |
+
+Exit codes: `0` ok, `1` setup failed, `2` API unavailable, `3` `--machine` refused,
+`4` registration already present, `5` media source DLL missing, `6` camera failed,
+`7` cleanup reported failure.
+
+The host never calls `RegDeleteKey`/`RegDeleteTreeW` on a path it did not create.
+That is enforced by tracking creation, not by assuming ownership of the path: the
+`Registration` struct carries `createdKey`/`createdInproc`/`wroteValues`, and
+`RemoveRegistration` is a no-op when `createdKey` is false.
+
 ## 3. Run
 
 ```bat
 :: 1. Does this machine have the API at all? Registers nothing.
 build\vcam\Release\vcam_host.exe --check
 
-:: 2. Start the camera and hold it alive.
+:: 2. Start the camera and hold it alive (Enter or Ctrl+C stops it and cleans up).
 build\vcam\Release\vcam_host.exe
 ```
+
+Further switches: `--reuse-existing` (accept a leftover HKCU registration that
+already points at this DLL, and leave it in place), `--machine` (refused, exit 3),
+`--help` (usage and exit codes). If a previous run was killed and now exits **4**,
+check whether the registration is yours and either pass `--reuse-existing` or run
+the `reg delete` line the host prints.
 
 `--check` prints the real OS build (via `RtlGetVersion`, not the manifest-lied
 `GetVersionEx`) and whether `mfsensorgroup.dll` exports `MFCreateVirtualCamera`.
