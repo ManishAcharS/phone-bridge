@@ -4,7 +4,10 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.hardware.display.DisplayManager
 import android.os.SystemClock
+import android.view.Display
+import android.view.Surface
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -160,6 +163,15 @@ class CameraEngine(
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .setTargetResolution(android.util.Size(requested.width, requested.height))
                 .build()
+            // Make the rotation metadata mean something. `rotationDegrees` is
+            // relative to the use case's target rotation, and a use case that is
+            // not attached to a window defaults that to 0 - so every frame was
+            // described as "upright in the phone's natural orientation", which is
+            // sideways the moment the phone is held in landscape, and the PC drew
+            // it that way. Tying it to the display rotation makes the number mean
+            // "turn the picture this far clockwise to be upright as the phone is
+            // held now", which is exactly what the receiver does with it.
+            analysisUseCase.targetRotation = displayRotation()
 
             val queue = ArrayBlockingQueue<ByteArray>(QUEUE_FRAMES)
             analysisUseCase.setAnalyzer(executor) { proxy -> analyse(proxy, requested, queue) }
@@ -335,6 +347,22 @@ class CameraEngine(
         thread.isDaemon = true
         thread.start()
         sender = thread
+    }
+
+    /**
+     * The display rotation right now, as a `Surface.ROTATION_*` value.
+     *
+     * `DisplayManager` is used rather than `Context.getDisplay()` because this
+     * runs in a service: a non-visual context has no display of its own, and the
+     * window-manager route is deprecated. `DEFAULT_DISPLAY` is still the
+     * documented way to ask for the built-in panel.
+     */
+    private fun displayRotation(): Int {
+        val manager = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+            ?: return Surface.ROTATION_0
+        @Suppress("DEPRECATION")
+        val rotation = manager.getDisplay(Display.DEFAULT_DISPLAY)?.rotation
+        return rotation ?: Surface.ROTATION_0
     }
 
     /** RGBA_8888 `ImageProxy` -> JPEG. Row stride is honoured, not assumed. */

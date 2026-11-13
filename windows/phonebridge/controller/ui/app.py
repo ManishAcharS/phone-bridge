@@ -302,18 +302,27 @@ class PhoneBridgeApp:
         self.camera_fps.pack(side="left", padx=(4, 0))
         self.camera_fps.bind("<<ComboboxSelected>>", self._camera_settings_changed)
 
-        # The preview: one Label, refreshed by the existing UI tick. Pillow is
-        # needed to turn JPEG bytes into a picture; without it the label says so
-        # instead of showing a broken image or a fake placeholder.
+        # The preview lives in a holder with a real height. `pack_propagate(False)`
+        # is what stops the section from collapsing to a strip: a Label given a
+        # 1280x720 image asks for 720 pixels of height, and inside a window that
+        # is already full what survived was a thin slice of the picture. The image
+        # is now scaled to fit this box instead (camera/preview.py: render()).
+        self.camera_preview_box = tk.Frame(camera_frame, bg="#101418", height=320)
+        self.camera_preview_box.pack(fill="both", expand=True, pady=(8, 0))
+        self.camera_preview_box.pack_propagate(False)
+        # The Label is refreshed by the existing UI tick. Pillow is needed to turn
+        # JPEG bytes into a picture; without it the Label says so instead of
+        # showing a broken image or a fake placeholder.
         self.camera_preview = tk.Label(
-            camera_frame,
+            self.camera_preview_box,
             text="no stream \u2014 nothing is captured until you press start",
             bg="#101418",
             fg="#c9d1d9",
-            width=64,
-            height=8,
+            wraplength=520,
+            justify="center",
         )
-        self.camera_preview.pack(fill="x", pady=(8, 0))
+        self.camera_preview.pack(fill="both", expand=True)
+        self.camera_preview_box.bind("<Configure>", self._camera_box_resized)
         self.camera_status = tk.Label(
             camera_frame,
             text="idle",
@@ -324,9 +333,16 @@ class PhoneBridgeApp:
             wraplength=880,
         )
         self.camera_status.pack(fill="x", pady=(6, 0))
-        self._camera_photo: object | None = None
+        #: The `ImageTk.PhotoImage` currently on screen. Tk keeps no reference
+        #: of its own, so dropping this makes the picture vanish.
+        self._camera_photo: Any = None
         self._camera_shown_seq: int | None = None
         self._camera_shown_state: str = "idle"
+        #: The space the preview has, in pixels, as the last <Configure> reported.
+        self._camera_box: tuple[int, int] | None = None
+        #: (seq, box, facing) of the frame currently drawn, so a tick with nothing
+        #: new does no decoding, no scaling and no allocation at all.
+        self._camera_render_key: tuple[object, ...] | None = None
 
         # ---- Phase 5: Bluetooth, sensors, files ------------------------ #
         planes = ttk.Notebook(outer, height=250)
@@ -451,24 +467,55 @@ class PhoneBridgeApp:
         )
 
     # ---- audio commands -------------------------------------------------- #
+    def _camera_box_resized(self, event: tk.Event) -> None:
+        """Remember the space the preview has; the next tick redraws to fit it.
+
+        Deliberately does not redraw here: `<Configure>` fires continuously while
+        a window is dragged, and decoding and rescaling in that handler would make
+        resizing stutter. One redraw per UI tick, at most, is the budget.
+        """
+        width, height = int(getattr(event, "width", 0)), int(getattr(event, "height", 0))
+        if width < 40 or height < 30:
+            return  # before the window is mapped, Tk reports 1x1
+        self._camera_box = (width, height)
+
+    def _preview_box(self) -> tuple[int, int]:
+        """The box to fit the picture into, with a sane fallback."""
+        box = self._camera_box
+        if box is None:
+            box = (self.camera_preview_box.winfo_width(), self.camera_preview_box.winfo_height())
+        if box[0] < 40 or box[1] < 30:
+            return (640, 360)
+        return (int(box[0]), int(box[1]))
+
     def _refresh_camera_preview(self, view: View) -> None:
         """Draw the newest frame, at most once per UI tick and only if it changed.
 
         Three outcomes, all honest: a picture when the bytes decode, an explicit
         "install Pillow" line when the decoder is missing, and a plain "waiting"
         line when the stream is live but no frame has arrived yet.
+
+        A frame is drawn at most once for a given (sequence, box, lens): the tick
+        runs several times a second, and re-rendering an unchanged frame would
+        mean decoding, rotating and rescaling the same JPEG for nothing.
         """
         status = dict(self.runtime.camera_status() or {})
         preview_state = dict(status.get("preview") or {})  # type: ignore[call-overload]
         frame = self.runtime.camera_frame()
         seq = getattr(frame, "seq", None)
-        if frame is None or seq == self._camera_shown_seq:
+        facing = view.camera_facing or "back"
+        key: tuple[object, ...] | None = None
+        if frame is not None and seq is not None:
+            key = (seq, self._preview_box(), facing)
+        if key is None or key == self._camera_render_key:
             if view.camera_state != self._camera_shown_state:
                 self._camera_shown_state = view.camera_state
                 if view.camera_state == "active":
-                    self.camera_preview.configure(text="waiting for the first frame…", image="")
+                    self.camera_preview.configure(text="waiting for the first frame\u2026", image="")
                     self._camera_photo = None
+                    self._camera_render_key = None
             return
+        self._camera_render_key = key
         self._camera_shown_seq = seq
         self._camera_shown_state = view.camera_state
         if not preview_state.get("available"):
@@ -483,15 +530,27 @@ class PhoneBridgeApp:
         try:
             from ..camera import preview as camera_preview  # noqa: PLC0415 - optional dep
 
-            image = camera_preview.decode(frame)
+            decoded = camera_preview.decode(frame)
+            # Rotation, front-lens mirroring and fitting all happen in one place,
+            # so the window and (later) the virtual camera cannot disagree about
+            # which way up the picture is.
+            image, width, height = camera_preview.render(
+                decoded, facing=facing, box=self._preview_box()
+            )
         except Exception as exc:  # noqa: BLE001 - a preview must never kill the window
             self.camera_preview.configure(text=f"could not draw that frame: {exc}", image="")
             return
         from PIL import ImageTk  # noqa: PLC0415 - only reachable when Pillow exists
 
-        photo = ImageTk.PhotoImage(image)
-        self._camera_photo = photo  # keep a reference or Tk drops the image
-        self.camera_preview.configure(image=photo, text="")
+        photo = self._camera_photo
+        if photo is None or (photo.width(), photo.height()) != (width, height):
+            self._camera_photo = ImageTk.PhotoImage(image)
+            self.camera_preview.configure(image=self._camera_photo, text="")
+        else:
+            # Same geometry as last time: paste into the existing PhotoImage
+            # instead of allocating a new Tk image object for every frame.
+            photo.paste(image)
+            self.camera_preview.configure(text="")
 
     def _toggle_playback(self) -> None:
         """Start or stop PC audio. Nothing plays until this is pressed."""
@@ -637,7 +696,8 @@ class PhoneBridgeApp:
                 f"camera: {view.camera_state} \u00b7 "
                 f"{'front' if view.camera_facing == 'front' else 'rear'} "
                 f"{view.camera_width}x{view.camera_height} @ {view.camera_fps} fps \u00b7 "
-                f"{view.camera_frames} frames received"
+                f"{view.camera_frames} frames received \u00b7 "
+                f"rotation {view.camera_rotation}\u00b0"
                 + ("" if view.camera_detail in {"", "\u2014"} else f"  \u00b7  {view.camera_detail}")
             )
         )

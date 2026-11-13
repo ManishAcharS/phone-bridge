@@ -229,6 +229,55 @@ the header and reports whether a preview decoder exists.
 
 ---
 
+## 8.1 Preview geometry and orientation (Phase 6, step 1)
+
+Three separate defects decided whether the picture was usable, and they were
+independent of each other.
+
+**The preview was a strip.** The Tk `Label` was given the decoded image at its
+natural size (1280x720 ≈ 720 pixels of height) inside a window that is already
+full, so what survived on screen was a thin slice of it. The label also carried
+`width=64, height=8` in *text* units, which says nothing useful about a picture.
+The fix is structural: the picture lives in a holder with a real height
+(`pack_propagate(False)`) and is **scaled to fit** it, preserving the aspect
+ratio, on every `<Configure>`. One dimension always uses the whole box; nothing
+is stretched and nothing is enlarged past the source.
+
+**The rotation was never applied.** `preview.decode()` returned a `Preview`, and
+the window handed that object straight to `ImageTk.PhotoImage` — which is not a
+Pillow image and cannot work — while `Preview.rotated()`, the one function that
+interprets the phone's `rotationDegrees`, was never called from the window. The
+result is exactly what a raw sensor buffer looks like: the rear lens 90° one way
+and the front lens the other, because the two sensors are mounted 180° apart.
+The window now goes through `preview.render()`, which rotates *once*, fits
+*once*, and returns the dimensions it produced.
+
+**The front lens was not mirrored, and nothing may guess.** A selfie camera is
+mirrored on the phone's own screen, so an unmirrored preview reads backwards.
+`mirrored_for_display()` mirrors `front` and never `back`; the *virtual camera*
+path passes `mirror=False` because every application mirrors its own preview and
+a second flip would un-mirror it.
+
+**The metadata is now deterministic.** `rotationDegrees` is relative to the use
+case's target rotation, which defaults to 0 for a use case that is not attached
+to a window — so the number described the phone's *natural* orientation rather
+than the way it is held. `CameraEngine` now sets
+`analysisUseCase.targetRotation` from `DisplayManager`, so the number means
+"turn the picture this far clockwise to be upright as the phone is held now".
+
+The window's status line reports `rotation N°` — the value the phone sent for the
+last frame — so a sideways picture can be diagnosed from a number instead of by
+guessing which side is wrong.
+
+**Proven here:** the arithmetic (clockwise turning, mirroring, fitting, one
+decode per frame) in `tests/test_camera_preview_geometry.py`; the Kotlin side in
+`tests/test_phase6_android_camera.py`.
+**Not proven:** that this handset reports the expected values, that the window
+looks right on a real display (no Tk in this environment), and that the picture
+is upright in an external webcam application (there is none yet).
+
+---
+
 ## 9. Manual hardware checklist (not yet done)
 
 Nothing below has been run: this development environment has no phone, no JDK, no
@@ -238,6 +287,16 @@ Run on a real phone and PC, in this order:
 
 1. **Build and install.** `cd android && .\gradlew.bat assembleDebug`, then
    `adb install -r app\build\outputs\apk\debug\app-debug.apk`.
+1a. **Preview geometry (Phase 6).** Start a stream and look at the window: the
+   picture must fill the width of its section with the correct aspect ratio, and
+   resizing the window must rescale it without stretching. The status line shows
+   `rotation N°`: note the value for each lens. Rotate the phone to landscape
+   while streaming — the picture must stay upright and the reported rotation must
+   change. The rear lens must *not* be mirrored; the front lens must be (text in
+   the scene reads correctly).
+1b. **Record the numbers.** If a lens is still sideways, the rotation figure and
+   the lens are the two facts needed to fix it; write them down before changing
+   any code, because a wrong sign corrects one lens and breaks the other.
 2. **Permission timing.** Launch the app: no camera dialog. Connect a PC, start the
    GUI, press **Camera → start**: the phone shows a permission dialog (first run
    only). Refuse it → the GUI must show `camera permission is not granted` and no
