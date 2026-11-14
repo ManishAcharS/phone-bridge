@@ -25,7 +25,6 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,6 +41,7 @@ from .devices import (
     open_loopback_source,
     open_virtual_camera,
 )
+from .pump import CameraPump, PumpSnapshot
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +56,11 @@ DEFAULT_FIRST_FRAME_S = 5.0
 #: Status is refreshed on this cadence: fast enough to look live, slow enough
 #: that a one-line status does not cost more than the audio it describes.
 STATUS_INTERVAL_S = 1.0
+
+#: How often the camera supervisor looks at the pump. Only bookkeeping — the
+#: frames themselves reach the pump from :meth:`CameraStream`'s callback, so this
+#: interval never limits the frame rate.
+SUPERVISOR_INTERVAL_S = 0.05
 
 
 @dataclass
@@ -76,6 +81,9 @@ class LiveStatus:
     latency_ms: int = 0
     detail: str = ""
     extra: dict[str, int] = field(default_factory=dict)
+    #: ``--stats`` numbers: the PC's pump and, when asked for, the phone's own
+    #: counters from its ``camera.status``. Empty unless ``--stats`` is on.
+    camera_stats: dict[str, Any] = field(default_factory=dict)
 
     def line(self) -> str:
         parts: list[str] = [f"link {'up' if self.connected else 'down'}"]
@@ -117,6 +125,8 @@ class LiveStatus:
                 "latency_ms": self.latency_ms,
             },
         }
+        if self.camera_stats:
+            payload["camera"]["stats"] = dict(self.camera_stats)
         if self.extra:
             payload["stats"] = dict(self.extra)
         return payload
@@ -128,24 +138,15 @@ def default_decode(frame: VideoFrame, width: int, height: int) -> Any:
     Deliberately **not** mirrored: a virtual webcam feeds applications that do
     their own preview mirroring, so mirroring here would mirror it twice. See
     :func:`phonebridge.camera.preview.mirrored_for_display`.
+
+    The work is in :func:`phonebridge.camera.preview.decode_into_box`, which
+    decodes with ``draft()`` and only allocates a letterbox when the aspect
+    ratios disagree — this function runs 30 times a second, so it does not copy
+    anything it can avoid.
     """
-    from ..camera.preview import PreviewUnavailable, decode, render  # noqa: PLC0415
+    from ..camera.preview import decode_into_box  # noqa: PLC0415 - optional Pillow
 
-    preview = decode(frame)
-    image, _, _ = render(preview, facing="", box=(width, height), mirror=False)
-    image = image.convert("RGB")
-    if image.size == (width, height):
-        return image
-    # Letterbox rather than stretch: a webcam that changes aspect ratio looks
-    # like a broken camera to everyone downstream.
-    canvas = image.copy()
-    canvas.thumbnail((width, height))
-    from PIL import Image  # noqa: PLC0415
-
-    out = Image.new("RGB", (width, height), (0, 0, 0))
-    out.paste(canvas, ((width - canvas.width) // 2, (height - canvas.height) // 2))
-    del PreviewUnavailable
-    return out
+    return decode_into_box(frame, width, height)
 
 
 def _to_array(image: Any) -> Any:
@@ -168,6 +169,7 @@ class LiveRunner:
         decode: Callable[[VideoFrame, int, int], Any] = default_decode,
         stall_s: float = DEFAULT_STALL_S,
         first_frame_s: float = DEFAULT_FIRST_FRAME_S,
+        stats: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._session = session
@@ -178,16 +180,23 @@ class LiveRunner:
         self._decode = decode
         self._stall_s = stall_s
         self._first_frame_s = first_frame_s
+        self._stats = stats
         self._clock = clock
 
         self._camera: CameraStream | None = None
         self._camera_sink: Any = None
-        self._pump: asyncio.Task[None] | None = None
+        #: The worker thread that decodes, converts and sends. Frames are handed
+        #: to it on arrival; nothing in the frame path touches the asyncio loop.
+        self._pump: CameraPump | None = None
+        self._supervisor: asyncio.Task[None] | None = None
+        self._last_frame_seen: Any = None
+        self._pump_snapshot = PumpSnapshot()
+        self._phone_stats: dict[str, Any] = {}
+        self._stats_at = 0.0
         self._link: AudioLink | None = None
         self._mic_sink: CableMicSink | None = None
 
         self._sent = 0
-        self._sent_at: deque[tuple[float, int]] = deque(maxlen=8)
         self._fps = 0.0
         self._detail = ""
         self._started_at = clock()
@@ -217,6 +226,10 @@ class LiveRunner:
 
         if self._plan.camera is not None:
             self._camera_sink = self._camera_factory(self._plan.camera)
+            # The pump exists before the phone is asked, so the very first frame
+            # is published instead of meeting a `None` and being dropped.
+            self._pump = self._make_pump()
+            self._pump.start()
             self._camera = CameraStream(
                 self._session,
                 config=VideoConfig(
@@ -226,6 +239,10 @@ class LiveRunner:
                     quality=self._plan.camera.quality,
                     facing=self._plan.camera.facing,
                 ),
+                # Frames reach the pump the moment they arrive, not on a timer:
+                # polling once per 1/fps was the largest single cost of the old
+                # frame path (see pump.py).
+                on_change=self._camera_changed,
             )
             if not await self._camera.start():
                 # The phone said no (or never answered). That sentence is the
@@ -234,6 +251,8 @@ class LiveRunner:
                 snapshot = self._camera.snapshot()
                 self._camera_error = snapshot.detail or "the phone refused the camera"
                 log.warning("camera did not start: %s", self._camera_error)
+                self._pump.close()
+                self._pump = None
 
         if self._plan.mic is not None or self._plan.speaker is not None:
             self._link = AudioLink(
@@ -256,9 +275,43 @@ class LiveRunner:
 
         if self._camera_sink is not None and not self._camera_error:
             self._first_frame_deadline = self._clock() + self._first_frame_s
-            self._pump = asyncio.get_running_loop().create_task(
-                self._camera_loop(), name="phonebridge-vcam-pump"
+            self._supervisor = asyncio.get_running_loop().create_task(
+                self._camera_loop(), name="phonebridge-camera-supervisor"
             )
+
+    def _make_pump(self) -> CameraPump:
+        assert self._plan.camera is not None
+        return CameraPump(
+            decode=self._decode,
+            # Late binding on purpose: tests replace `_to_array` at module level
+            # and the pump must see the replacement.
+            to_array=lambda image: _to_array(image),
+            sink=self._camera_sink,
+            width=self._plan.camera.width,
+            height=self._plan.camera.height,
+            fps=self._plan.camera.fps,
+            stall_s=self._stall_s,
+            delay_s=(max(0, self._plan.speaker.lipsync_ms) / 1000.0)
+            if self._plan.speaker
+            else 0.0,
+            clock=self._clock,
+        )
+
+    def _camera_changed(self, snapshot: Any) -> None:
+        """Called by :class:`CameraStream` for every received frame.
+
+        Runs on the asyncio thread, so it does one thing only: hand the frame to
+        the pump's single slot. Any older frame still waiting there is dropped —
+        a backlog of old pictures is worse than a missing one.
+        """
+        pump = self._pump
+        if pump is None:
+            return
+        frame = getattr(snapshot, "frame", None)
+        if frame is None or frame is self._last_frame_seen:
+            return
+        self._last_frame_seen = frame
+        pump.submit(frame)
 
     def _open_mic(self, fmt: AudioFormat) -> Any:
         assert self._plan.mic is not None
@@ -305,80 +358,65 @@ class LiveRunner:
     # camera pump
     # ------------------------------------------------------------------ #
     async def _camera_loop(self) -> None:
+        """Supervise the pump; never touch a frame.
+
+        The frames are decoded and sent on :class:`CameraPump`'s thread. This
+        loop exists for the things that need the session: noticing a pump error,
+        reporting silence, and (with ``--stats``) asking the phone what *it*
+        thinks its frame rate is. It ticks every 50 ms, which no longer limits
+        anything — the frames do not come through here.
+        """
         assert self._plan.camera is not None
-        interval = 1.0 / max(1, self._plan.camera.fps)
-        last_frame: VideoFrame | None = None
-        last_sent = 0.0
-        blanked = False
-        loop = asyncio.get_running_loop()
-        delay_s = max(0, self._plan.speaker.lipsync_ms) / 1000.0 if self._plan.speaker else 0.0
-        pending: deque[tuple[float, Any]] = deque()
-
         while True:
-            await asyncio.sleep(interval)
-            now = self._clock()
-            frame = self._camera.latest_frame() if self._camera else None
+            await asyncio.sleep(SUPERVISOR_INTERVAL_S)
+            self._sample_pump()
+            self._watch_first_frame(self._clock())
+            if self._stats:
+                await self._poll_phone_stats()
 
-            if frame is not None and frame is not last_frame:
-                last_frame = frame
-                try:
-                    image = await loop.run_in_executor(
-                        None,
-                        self._decode,
-                        frame,
-                        self._plan.camera.width,
-                        self._plan.camera.height,
-                    )
-                    rgb = _to_array(image)
-                except Exception as exc:  # noqa: BLE001 - one bad JPEG is one dropped frame
-                    self._decode_failures += 1
-                    self._decode_detail = f"{type(exc).__name__}: {exc}"
-                    if self._decode_failures == 1:
-                        # Said once, not once per frame: a wrong codec or a
-                        # truncated stream would otherwise print every 33 ms.
-                        self._camera_notice = (
-                            f"a camera frame could not be decoded ({self._decode_detail}); "
-                            f"further failures are counted, not printed"
-                        )
-                        log.warning("camera: %s", self._camera_notice)
-                    continue
-                pending.append((now + delay_s, rgb))
-                last_sent = now
-                blanked = False
+    def _sample_pump(self) -> None:
+        """Take the pump's counters, and turn its errors into the user's words."""
+        pump = self._pump
+        if pump is None:
+            return
+        snapshot = pump.snapshot()
+        self._pump_snapshot = snapshot
+        self._sent = snapshot.sent
+        self._fps = snapshot.fps
 
-            # Lip-sync: hold each frame until its due time, then release the ones
-            # that are due. A positive offset delays video, never audio.
-            while pending and pending[0][0] <= now:
-                _, rgb = pending.popleft()
-                if self._sink_error:
-                    continue
-                try:
-                    self._camera_sink.send(rgb)
-                except Exception as exc:  # noqa: BLE001 - the device is gone, the session is not
-                    self._sink_failed(exc)
-                    continue
-                self._sent += 1
-                self._sent_at.append((now, self._sent))
+        if snapshot.decode_failures > self._decode_failures:
+            self._decode_failures = snapshot.decode_failures
+            self._decode_detail = snapshot.decode_error or self._decode_detail
+            if not self._camera_notice:
+                # Said once, not once per frame: a wrong codec or a truncated
+                # stream would otherwise print every 33 ms.
+                self._camera_notice = (
+                    f"a camera frame could not be decoded ({self._decode_detail}); "
+                    f"further failures are counted, not printed"
+                )
+                log.warning("camera: %s", self._camera_notice)
 
-            if self._watch_first_frame(now):
-                continue
+        if snapshot.send_error and not self._sink_error:
+            self._sink_failed(Exception(snapshot.send_error))
 
-            if (
-                not pending
-                and last_sent
-                and not blanked
-                and not self._sink_error
-                and now - last_sent > self._stall_s
-            ):
-                # Nothing new arrived: keep the last picture, then go black so a
-                # call shows "no signal" rather than a frozen face.
-                try:
-                    self._camera_sink.send_black()
-                except Exception as exc:  # noqa: BLE001
-                    self._sink_failed(exc)
-                blanked = True
+    async def _poll_phone_stats(self) -> None:
+        """Ask the phone for its own numbers, at most once a second.
 
-            self._refresh_fps(now)
+        Only with ``--stats``: this is an extra RPC per second, and it is only
+        worth its cost when someone is looking at the numbers.
+        """
+        now = self._clock()
+        if now - self._stats_at < 1.0:
+            return
+        self._stats_at = now
+        try:
+            reply = await self._session.call("camera.status", {}, timeout=2.0)
+        except Exception:  # noqa: BLE001 - a debug aid must never break the run
+            return
+        payload = reply.get("result", reply) if isinstance(reply, dict) else {}
+        stats = payload.get("stats") if isinstance(payload, dict) else None
+        if isinstance(stats, dict):
+            self._phone_stats = stats
 
     def _watch_first_frame(self, now: float) -> bool:
         """Report a camera that accepted `start` and then delivered nothing.
@@ -420,17 +458,6 @@ class LiveRunner:
         )
         log.warning("camera: %s", self._sink_error)
 
-    def _refresh_fps(self, now: float) -> None:
-        while self._sent_at and now - self._sent_at[0][0] > 2.0:
-            self._sent_at.popleft()
-        if len(self._sent_at) >= 2:
-            first_t, first_n = self._sent_at[0]
-            last_t, last_n = self._sent_at[-1]
-            span = last_t - first_t
-            self._fps = (last_n - first_n) / span if span > 0 else 0.0
-        elif not self._sent_at:
-            self._fps = 0.0
-
     # ------------------------------------------------------------------ #
     # observation
     # ------------------------------------------------------------------ #
@@ -448,6 +475,16 @@ class LiveRunner:
             snapshot = self._camera.snapshot()
             status.camera_state = snapshot.state
             status.camera_detail = snapshot.detail
+        if self._pump is not None:
+            # The pump is the only thing that knows what actually reached the
+            # device, so its numbers win over the stream's.
+            self._sample_pump()
+            status.fps = self._fps
+            status.frames_sent = self._sent
+            status.camera_stats = {
+                "pc": self._pump_snapshot.to_dict(),
+                "phone": dict(self._phone_stats),
+            }
         if self._camera_error:
             # Sticky: the path is dead until the command is restarted, so the
             # reason must not disappear the moment the phone sends a frame.
@@ -490,10 +527,14 @@ class LiveRunner:
 
     # ------------------------------------------------------------------ #
     async def close(self, reason: str = "stopped") -> None:
-        if self._pump is not None:
-            self._pump.cancel()
+        if self._supervisor is not None:
+            self._supervisor.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._pump
+                await self._supervisor
+            self._supervisor = None
+        if self._pump is not None:
+            # Joins the thread: no frame may be sent after the device is closed.
+            self._pump.close()
             self._pump = None
         if self._camera is not None:
             await self._camera.close(reason)

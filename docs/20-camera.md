@@ -109,12 +109,27 @@ Rules the PC enforces (`decode_frame`, all covered by tests):
 | `camera.start` | `config` object (optional) | `{ok, config}` |
 | `camera.stop` | — | `{ok, streaming:false}` |
 | `camera.switch` | `facing` (`back`/`front`) | `{ok, facing, streaming}` |
-| `camera.status` | — | `{streaming, facing, width, height, fps, frames_sent, dropped, permitted, hardware, last_error}` |
+| `camera.status` | — | `{streaming, facing, width, height, fps, frames_sent, dropped, permitted, hardware, last_error, stats}` |
 
 **Error codes** (docs/03 §7): `camera_denied` (permission not granted — the lens is
 never opened to find out), `no_camera` (this phone has no such lens), `camera_busy`
 (another app holds it, or CameraX refused to bind), `bad_config` (outside the
 documented ranges), plus the existing `bad_request`/`internal`.
+
+**Encoding.** The analysis use case asks for `YUV_420_888`, and frames are packed
+into NV21 and handed to `YuvImage.compressToJpeg` — no `Bitmap`, no RGBA
+conversion. Asking for `RGBA_8888` costs a native YUV→RGB pass, a `Bitmap`
+allocation, a stride crop and an RGB→YCbCr conversion inside the encoder, for a
+picture that arrived as YCbCr. The self-view thumbnail is refreshed 4 times a
+second (`PREVIEW_INTERVAL_MS`), not once per frame: decoding every frame the
+phone just encoded was measurable heat for a preview nobody watches at 30 fps.
+
+Every second the engine logs its own numbers — `adb logcat -s CameraEngine`:
+
+    D CameraEngine: capture 29.8 fps  yuv->jpeg 12.4 ms  q70  94 KB  send 1.9 ms  target 1280x720@30
+
+and the same values are returned by `camera.status` under `stats`, which is what
+`phonebridge camera --stats` prints beside the PC's side (docs/26 §6).
 
 **Threading.** CameraX binds a `LifecycleRegistry`, and `setCurrentState` is
 main-thread-only — `bindToLifecycle`, `unbindAll` and our own owner all reach it.

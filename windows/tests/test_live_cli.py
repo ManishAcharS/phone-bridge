@@ -27,11 +27,41 @@ def test_the_four_commands_exist_and_parse() -> None:
 
 
 def test_camera_defaults_match_the_call_defaults() -> None:
+    """The default is 720p30 whichever way it is spelled: profile or numbers."""
     args = _parse("camera", "--virtual")
+    plan = live.plan_from_args(args)
 
-    assert (args.width, args.height, args.fps) == (1280, 720, 30)
+    assert args.profile == "720p"
+    assert plan.camera is not None
+    assert (plan.camera.width, plan.camera.height, plan.camera.fps) == (1280, 720, 30)
     assert args.facing == "back"
     assert args.backend == "auto"
+
+
+def test_a_lower_resolution_fallback_is_one_flag() -> None:
+    plan = live.plan_from_args(_parse("camera", "--virtual", "--profile", "low"))
+
+    assert plan.camera is not None
+    assert (plan.camera.width, plan.camera.height, plan.camera.fps) == (640, 480, 30)
+
+
+def test_an_explicit_flag_still_beats_the_profile() -> None:
+    plan = live.plan_from_args(
+        _parse("camera", "--virtual", "--profile", "low", "--width", "800", "--fps", "15")
+    )
+
+    assert plan.camera is not None
+    assert (plan.camera.width, plan.camera.height, plan.camera.fps) == (800, 480, 15)
+
+
+def test_stats_is_off_unless_asked_for() -> None:
+    assert _parse("camera", "--virtual").stats is False
+    assert _parse("camera", "--virtual", "--stats").stats is True
+
+
+def test_a_profile_this_build_does_not_have_is_refused() -> None:
+    with pytest.raises(SystemExit):  # argparse's own "invalid choice" message
+        _parse("camera", "--virtual", "--profile", "4k")
 
 
 def test_camera_plan_is_built_from_the_flags() -> None:

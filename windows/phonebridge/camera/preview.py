@@ -159,6 +159,59 @@ def render(
     return image, image.width, image.height
 
 
+def decode_into_box(frame: VideoFrame, width: int, height: int) -> Any:
+    """One frame as an exactly ``width`` x ``height`` RGB image, as cheaply as possible.
+
+    This is the virtual-camera path, which unlike the GUI preview runs 30 times a
+    second, so every copy here is paid 30 times a second:
+
+    * ``Image.draft()`` lets libjpeg decode a JPEG at 1/2, 1/4 or 1/8 scale when
+      the device is smaller than the frame. It is the single biggest win when the
+      phone sends 720p and the device wants 480p — it decodes a quarter of the
+      pixels instead of decoding fully and throwing three quarters away;
+    * one ``convert("RGB")``, one rotate (only if the phone reported one), one
+      resize (only if the size still differs);
+    * the letterbox canvas is allocated **only** when the aspect ratios differ.
+      For a 16:9 phone and a 16:9 device that allocation never happens, which is
+      the common case and used to cost a full-frame copy plus a paste per frame.
+    """
+    Image = _pillow()
+    if not frame.payload:
+        raise PreviewUnavailable("the frame carried no image data")
+    rotation = frame.rotation if frame.rotation in VALID_ROTATIONS else 0
+    try:
+        image = Image.open(io.BytesIO(frame.payload))
+        source_w, source_h = image.width, image.height
+        # The size we actually want, *after* rotation, which is what makes
+        # `draft()` able to help: asking libjpeg for 640x480 from a 1280x720
+        # frame that will be letterboxed to 640x360 would make PIL refuse the
+        # half-scale decode, because 360 is less than 480.
+        if rotation in (90, 270):
+            target = fit_size(source_h, source_w, width, height)
+            draft_to = (target[1], target[0])
+        else:
+            target = fit_size(source_w, source_h, width, height)
+            draft_to = target
+        # draft() must come before load()/convert(): it is a decode-time choice.
+        image.draft("RGB", (max(1, draft_to[0]), max(1, draft_to[1])))
+        image = image.convert("RGB")
+    except Exception as exc:  # noqa: BLE001 - a truncated JPEG is a dropped frame
+        raise PreviewUnavailable(f"the frame could not be decoded: {exc}") from exc
+
+    preview = Preview(
+        image=image,
+        width=source_w,
+        height=source_h,
+        rotation=rotation,
+    )
+    fitted, fitted_w, fitted_h = render(preview, facing="", box=(width, height), mirror=False)
+    if (fitted_w, fitted_h) == (width, height):
+        return fitted
+    canvas = Image.new("RGB", (width, height), (0, 0, 0))
+    canvas.paste(fitted, ((width - fitted_w) // 2, (height - fitted_h) // 2))
+    return canvas
+
+
 def decode(frame: VideoFrame) -> Preview:
     """Decode one frame's JPEG payload. Raises :class:`PreviewUnavailable`."""
     Image = _pillow()

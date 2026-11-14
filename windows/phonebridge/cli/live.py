@@ -24,6 +24,8 @@ import json
 from typing import Any
 
 from ..live.config import (
+    CAMERA_PROFILES,
+    DEFAULT_CAMERA_PROFILE,
     VIRTUAL_CAMERA_AUTO,
     VIRTUAL_CAMERA_BACKENDS,
     CameraPlan,
@@ -31,14 +33,69 @@ from ..live.config import (
     LivePlan,
     MicPlan,
     SpeakerPlan,
+    profile_size,
 )
 from ..live.devices import OBS_DOWNLOAD_URL, VB_CABLE_URL, DeviceUnavailable
+from ..live.pump import stats_lines
 from ..live.runner import STATUS_INTERVAL_S, LiveRunner
 from .target import EXIT_ERROR, EXIT_USAGE, CliError, note, open_session
 
 
 def _print_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, default=str))
+
+
+def _add_camera_args(parser: argparse.ArgumentParser) -> None:
+    """The camera flags both ``camera`` and ``start`` accept.
+
+    ``--profile`` is the one-flag answer for a machine that cannot sustain 720p:
+    ``--profile low`` is 640x480 at 30 fps, a quarter of the pixels and a quarter
+    of the JPEG work on both ends. The three explicit flags still win over the
+    profile, so ``--profile low --fps 15`` means exactly that.
+    """
+    parser.add_argument(
+        "--profile",
+        choices=tuple(CAMERA_PROFILES),
+        default=DEFAULT_CAMERA_PROFILE,
+        help=(
+            "camera size preset: "
+            + ", ".join(f"{name} = {w}x{h}@{f}" for name, (w, h, f) in CAMERA_PROFILES.items())
+            + f" (default: {DEFAULT_CAMERA_PROFILE})"
+        ),
+    )
+    parser.add_argument("--width", type=int, default=None, help="override the profile's width")
+    parser.add_argument("--height", type=int, default=None, help="override the profile's height")
+    parser.add_argument("--fps", type=int, default=None, help="override the profile's frame rate")
+    parser.add_argument(
+        "--quality",
+        type=int,
+        default=70,
+        metavar="JPEG",
+        help="JPEG quality the phone encodes at (default 70; 20-95)",
+    )
+    parser.add_argument("--facing", choices=("back", "front"), default="back")
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help=(
+            "print per-second measurements: frames received, KB per frame, decode/"
+            "convert/send milliseconds, queue depth and drops on the PC, plus the "
+            "phone's own capture fps, encode time and JPEG size"
+        ),
+    )
+
+
+def _camera_geometry(args: argparse.Namespace) -> tuple[int, int, int]:
+    """Profile defaults, with whatever the user named explicitly on top."""
+    try:
+        width, height, fps = profile_size(getattr(args, "profile", DEFAULT_CAMERA_PROFILE))
+    except ConfigError as exc:
+        raise CliError(str(exc), code=EXIT_USAGE) from exc
+    return (
+        args.width if getattr(args, "width", None) is not None else width,
+        args.height if getattr(args, "height", None) is not None else height,
+        args.fps if getattr(args, "fps", None) is not None else fps,
+    )
 
 
 def add_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -59,11 +116,7 @@ def add_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> Non
     camera.add_argument(
         "--virtual", action="store_true", help="publish to the Windows virtual camera (required)"
     )
-    camera.add_argument("--width", type=int, default=1280)
-    camera.add_argument("--height", type=int, default=720)
-    camera.add_argument("--fps", type=int, default=30)
-    camera.add_argument("--quality", type=int, default=70, metavar="JPEG")
-    camera.add_argument("--facing", choices=("back", "front"), default="back")
+    _add_camera_args(camera)
     camera.add_argument(
         "--backend",
         choices=(*VIRTUAL_CAMERA_BACKENDS, VIRTUAL_CAMERA_AUTO),
@@ -160,11 +213,7 @@ def add_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> Non
     start.add_argument("--camera", action="store_true")
     start.add_argument("--mic", action="store_true")
     start.add_argument("--speaker", action="store_true")
-    start.add_argument("--width", type=int, default=1280)
-    start.add_argument("--height", type=int, default=720)
-    start.add_argument("--fps", type=int, default=30)
-    start.add_argument("--quality", type=int, default=70, metavar="JPEG")
-    start.add_argument("--facing", choices=("back", "front"), default="back")
+    _add_camera_args(start)
     start.add_argument(
         "--backend",
         choices=(*VIRTUAL_CAMERA_BACKENDS, VIRTUAL_CAMERA_AUTO),
@@ -193,11 +242,12 @@ def plan_from_args(args: argparse.Namespace) -> LivePlan:
                     "selfie camera; Ctrl+C to switch back? see docs/26)",
                     code=EXIT_USAGE,
                 )
+            width, height, fps = _camera_geometry(args)
             return LivePlan(
                 camera=CameraPlan(
-                    width=args.width,
-                    height=args.height,
-                    fps=args.fps,
+                    width=width,
+                    height=height,
+                    fps=fps,
                     quality=args.quality,
                     facing=args.facing,
                     backend=args.backend,
@@ -229,11 +279,12 @@ def plan_from_args(args: argparse.Namespace) -> LivePlan:
                     hint="phonebridge start --camera --mic --speaker",
                     code=EXIT_USAGE,
                 )
+            width, height, fps = _camera_geometry(args)
             return LivePlan(
                 camera=CameraPlan(
-                    width=args.width,
-                    height=args.height,
-                    fps=args.fps,
+                    width=width,
+                    height=height,
+                    fps=fps,
                     quality=args.quality,
                     facing=args.facing,
                     backend=args.backend,
@@ -299,13 +350,20 @@ def _report_failures(status: Any, reported: dict[str, str]) -> None:
             print(f"  {label}: {detail}", flush=True)
 
 
-async def _status_loop(runner: LiveRunner, stop: asyncio.Event, *, quiet: bool) -> None:
+async def _status_loop(
+    runner: LiveRunner, stop: asyncio.Event, *, quiet: bool, stats: bool = False
+) -> None:
     reported: dict[str, str] = {}
     while not stop.is_set():
         status = runner.status()
         if not quiet:
             print(f"  {status.line()}", flush=True)
         _report_failures(status, reported)
+        if stats:
+            for line in stats_lines(
+                status.camera_stats.get("pc"), status.camera_stats.get("phone")
+            ):
+                print(line, flush=True)
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=STATUS_INTERVAL_S)
 
@@ -314,7 +372,7 @@ async def _run(args: argparse.Namespace) -> int:
     plan = plan_from_args(args)
     store = _store(args)
     session, target = await open_session(args, store)
-    runner = LiveRunner(session, plan)
+    runner = LiveRunner(session, plan, stats=bool(getattr(args, "stats", False)))
     stop = asyncio.Event()
     printer: asyncio.Task[None] | None = None
     try:
@@ -335,7 +393,12 @@ async def _run(args: argparse.Namespace) -> int:
             )
         await runner.start()
         printer = asyncio.get_running_loop().create_task(
-            _status_loop(runner, stop, quiet=bool(getattr(args, "no_status", False)))
+            _status_loop(
+                runner,
+                stop,
+                quiet=bool(getattr(args, "no_status", False)),
+                stats=bool(getattr(args, "stats", False)),
+            )
         )
         status = await runner.run(stop, duration=getattr(args, "duration", None))
     finally:

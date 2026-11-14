@@ -37,11 +37,19 @@ class FakeCameraSink:
 
 
 class FakeCameraStream:
+    """The real class minus the socket: it pushes frames through ``on_change``.
+
+    That callback is how the runner is fed in production, so the fake must call
+    it too — a fake that only answered ``latest_frame()`` would pass while the
+    real path delivered nothing.
+    """
+
     instances: list[FakeCameraStream] = []
 
-    def __init__(self, session: Any, *, config: Any) -> None:
+    def __init__(self, session: Any, *, config: Any, on_change: Any = None) -> None:
         self.session = session
         self.config = config
+        self.on_change = on_change
         self.started = False
         self.closed = False
         self.state = "idle"
@@ -49,17 +57,28 @@ class FakeCameraStream:
         self.frame: Any = None
         FakeCameraStream.instances.append(self)
 
+    def _notify(self) -> None:
+        if self.on_change is not None:
+            self.on_change(self.snapshot())
+
+    def push_frame(self, frame: Any = None) -> None:
+        """A new frame arrives the way the real stream delivers one."""
+        self.frame = object() if frame is None else frame
+        self._notify()
+
     async def start(self) -> bool:
         self.started = True
         self.state = "active"
         self.frame = object()  # one frame waiting
+        self._notify()
         return True
 
     def latest_frame(self) -> Any:
         return self.frame
 
     def snapshot(self) -> Any:
-        return SimpleNamespace(state=self.state, detail=self.detail)
+        # The real snapshot carries the newest frame; the runner publishes from it.
+        return SimpleNamespace(state=self.state, detail=self.detail, frame=self.frame)
 
     async def close(self, reason: str = "stopped") -> None:
         self.closed = True
@@ -326,10 +345,10 @@ def test_a_dead_microphone_device_stops_the_phone_capture_and_nothing_else() -> 
             assert "dtype mismatch" in link.mic_stopped, (
                 "the phone's capture must be stopped: nobody can hear it"
             )
-            FakeCameraStream.instances[0].frame = object()  # the phone sends another
+            FakeCameraStream.instances[0].push_frame()  # the phone sends another
             await asyncio.sleep(0.15)
             assert len(camera_sink.frames) > before, "the camera pump must keep sending"
-            assert not runner._pump.done()  # noqa: SLF001
+            assert runner._pump.snapshot().running  # noqa: SLF001
             assert runner.status().speaker_state == "active"
         finally:
             await runner.close()

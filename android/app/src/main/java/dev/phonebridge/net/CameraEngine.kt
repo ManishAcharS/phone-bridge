@@ -3,7 +3,9 @@ package dev.phonebridge.net
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
 import android.hardware.display.DisplayManager
 import android.os.Handler
 import android.os.Looper
@@ -27,6 +29,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -87,6 +90,16 @@ class CameraEngine(
 
         /** Opening the provider on a cold start is allowed to take a moment. */
         private const val PROVIDER_TIMEOUT_MS = 5_000L
+
+        /**
+         * The phone's own self-view is redrawn this often, not once per frame.
+         *
+         * `_state` carries the last JPEG, and the Compose card decodes it for the
+         * thumbnail. At 30 fps that decode ran 30 times a second *in addition* to
+         * encoding the same picture for the PC — measurable heat for a preview
+         * nobody watches at 30 fps.
+         */
+        private const val PREVIEW_INTERVAL_MS = 250L
     }
 
     /** What the phone screen shows. */
@@ -124,6 +137,23 @@ class CameraEngine(
     private var sender: Thread? = null
     private var sendQueue: ArrayBlockingQueue<ByteArray>? = null
     private var lastSentAtMs = 0L
+    private var lastPreviewAtMs = 0L
+
+    // Measurement. All of it is reported once a second with Log.d and in
+    // `camera.status`, so a slow frame rate can be attributed to a stage
+    // instead of guessed at.
+    private val encoded = AtomicInteger(0)
+    private val encodeNanos = AtomicLong(0)
+    private val sendNanos = AtomicLong(0)
+    private var lastStatsAtMs = 0L
+    private var lastStatsFrames = 0
+    private var lastStatsEncodeNanos = 0L
+    private var lastStatsSendNanos = 0L
+
+    @Volatile private var measuredFps = 0.0f
+    @Volatile private var lastEncodeMs = 0.0f
+    @Volatile private var lastSendMs = 0.0f
+    @Volatile private var lastFrameBytes = 0
 
     /**
      * Every CameraX lifecycle call goes through this handler.
@@ -180,7 +210,9 @@ class CameraEngine(
         // main thread where this call already is.
         val analysisUseCase = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            // YUV, not RGBA: the JPEG encoder wants YCbCr, and every RGBA frame
+            // cost a native conversion plus a Bitmap allocation (see toNv21).
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .setTargetResolution(android.util.Size(requested.width, requested.height))
             .build()
         // Make the rotation metadata mean something. `rotationDegrees` is
@@ -340,6 +372,20 @@ class CameraEngine(
         "permitted" to isPermitted(),
         "hardware" to hasHardware(),
         "last_error" to _state.value.lastError,
+        // Read by `phonebridge camera --stats` (docs/26). Same numbers as the
+        // per-second Log.d line, so the two can be compared directly.
+        "stats" to mapOf(
+            "fps" to measuredFps.toDouble(),
+            "encode_ms" to lastEncodeMs.toDouble(),
+            "send_ms" to lastSendMs.toDouble(),
+            "bytes_per_frame" to lastFrameBytes,
+            "quality" to config.quality,
+            "width" to config.width,
+            "height" to config.height,
+            "encoded" to encoded.get(),
+            "sent" to framesSent.get(),
+            "dropped" to framesDropped.get(),
+        ),
     )
 
     /** The PC stopped or the session died: nothing should keep the lens open. */
@@ -440,11 +486,17 @@ class CameraEngine(
             val interval = 1000L / cfg.fps.coerceAtLeast(1)
             if (lastSentAtMs != 0L && now - lastSentAtMs < interval) return
 
+            val encodeStarted = System.nanoTime()
             val jpeg = proxy.toJpeg(cfg.quality) ?: return
+            val encodeFinished = System.nanoTime()
             if (jpeg.size > MAX_FRAME_BYTES) {
                 log("WARN", "dropping oversized camera frame (${jpeg.size} bytes)")
                 return
             }
+            encoded.incrementAndGet()
+            encodeNanos.addAndGet(encodeFinished - encodeStarted)
+            lastEncodeMs = (encodeFinished - encodeStarted) / 1_000_000f
+            lastFrameBytes = jpeg.size
             lastSentAtMs = now
             val index = seq.getAndIncrement() and 0xFFFF
             val flags = VideoFrames.FLAG_KEY or (if (index == 0) VideoFrames.FLAG_START else 0)
@@ -459,13 +511,17 @@ class CameraEngine(
                     flags = flags,
                 )
             )
-            _state.value = _state.value.copy(
-                width = proxy.width,
-                height = proxy.height,
-                lastJpeg = jpeg,
-                framesSent = framesSent.get().toLong(),
-                dropped = framesDropped.get().toLong(),
-            )
+            if (now - lastPreviewAtMs >= PREVIEW_INTERVAL_MS) {
+                lastPreviewAtMs = now
+                _state.value = _state.value.copy(
+                    width = proxy.width,
+                    height = proxy.height,
+                    lastJpeg = jpeg,
+                    framesSent = framesSent.get().toLong(),
+                    dropped = framesDropped.get().toLong(),
+                )
+            }
+            reportOnceASecond(now, cfg)
             // Drop-oldest: a late frame is worth less than the newest one.
             if (!queue.offer(body)) {
                 queue.poll()
@@ -490,7 +546,11 @@ class CameraEngine(
                     return@Thread
                 }
                 try {
+                    val sendStarted = System.nanoTime()
                     sendFrame(VideoFrames.VIDEO_STREAM, body)
+                    val took = System.nanoTime() - sendStarted
+                    sendNanos.addAndGet(took)
+                    lastSendMs = took / 1_000_000f
                     framesSent.incrementAndGet()
                 } catch (e: Exception) {
                     log("WARN", "could not send camera frame: ${e.message}")
@@ -519,28 +579,127 @@ class CameraEngine(
         return rotation ?: Surface.ROTATION_0
     }
 
-    /** RGBA_8888 `ImageProxy` -> JPEG. Row stride is honoured, not assumed. */
+    /**
+     * YUV_420_888 `ImageProxy` -> JPEG, without a Bitmap in between.
+     *
+     * The version this replaces asked CameraX for RGBA_8888, which means a native
+     * YUV->RGB conversion per frame, a `Bitmap` allocation, a second `Bitmap` for
+     * the stride crop and then `Bitmap.compress(JPEG)` — four full-frame copies
+     * and an RGB->YCbCr conversion inside the encoder, for a picture that was
+     * YCbCr to begin with. `YuvImage.compressToJpeg` feeds the planes straight to
+     * the platform JPEG encoder, which is why the same frame costs a fraction of
+     * the time (measured on the phone with the per-second Log.d line below).
+     *
+     * The one real cost left is packing the planes into NV21, because the
+     * encoder wants one buffer. Both layouts that exist in the wild are handled
+     * with bulk copies, not per-pixel loops: semi-planar (pixel stride 2 — most
+     * devices, where the V plane already holds the interleaved VU pairs) and
+     * fully planar (stride 1).
+     */
     private fun ImageProxy.toJpeg(quality: Int): ByteArray? {
-        val plane = planes.firstOrNull() ?: return null
-        val buffer = plane.buffer
-        val pixelStride = plane.pixelStride
-        val rowStride = plane.rowStride
-        val rowPadding = rowStride - pixelStride * width
-        val bitmapWidth = width + rowPadding / pixelStride
-        val bitmap = Bitmap.createBitmap(bitmapWidth, height, Bitmap.Config.ARGB_8888)
-        buffer.rewind()
-        bitmap.copyPixelsFromBuffer(buffer)
-        val cropped = if (bitmapWidth == width) {
-            bitmap
-        } else {
-            Bitmap.createBitmap(bitmap, 0, 0, width, height).also { bitmap.recycle() }
-        }
-        return ByteArrayOutputStream().use { out ->
-            cropped.compress(Bitmap.CompressFormat.JPEG, quality, out)
-            cropped.recycle()
+        val nv21 = toNv21() ?: return null
+        return ByteArrayOutputStream(MAX_FRAME_BYTES / 4).use { out ->
+            val image = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+            if (!image.compressToJpeg(Rect(0, 0, width, height), quality, out)) return null
             out.toByteArray()
         }
     }
+
+    /** Pack a `YUV_420_888` frame into NV21, honouring every row stride. */
+    private fun ImageProxy.toNv21(): ByteArray? {
+        if (planes.size < 3) {
+            log("WARN", "camera frame has ${planes.size} planes, expected 3")
+            return null
+        }
+        val nv21 = ByteArray(width * height * 3 / 2)
+        val y = planes[0]
+        val yBuffer = y.buffer.duplicate()
+        // The Y plane is row-padded on most phones: copy `width` bytes per row.
+        for (row in 0 until height) {
+            yBuffer.position(row * y.rowStride)
+            yBuffer.get(nv21, row * width, width)
+        }
+        val u = planes[1]
+        val v = planes[2]
+        val chroma = width * height
+        when {
+            // Semi-planar (NV21/NV12): V and U are interleaved with stride 2, and
+            // the V buffer's row *is* the VU pair sequence NV21 wants.
+            v.pixelStride == 2 && u.pixelStride == 2 -> {
+                val vBuffer = v.buffer.duplicate()
+                for (row in 0 until height / 2) {
+                    vBuffer.position(row * v.rowStride)
+                    vBuffer.get(nv21, chroma + row * width, width)
+                }
+            }
+            // Fully planar: interleave V then U, one row at a time.
+            v.pixelStride == 1 && u.pixelStride == 1 -> {
+                val uBuffer = u.buffer.duplicate()
+                val vBuffer = v.buffer.duplicate()
+                val uRow = ByteArray(u.rowStride)
+                val vRow = ByteArray(v.rowStride)
+                for (row in 0 until height / 2) {
+                    uBuffer.position(row * u.rowStride)
+                    vBuffer.position(row * v.rowStride)
+                    uBuffer.get(uRow, 0, minOf(uRow.size, uBuffer.remaining()))
+                    vBuffer.get(vRow, 0, minOf(vRow.size, vBuffer.remaining()))
+                    var write = chroma + row * width
+                    for (column in 0 until width / 2) {
+                        nv21[write++] = vRow[column]
+                        nv21[write++] = uRow[column]
+                    }
+                }
+            }
+            else -> {
+                log(
+                    "WARN",
+                    "unsupported camera plane layout (pixel strides " +
+                        "${u.pixelStride}/${v.pixelStride}); frame dropped",
+                )
+                return null
+            }
+        }
+        return nv21
+    }
+
+    /**
+     * One line a second, for the phone's own log and for the PC's `--stats`.
+     *
+     * `adb logcat -s CameraEngine` then shows whether a low frame rate comes from
+     * capture, from encoding, or from the send path — the three numbers here.
+     */
+    private fun reportOnceASecond(now: Long, cfg: VideoFrames.Config) {
+        if (lastStatsAtMs == 0L) {
+            lastStatsAtMs = now
+            lastStatsFrames = encoded.get()
+            lastStatsEncodeNanos = encodeNanos.get()
+            return
+        }
+        val elapsed = now - lastStatsAtMs
+        if (elapsed < 1000L) return
+        val frames = encoded.get()
+        val produced = frames - lastStatsFrames
+        val encodeDelta = encodeNanos.get() - lastStatsEncodeNanos
+        val sendDelta = sendNanos.get() - lastStatsSendNanos
+        val seconds = elapsed / 1000.0
+        measuredFps = (produced / seconds).toFloat()
+        val encodeMean = if (produced > 0) encodeDelta / 1_000_000.0 / produced else 0.0
+        val sendMean = if (framesSent.get() > 0) sendDelta / 1_000_000.0 / maxOf(1, produced) else 0.0
+        Log.d(
+            TAG,
+            "capture ${"%.1f".format(measuredFps)} fps  " +
+                "yuv->jpeg ${"%.1f".format(encodeMean)} ms  " +
+                "q${cfg.quality}  ${lastFrameBytes / 1024} KB  " +
+                "send ${"%.1f".format(sendMean)} ms  " +
+                "target ${cfg.width}x${cfg.height}@${cfg.fps}",
+        )
+        lastStatsAtMs = now
+        lastStatsFrames = frames
+        lastStatsEncodeNanos = encodeNanos.get()
+        lastStatsSendNanos = sendNanos.get()
+    }
+
+
 
     /**
      * CameraX binds to a `LifecycleOwner`; a foreground service is not one. This

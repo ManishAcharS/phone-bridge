@@ -411,7 +411,7 @@ def test_a_camera_failure_is_a_failed_run(
     )
     monkeypatch.setattr(live, "open_session", fake_open_session)
     monkeypatch.setattr(live, "_store", lambda args: None)
-    monkeypatch.setattr(live, "LiveRunner", lambda session, plan: runner)
+    monkeypatch.setattr(live, "LiveRunner", lambda session, plan, **kwargs: runner)
 
     args = SimpleNamespace(
         command="camera",
@@ -428,6 +428,8 @@ def test_a_camera_failure_is_a_failed_run(
         quality=70,
         facing="back",
         backend="auto",
+        profile="720p",
+        stats=False,
     )
     code = run(live._run(args))  # noqa: SLF001
 

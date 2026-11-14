@@ -201,7 +201,62 @@ combination that matters, and the one no test here can stand in for.
 
 ---
 
-## 6. Known limits, stated plainly
+## 6. Measuring the camera (`--stats`)
+
+A camera that "works but runs at 5 fps" is not a feature. `--stats` prints one
+line per second from each end of the link, so the slow stage names itself:
+
+    phonebridge camera --virtual --stats
+
+      link up | camera active 29.6 fps
+      pc   29.6 fps  rx   30  96 KB/frame  decode   6.2 ms  convert  2.1 ms  send  1.4 ms  queue 0  dropped 3
+      phone 29.8 fps  encode  12.4 ms   94 KB/frame  q70  send  1.9 ms  1280x720
+
+| number | where it comes from | what it tells you |
+| --- | --- | --- |
+| `phone … encode` | the phone's own `camera.status` (`stats`) | YUV→JPEG cost per frame. Over ~25 ms it cannot reach 30 fps, whatever the PC does |
+| `phone … KB/frame` | the same | JPEG size: the link cost, and a sign that `--quality` is too high for the scene |
+| `phone … send` | the sender thread | time to encrypt and write one frame to the socket |
+| `pc … rx` / `KB/frame` | the pump | frames that actually arrived, and their size |
+| `pc … decode` | the pump | JPEG decode, including `Image.draft` scaling |
+| `pc … convert` | the pump | rotate/resize/letterbox and the numpy copy |
+| `pc … send` | the pump | the memcpy into the virtual camera's shared memory |
+| `pc … queue` / `dropped` | the pump | the frame slot is **one** deep: a PC that falls behind drops, it never queues |
+
+The phone also logs the same numbers once a second, so the two can be compared
+without the PC: `adb logcat -s CameraEngine` shows
+`capture 29.8 fps  yuv->jpeg 12.4 ms  q70  94 KB  send 1.9 ms  target 1280x720@30`.
+
+**What the measurements changed.** On a CI-class CPU, one 720p q70 frame costs
+~9-10 ms of PC work (decode ~8.8 ms, convert ~1 ms) — a third of the 33 ms budget.
+The old frame path still delivered only ~17-22 fps on the same machine, because
+the loop slept `1/fps` between frames (`asyncio.sleep(33 ms)` is quantised to the
+Windows system timer, ~15.6 ms, so a tick cost 47 ms) and did the decode, the
+numpy copy and the device send around that sleep. The pacing came entirely from
+that sleep: `pyvirtualcam.Camera.send()` does not sleep — `sleep_until_next_frame()`
+is a separate call this code never made — so a frame arriving just after a tick
+waited a whole interval, and the tick itself could not start work while it slept. Measured, same 30 fps
+source and same frames:
+
+| design | delivered |
+| --- | --- |
+| old: poll every `1/fps`, work on the event loop | 17.0 fps (22.3 fps with a 1 ms timer) |
+| this branch: frames on arrival, one worker thread, newest wins | **30.0 fps** |
+
+On the phone the frame went through `RGBA_8888` → `Bitmap` → stride crop →
+`Bitmap.compress(JPEG)` (four full-frame copies and an RGB→YCbCr pass in the
+encoder), and the self-view decoded every frame it had just encoded, 30 times a
+second. It is now `YUV_420_888` → NV21 repack → `YuvImage.compressToJpeg`, with
+the self-view refreshed 4 times a second instead of 30.
+
+**If 720p still cannot keep up**, `--profile low` is the documented fallback:
+
+    phonebridge camera --virtual --profile low      # 640x480 at 30 fps
+
+It is a quarter of the pixels and a quarter of the JPEG work on both ends, and
+the explicit `--width/--height/--fps` flags still override it.
+
+## 7. Known limits, stated plainly
 
 * **Audio is 48 kHz PCM16, not Opus.** Protocol v1 carries PCM16 with a 20 ms
   frame; adding Opus would change the wire format on both ends and break older
@@ -226,7 +281,7 @@ combination that matters, and the one no test here can stand in for.
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | Cause | What to do |
 | --- | --- | --- |
@@ -237,6 +292,9 @@ combination that matters, and the one no test here can stand in for.
 | `camera stopped: no camera frames from the phone within 5 s` | `camera.start` was accepted and then nothing arrived | the phone accepted but cannot deliver: check its camera banner and `adb logcat -s CameraEngine` |
 | `camera stopped: the virtual camera stopped accepting frames (…)` | OBS (or the app) closed the device mid-stream | restart OBS and re-run; the session and audio keep working |
 | `camera: a camera frame could not be decoded (…)` | one damaged JPEG | nothing — the next frame replaces it; a repeating message means the phone and PC disagree on the codec |
+| `--stats` shows `phone … encode` over ~25 ms | the phone's JPEG encoder is the bottleneck | `--quality 60`, or `--profile low` (640x480); raise `--duration` and re-measure |
+| `--stats` shows `pc … dropped` climbing | the PC cannot keep up with the phone (decode or device send) | try `--profile low`; check that OBS is not also recording the same virtual camera |
+| `--stats` shows `phone` line missing | the phone did not answer `camera.status` | the APK predates the `stats` field; nothing breaks, the PC's line still works |
 | `no playback device matching 'CABLE Input'` | VB-CABLE not installed, or not rebooted | install it, reboot, re-run `setup-windows.ps1 -Check` |
 | mic runs but the other app is silent | the app is reading a different input | select `CABLE Output (VB-Audio Virtual Cable)` |
 | `capturing PC audio needs PyAudioWPatch` | the package is missing | `py -3 -m pip install PyAudioWPatch` |

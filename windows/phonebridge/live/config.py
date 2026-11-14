@@ -25,8 +25,31 @@ DEFAULT_CABLE_DEVICE = "CABLE Input"
 #: 120 ms of jitter buffer is inaudible as delay, and 200 ms of playback buffer
 #: survives a Wi-Fi hiccup without turning conversation into a walkie-talkie.
 DEFAULT_CAMERA = (1280, 720, 30)
+
+#: Named camera sizes, so a machine that cannot sustain 720p has a one-flag
+#: answer rather than three numbers to remember. "low" is the documented
+#: fallback: 640x480 at 30 fps costs a quarter of the pixels and a quarter of the
+#: JPEG work on both ends.
+CAMERA_PROFILES: dict[str, tuple[int, int, int]] = {
+    "720p": (1280, 720, 30),
+    "low": (640, 480, 30),
+    "high": (1920, 1080, 15),
+}
+
+DEFAULT_CAMERA_PROFILE = "720p"
 DEFAULT_MIC_LATENCY_MS = 120
 DEFAULT_SPEAKER_LATENCY_MS = 200
+
+
+def profile_size(profile: str) -> tuple[int, int, int]:
+    """The ``(width, height, fps)`` a named profile asks for."""
+    try:
+        return CAMERA_PROFILES[profile]
+    except KeyError:
+        raise ConfigError(
+            f"unknown camera profile {profile!r}: choose one of "
+            f"{', '.join(CAMERA_PROFILES)}"
+        ) from None
 
 
 class ConfigError(ValueError):
