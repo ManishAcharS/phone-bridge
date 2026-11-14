@@ -43,4 +43,4 @@ jobs:
 
       - name: Run native host safety tests
         shell: pwsh
-        run: python -m pytest windows/tests/test_vcam_host_safety.py -q
+        run: python -m pytest windows/tests/test_vcam_host_safety.py windows/tests/test_vcam_media_source_contract.py -q
