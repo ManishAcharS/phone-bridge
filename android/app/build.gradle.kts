@@ -1,3 +1,7 @@
+// An import, not `java.util.Properties`: inside a .gradle.kts script `java` is
+// the Gradle Java extension, so the fully qualified name does not resolve.
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -27,7 +31,7 @@ android {
     // app-release-unsigned.apk - an APK that cannot be installed or updated.
     // The build fails loudly at the end instead of silently shipping that.
     val keystorePropertiesFile = rootProject.file("keystore.properties")
-    val keystoreProperties = java.util.Properties().apply {
+    val keystoreProperties = Properties().apply {
         if (keystorePropertiesFile.exists()) {
             keystorePropertiesFile.inputStream().use { load(it) }
         }
