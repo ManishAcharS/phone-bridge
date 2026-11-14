@@ -33,7 +33,14 @@ jobs:
             throw "vcam_host --help failed with exit code $LASTEXITCODE"
           }
 
+      - name: Set up Python for source-safety tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test runner
+        run: python -m pip install pytest
+
       - name: Run native host safety tests
         shell: pwsh
-        run: |
-          python -m pytest windows/tests/test_vcam_host_safety.py -q
+        run: python -m pytest windows/tests/test_vcam_host_safety.py -q
