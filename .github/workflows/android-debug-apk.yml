@@ -112,7 +112,20 @@ jobs:
       - name: Run the unit tests
         working-directory: android
         shell: bash
-        run: ./gradlew --no-daemon --console=plain testDebugUnitTest
+        run: |
+          ./gradlew --no-daemon --console=plain testDebugUnitTest
+          # A test task with no sources passes silently, which would make "the
+          # packing tests ran" an assumption. Count the cases and fail if they
+          # are not there: Nv21Test (the YUV_420_888 -> NV21 layouts) and
+          # SerialSenderTest (the frame counter under concurrency).
+          results=app/build/test-results/testDebugUnitTest
+          ls "$results"
+          cases=$(grep -h '<testcase ' "$results"/*.xml | wc -l)
+          echo "unit test cases: $cases"
+          if [ "$cases" -lt 10 ]; then
+            echo "::error::expected at least 10 unit test cases, found $cases"
+            exit 1
+          fi
 
       # The method names the PC client calls live in the dex string pool, so this
       # is a cheap way to show the APK being uploaded is not a stale one. It is a
