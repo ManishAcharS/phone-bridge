@@ -77,3 +77,21 @@ def test_it_detects_the_virtual_camera_device_through_the_same_lookup_the_cli_us
 
     assert "sounddevice.query_devices()" in text
     assert "cable input" in text.lower()
+
+
+def test_the_ci_check_reads_the_script_output_as_one_string() -> None:
+    """`-notmatch` on an array returns the *non*-matching items.
+
+    The workflow used to test `$output -notmatch 'still to do by hand'`, which
+    is truthy whenever a single line lacks the phrase, so the step failed even
+    when the script behaved. The output has to be joined first.
+    """
+    workflow = (REPO / ".github" / "workflows" / "windows-native-vcam.yml").read_text(encoding="utf-8")
+    step = workflow.split("Check the setup script is report-only", 1)[1]
+
+    assert "setup-windows.ps1 -Check" in step
+    assert "$text = ($output | Out-String)" in step
+    assert "$text -notmatch" in step
+    for line in step.splitlines():
+        assert not line.strip().startswith("#") or "$output -notmatch" not in line
+        assert "$output -notmatch" not in line, "match on $output directly: it is an array"
