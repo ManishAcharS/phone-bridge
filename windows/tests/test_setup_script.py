@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tests.ps1_lint import odd_quote_lines
+
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "setup-windows.ps1"
 
@@ -97,3 +99,26 @@ def test_the_ci_check_supervises_the_script_from_python() -> None:
     # Exit 1 is only acceptable when the script reached its summary and named
     # what a human still has to install.
     assert 'code == 1 and "still to do by hand" not in done.stdout' in step
+
+
+# --------------------------------------------------------------------------- #
+# the install can be parsed at all (it once could not be)
+# --------------------------------------------------------------------------- #
+def test_every_single_quoted_string_closes() -> None:
+    """An apostrophe inside 'quotes' makes the whole script unparseable.
+
+    `pwsh -File setup-windows.ps1 -Check` then prints *nothing* to stdout and exits
+    1, so CI sees a bare exit code and a user sees a launcher that did nothing. The
+    step title "the microphone's cable" did exactly that.
+    """
+    assert odd_quote_lines(setup_text()) == [], "a single-quoted string does not close"
+
+
+def test_it_checks_for_a_second_virtual_cable() -> None:
+    """The speaker path needs a cable of its own, or the room hears the PC."""
+    text = setup_text()
+
+    assert "Get-LoopbackDevices" in text
+    assert "speaker path" in text
+    assert "--list-loopback-devices" in text, "point at the command that explains the choice"
+    assert "vb-audio.com/Cable/" in text

@@ -265,7 +265,7 @@ if ($cable -and $cable -ne 'unknown') {
 }
 Write-Host ''
 
-Write-Step 'a second virtual cable (speaker path: keep the microphone's cable free)'
+Write-Step 'a second virtual cable (the speaker path must not capture the microphone one)'
 $loopbacks = Get-LoopbackDevices
 if ($null -eq $loopbacks) {
     Write-Need 'could not list capture devices yet (install PyAudioWPatch, then re-run)'

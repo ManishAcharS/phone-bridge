@@ -19,6 +19,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from tests.ps1_lint import odd_quote_lines
+
 from phonebridge.live.usb import ensure_forward, is_loopback
 
 REPO = Path(__file__).resolve().parents[2]
@@ -285,3 +287,8 @@ def test_the_launcher_can_capture_a_second_cable() -> None:
     assert "[string]$LoopbackDevice" in text
     assert "'--loopback-device', $LoopbackDevice" in text
     assert "list-loopback-devices" in text, "point at the command that explains the choice"
+
+
+def test_every_single_quoted_string_closes() -> None:
+    """An apostrophe inside 'quotes' stops the whole script from parsing."""
+    assert odd_quote_lines(ps1()) == [], "a single-quoted string does not close"
