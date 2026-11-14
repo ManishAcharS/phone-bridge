@@ -44,3 +44,30 @@ jobs:
       - name: Run native host safety tests
         shell: pwsh
         run: python -m pytest windows/tests/test_vcam_host_safety.py windows/tests/test_vcam_media_source_contract.py -q
+
+      # The live delivery paths are Python, not C++, but Windows is the only
+      # place their device lookup and driver-missing messages run for real.
+      - name: Install the PC client for the live-delivery tests
+        run: python -m pip install cryptography
+
+      - name: Run live-delivery tests (no hardware needed)
+        shell: pwsh
+        env:
+          PYTHONPATH: ${{ github.workspace }}\windows
+        run: >-
+          python -m pytest
+          windows/tests/test_live_config.py
+          windows/tests/test_live_jitter.py
+          windows/tests/test_live_devices.py
+          windows/tests/test_live_runner.py
+          windows/tests/test_live_cli.py
+          windows/tests/test_setup_script.py
+          -q
+
+      # Report-only mode: it must tell us OBS and VB-CABLE are absent on a fresh
+      # runner (exit 1) without touching the machine or failing on an error (2).
+      - name: Check the setup script is report-only and does not crash
+        shell: pwsh
+        run: |
+          ./scripts/setup-windows.ps1 -Check
+          if ($LASTEXITCODE -gt 1) { throw "setup-windows.ps1 -Check exited $LASTEXITCODE" }
