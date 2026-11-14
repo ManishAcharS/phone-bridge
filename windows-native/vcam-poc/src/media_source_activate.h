@@ -86,8 +86,7 @@ public:
     IFACEMETHODIMP LockStore() override;
     IFACEMETHODIMP UnlockStore() override;
     IFACEMETHODIMP GetCount(UINT32* count) override;
-    IFACEMETHODIMP GetAllItems(REFGUID* keys, PROPVARIANT* values, UINT32 size, UINT32* count)
-        override;
+    IFACEMETHODIMP GetItemByIndex(UINT32 index, GUID* key, PROPVARIANT* value) override;
     IFACEMETHODIMP CopyAllItems(IMFAttributes* destination) override;
 
 private:
