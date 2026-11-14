@@ -134,7 +134,7 @@ are the only thing that can turn any row above from "tested in software" into
 
 | Limitation | Reason |
 | --- | --- |
-| No virtual microphone | Needs a kernel audio driver; installing one silently is out of scope. Documented as an optional integration instead. |
+| Virtual microphone needs a driver you install | PhoneBridge writes the phone's microphone into **VB-CABLE**'s "CABLE Input"; applications then record "CABLE Output". No driver is installed by PhoneBridge itself, so without VB-CABLE there is no Windows recording device to write into (`phonebridge mic --to-cable` says so). See `docs/26`. |
 | PCM16 only | One codec, one negotiation path. Opus would cut bandwidth ~8× and is the obvious next step. |
 | No Bluetooth route for audio | Separate capability (`audio.bluetooth_sco`); it stays `unavailable` unless the phone actually has a headset route. |
 | Mono by default | Both directions negotiate mono; stereo is accepted by the format but untested on the phone. |

@@ -122,9 +122,10 @@ class SoundDeviceSink:
     """Plays received PCM on a Windows output device (optional ``sounddevice``).
 
     Default device unless one is named. This is the *in-app monitor*: it makes the
-    phone's microphone audible on the PC. It is **not** a Windows recording device
-    — a third-party app such as a call client cannot select it, and PhoneBridge
-    does not claim otherwise (see docs/19-audio.md, "virtual microphone").
+    phone's microphone audible on the PC. On its own it creates no Windows
+    recording device, so a call client cannot select it; to give one a microphone,
+    point this sink at VB-CABLE's "CABLE Input" (``phonebridge mic --to-cable``)
+    and the app records "CABLE Output" instead. See docs/26.
     """
 
     def __init__(self, fmt: AudioFormat, device: str | int | None = None) -> None:

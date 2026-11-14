@@ -207,6 +207,21 @@ camera that comes back on its own is a camera the user did not ask for.
   pip install pillow" — it does not fake a picture and it does not pretend the
   stream failed.
 
+### 7.1 Delivering the stream as a Windows webcam
+
+`phonebridge camera --virtual` feeds the same decoded frames into **pyvirtualcam**
+(OBS Studio's "OBS Virtual Camera", Unity Capture as the fallback) so that Zoom,
+Teams, Meet or OBS can select the phone as a camera. It lives in
+`phonebridge/live/` and consumes `CameraStream`; nothing in the protocol, the
+Android app or the frame path changed.
+
+Two details are deliberate: frames are letterboxed rather than stretched when the
+requested camera resolution and the phone's aspect ratio differ, and the
+*unmirrored* frame is delivered (applications mirror their own previews). A stall
+shows the last frame and then black; the stream resumes on its own.
+
+Full setup, options and the hardware checklist: `docs/26-windows-live-delivery.md`.
+
 ---
 
 ## 8. Capabilities and diagnostics
