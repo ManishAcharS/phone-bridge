@@ -103,14 +103,17 @@ def test_two_seconds_without_a_frame_switches_encoder() -> None:
 
     assert "private const val FALLBACK_AFTER_MS = 2_000L" in text
     bind = body("private fun bindOnMainThread(")
-    assert "mainHandler.postDelayed(fallbackWatchdog, FALLBACK_AFTER_MS)" in bind, (
-        "the watchdog has to be armed by the bind, not by a frame"
-    )
-    watchdog = body("private val fallbackWatchdog = Runnable {")
-    assert "if (encoded.get() > encodedAtStart) return@Runnable" in watchdog, (
+    assert "armWatchdog()" in bind, "the watchdog has to be armed by the bind, not by a frame"
+    arm = body("private fun armWatchdog(")
+    assert "mainHandler.postDelayed(fallbackWatchdog, FALLBACK_AFTER_MS)" in arm
+    watchdog = body("private fun checkForSilence(")
+    assert "if (encoded.get() > encodedAtStart) return" in watchdog, (
         "a stream that produced one frame is not stuck"
     )
     assert "fallBack(" in watchdog
+    assert "armWatchdog()" in watchdog, (
+        "the fallback gets the same grace period, so the second silence is reported"
+    )
 
 
 def test_the_watchdog_is_cancelled_when_the_camera_closes() -> None:
@@ -122,7 +125,7 @@ def test_the_watchdog_is_cancelled_when_the_camera_closes() -> None:
 
 
 def test_a_watchdog_that_also_fails_says_so_once() -> None:
-    watchdog = body("private val fallbackWatchdog = Runnable {")
+    watchdog = body("private fun checkForSilence(")
 
     assert 'if (activePath == Path.RGBA)' in watchdog
     assert "logFailure(" in watchdog, (

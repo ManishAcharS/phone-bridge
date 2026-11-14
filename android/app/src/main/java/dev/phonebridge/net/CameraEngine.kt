@@ -193,25 +193,9 @@ class CameraEngine(
     @Volatile private var captureHeight = 0
     @Volatile private var lastCaptureLayout = ""
 
-    // Encoder fallback. The task is a field so `stop` can cancel a pending
+    // Encoder fallback. The runnable is a field so `stop` can cancel a pending
     // switch instead of rebinding a camera the user already closed.
-    private val fallbackWatchdog = Runnable {
-        if (!running.get()) return@Runnable
-        if (encoded.get() > encodedAtStart) return@Runnable
-        if (activePath == Path.RGBA) {
-            logFailure(
-                "camera.start",
-                "no frame was encoded in ${FALLBACK_AFTER_MS} ms on the RGBA path either " +
-                    "(${lastCaptureLayout.ifEmpty { "no frame reached the analyzer" }})",
-            )
-            return@Runnable
-        }
-        fallBack("no frame was encoded within ${FALLBACK_AFTER_MS} ms")
-        // Give the fallback the same grace period: one log line either way
-        // instead of a silent stall.
-        mainHandler.removeCallbacks(fallbackWatchdog)
-        mainHandler.postDelayed(fallbackWatchdog, FALLBACK_AFTER_MS)
-    }
+    private val fallbackWatchdog = Runnable { checkForSilence() }
 
     // Measurement. All of it is reported once a second with Log.d and in
     // `camera.status`, so a slow frame rate can be attributed to a stage
@@ -420,8 +404,7 @@ class CameraEngine(
                     " @ ${requested.fps} fps q${requested.quality}, encoder ${activePath.code}" +
                     " (${pathReason})",
             )
-            mainHandler.removeCallbacks(fallbackWatchdog)
-            mainHandler.postDelayed(fallbackWatchdog, FALLBACK_AFTER_MS)
+            armWatchdog()
             _state.value = State(
                 active = true,
                 facing = requested.facing,
@@ -641,6 +624,40 @@ class CameraEngine(
             Log.e(TAG, line)
         }
         log("ERROR", line)
+    }
+
+    /**
+     * Arm the silence watchdog for [FALLBACK_AFTER_MS] from now.
+     *
+     * Called by the bind and re-armed by the fallback, so each path gets the same
+     * grace period and a camera that produces nothing on either path is reported
+     * once instead of stalling quietly.
+     */
+    private fun armWatchdog() {
+        mainHandler.removeCallbacks(fallbackWatchdog)
+        mainHandler.postDelayed(fallbackWatchdog, FALLBACK_AFTER_MS)
+    }
+
+    /**
+     * Nothing encoded since the stream was bound: switch encoder, or say so.
+     *
+     * A separate function rather than a lambda body because it has to re-arm
+     * itself, and a property initializer that mentions its own name is a
+     * recursive-initialization error in Kotlin.
+     */
+    private fun checkForSilence() {
+        if (!running.get()) return
+        if (encoded.get() > encodedAtStart) return
+        if (activePath == Path.RGBA) {
+            logFailure(
+                "camera.start",
+                "no frame was encoded in ${FALLBACK_AFTER_MS} ms on the RGBA path either " +
+                    "(${lastCaptureLayout.ifEmpty { "no frame reached the analyzer" }})",
+            )
+            return
+        }
+        fallBack("no frame was encoded within ${FALLBACK_AFTER_MS} ms")
+        armWatchdog()
     }
 
     /**
@@ -956,8 +973,7 @@ class CameraEngine(
                     lifecycle = owner
                     // The watchdog now measures the new path only.
                     encodedAtStart = encoded.get()
-                    mainHandler.removeCallbacks(fallbackWatchdog)
-                    mainHandler.postDelayed(fallbackWatchdog, FALLBACK_AFTER_MS)
+                    armWatchdog()
                     Log.i(TAG, "camera rebound on the RGBA path")
                 } catch (e: Exception) {
                     logFailure("camera fallback", "${e.javaClass.simpleName}: ${e.message}", e)
