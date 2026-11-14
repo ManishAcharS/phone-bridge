@@ -238,8 +238,44 @@ class LiveRunner:
 
     def _open_mic(self, fmt: AudioFormat) -> Any:
         assert self._plan.mic is not None
-        self._mic_sink = self._mic_factory(fmt, self._plan.mic)
+        loop = asyncio.get_running_loop()
+        kwargs: dict[str, Any] = {}
+        if self._mic_factory_supports_failure_callback():
+            kwargs["on_failure"] = lambda message: self._mic_failed(loop, message)
+        self._mic_sink = self._mic_factory(fmt, self._plan.mic, **kwargs)
         return self._mic_sink
+
+    def _mic_factory_supports_failure_callback(self) -> bool:
+        """True when the factory takes ``on_failure`` (tests inject two-arg fakes)."""
+        import inspect  # noqa: PLC0415 - only needed once, and keeps import cheap
+
+        try:
+            parameters = inspect.signature(self._mic_factory).parameters
+        except (TypeError, ValueError):  # builtins and C callables
+            return False
+        if "on_failure" in parameters:
+            return True
+        return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+    def _mic_failed(self, loop: asyncio.AbstractEventLoop, message: str) -> None:
+        """Called from the sink's pump thread when the device dies.
+
+        Stops the *phone's* capture — a microphone nobody can hear is battery
+        spent for nothing — and touches nothing else: the session, the camera and
+        the speaker stay up, which is the difference between a dead device and a
+        dead call.
+        """
+        link = self._link
+        if link is None:
+            return
+
+        def stop() -> None:
+            asyncio.ensure_future(link.stop_mic(f"microphone device failed: {message}"))
+
+        try:
+            loop.call_soon_threadsafe(stop)
+        except RuntimeError:
+            pass  # the loop closed first; there is nothing left to stop
 
     # ------------------------------------------------------------------ #
     # camera pump

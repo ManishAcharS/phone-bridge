@@ -36,6 +36,7 @@ class FakeDevice:
             "name": name,
             "max_input_channels": inputs,
             "max_output_channels": outputs,
+            "default_samplerate": 48_000.0,
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -53,10 +54,18 @@ class FakeSoundDevice:
         self.devices.insert(0, FakeDevice("Microphone", inputs=2))
         self.samples = opened if opened is not None else []
 
-    def query_devices(self) -> list[FakeDevice]:
-        return self.devices
+    def query_devices(self, device: Any = None, kind: str | None = None) -> Any:
+        if device is None and kind is None:
+            return self.devices
+        return self.devices[int(device)].data
+
+    def check_output_settings(self, **kwargs: Any) -> None:
+        """The library's own answer to "will this open?": always yes here."""
 
     def OutputStream(self, **kwargs: Any) -> FakeStream:  # noqa: N802 - mirrors sounddevice
+        return FakeStream(self.samples, kwargs)
+
+    def RawOutputStream(self, **kwargs: Any) -> FakeStream:  # noqa: N802 - the one used
         return FakeStream(self.samples, kwargs)
 
 
@@ -70,7 +79,10 @@ class FakeStream:
         self.started = True
 
     def write(self, payload: bytes) -> None:
-        self._sink.append(payload)
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            # RawOutputStream writes bytes; OutputStream would want a numpy array.
+            raise TypeError(f"a RawOutputStream writes bytes, not {type(payload).__name__}")
+        self._sink.append(bytes(payload))
 
     def stop(self) -> None:
         self.started = False
@@ -202,6 +214,7 @@ def test_open_cable_sink_opens_the_device_before_the_phone_starts() -> None:
     # The stream exists (started) before any frame arrives: a device that cannot
     # open must fail here, not on the first frame of a live call.
     assert sink._writer._stream is not None  # noqa: SLF001
+    assert sink._writer._stream.started is True, "started before the phone captures"  # noqa: SLF001
     sink.close()
 
 
@@ -280,11 +293,11 @@ def test_a_writer_that_dies_stops_the_sink_and_is_reported() -> None:
 
 
 def test_sounddevice_writer_reports_an_unopenable_device() -> None:
-    class Broken:
-        def OutputStream(self, **kwargs: Any) -> Any:
+    class Broken(FakeSoundDevice):
+        def RawOutputStream(self, **kwargs: Any) -> Any:  # noqa: N802
             raise RuntimeError("device busy")
 
-    writer = SoundDeviceWriter(AudioFormat(), 3, sd=Broken())
-
+    # Opening happens in the constructor, so the failure is not deferred to the
+    # first frame of a live call.
     with pytest.raises(DeviceUnavailable, match="could not open"):
-        writer.write(b"\x00\x00")
+        SoundDeviceWriter(AudioFormat(), 0, sd=Broken(["CABLE Input"]))

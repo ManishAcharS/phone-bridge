@@ -253,12 +253,20 @@ def plan_from_args(args: argparse.Namespace) -> LivePlan:
 
 
 async def _status_loop(runner: LiveRunner, stop: asyncio.Event, *, quiet: bool) -> None:
+    reported = ""
     while not stop.is_set():
         status = runner.status()
         if not quiet:
             print(f"  {status.line()}", flush=True)
-        if status.mic_state == "error" and status.mic_detail:
+        # Once per distinct failure: a repeating line buries the message it repeats.
+        if status.mic_state == "error" and status.mic_detail and status.mic_detail != reported:
+            reported = status.mic_detail
             print(f"  microphone stopped: {status.mic_detail}", flush=True)
+            print(
+                "  the session is still up; camera and speaker are unaffected. "
+                "Fix the device, then Ctrl+C and restart this command.",
+                flush=True,
+            )
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=STATUS_INTERVAL_S)
 

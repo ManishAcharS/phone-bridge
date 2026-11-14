@@ -408,8 +408,18 @@ class AudioLink:
                 for ordered in self._gate.offer(frame):
                     if ordered.muted or not ordered.payload:
                         continue
-                    if self._sink is not None:
+                    if self._sink is None:
+                        continue
+                    try:
                         await loop.run_in_executor(None, self._sink.write, ordered.payload)
+                    except AudioBackendError as exc:
+                        # A dead *device* stops this direction and nothing else:
+                        # the session, the camera and the speaker keep running.
+                        self._set_mic(ERROR, str(exc))
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        self._set_mic(ERROR, f"microphone device failed: {exc}")
+                        return
         except asyncio.CancelledError:
             raise
         except AudioBackendError as exc:

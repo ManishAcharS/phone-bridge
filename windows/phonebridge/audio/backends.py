@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from .frames import AudioFormat
+from .sdout import SdOutputError, SoundDeviceOutput
 
 log = logging.getLogger(__name__)
 
@@ -138,31 +139,25 @@ class SoundDeviceSink:
                 "'sounddevice' package: run `pip install sounddevice`"
             ) from exc
         self._sd = sounddevice
+        # RawOutputStream (bytes, no dtype conversion) with the device's own
+        # channel count and rate, negotiated — see phonebridge.audio.sdout. The
+        # same two mistakes (numpy-array writes, session channels on a device
+        # that has its own) used to be in here and in live/devices.py.
         try:
-            self._stream = sounddevice.RawOutputStream(
-                samplerate=fmt.sample_rate,
-                channels=fmt.channels,
-                dtype="int16",
-                device=device,
-                blocksize=fmt.samples_per_frame,
-            )
-            self._stream.start()
-        except Exception as exc:  # noqa: BLE001
+            self._output = SoundDeviceOutput(fmt, device, sd=sounddevice)
+        except SdOutputError as exc:
             raise AudioBackendError(f"the output device could not be opened: {exc}") from exc
 
     def write(self, payload: bytes) -> None:
         if not payload:
             return
         try:
-            self._stream.write(payload)
-        except Exception as exc:  # noqa: BLE001
+            self._output.write(payload)
+        except SdOutputError as exc:
             raise AudioBackendError(f"playback failed: {exc}") from exc
 
     def close(self) -> None:
-        with contextlib.suppress(Exception):
-            self._stream.stop()
-        with contextlib.suppress(Exception):
-            self._stream.close()
+        self._output.close()
 
 
 def _to_pcm16(chunk: object) -> bytes:

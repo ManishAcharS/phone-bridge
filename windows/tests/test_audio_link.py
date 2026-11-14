@@ -456,3 +456,76 @@ def test_the_snapshot_is_a_copy_the_window_can_keep() -> None:
 def test_every_flag_survives_the_wire(flag: int) -> None:
     frame = AudioFrame(seq=1, timestamp_ms=20, payload=b"\x00\x00", flags=flag)
     assert decode_frame(frame.encode()).flags == flag
+
+
+# --------------------------------------------------------------------------- #
+# a dead PC device must not cost the session
+# --------------------------------------------------------------------------- #
+def test_a_failing_sink_stops_the_microphone_and_leaves_the_session_open() -> None:
+    """The device error the user hit must not become a dropped connection.
+
+    Writing into a real device can fail at any moment (unplugged, taken by an
+    exclusive-mode app, VB-CABLE removed). The failure is reported on the
+    microphone direction; the session keeps running, so the camera and the
+    speaker on the same session are untouched.
+    """
+
+    async def scenario():
+        session = FakeSession()
+        calls: list[str] = []
+
+        class DyingSink:
+            def write(self, payload: bytes) -> None:
+                calls.append("write")
+                raise AudioBackendError("writing to the microphone device failed: dtype mismatch")
+
+            def close(self) -> None:
+                return None
+
+        audio = link(session, sink_factory=lambda fmt: DyingSink())
+        await audio.start_playback()  # the other direction, on the same session
+        assert await audio.start_mic() is True
+
+        session.queues[MIC_STREAM].put_nowait(
+            AudioFrame(seq=0, timestamp_ms=0, payload=b"\x01\x00" * 4).encode()
+        )
+        assert await wait_for(lambda: audio.snapshot().mic == ERROR)
+
+        snapshot = audio.snapshot()
+        assert "dtype mismatch" in snapshot.mic_detail
+        assert snapshot.playback == ACTIVE, "the speaker direction must not be affected"
+        assert session.is_open is True, "a dead device is not a dead session"
+
+        # The phone's capture is stopped, so it is not streaming into nothing.
+        await audio.stop_mic()
+        assert "audio.mic.stop" in session.methods()
+        await audio.close()
+
+    run(scenario())
+
+
+def test_an_unexpected_sink_error_is_reported_the_same_way() -> None:
+    """A sink is third-party code: it may raise anything at all."""
+
+    async def scenario():
+        session = FakeSession()
+
+        class ExplodingSink:
+            def write(self, payload: bytes) -> None:
+                raise RuntimeError("PortAudio: device invalidated")
+
+            def close(self) -> None:
+                return None
+
+        audio = link(session, sink_factory=lambda fmt: ExplodingSink())
+        await audio.start_mic()
+        session.queues[MIC_STREAM].put_nowait(
+            AudioFrame(seq=0, timestamp_ms=0, payload=b"\x01\x00" * 4).encode()
+        )
+
+        assert await wait_for(lambda: audio.snapshot().mic == ERROR)
+        assert "device invalidated" in audio.snapshot().mic_detail
+        assert session.is_open is True
+        await audio.close()
+
+    run(scenario())

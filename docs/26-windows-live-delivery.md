@@ -217,6 +217,12 @@ combination that matters, and the one no test here can stand in for.
   mirroring the device feed would mirror it twice.
 * **One phone at a time per command.** Multi-device is the controller's job
   (`phonebridge gui`), not these commands'.
+* **Device formats are negotiated, not assumed.** The endpoint's channel count and
+  sample rate come from the device (a stereo "CABLE Input" gets duplicated mono; a
+  44.1 kHz endpoint gets resampled), because writing the session's shape into a
+  device that has its own is how a microphone ends up at half speed. Resampling is
+  linear interpolation — exact in duration, modest in quality — and never applied
+  when the rates already match.
 
 ---
 
@@ -229,5 +235,10 @@ combination that matters, and the one no test here can stand in for.
 | `no playback device matching 'CABLE Input'` | VB-CABLE not installed, or not rebooted | install it, reboot, re-run `setup-windows.ps1 -Check` |
 | mic runs but the other app is silent | the app is reading a different input | select `CABLE Output (VB-Audio Virtual Cable)` |
 | `capturing PC audio needs PyAudioWPatch` | the package is missing | `py -3 -m pip install PyAudioWPatch` |
+| `dtype mismatch: 'bytes…' vs 'int16'` | a sounddevice `OutputStream` (numpy arrays) was used for raw PCM — fixed; you are on an older build | `py -3 -m pip install -e .\windows` from the branch head |
+| `the output device accepts none of these formats` | the endpoint will not take 48 kHz mono or stereo | set the device to 48 kHz (Windows sound settings or the VB-CABLE control panel) |
+| phone microphone audible but fast/high-pitched | the capture rate was not the device's rate | fixed by negotiation; if you still hear it, note the device's rate in `sounddevice.query_devices()` |
+| `the phone stopped answering … no close frame (1006)` | the phone went quiet for 8 s: app frozen or killed, or the network dropped. It is *not* a PC defect, and it is unrelated to a dead PC device | keep PhoneBridge in the phone's Autostart list, out of battery optimisation, on a stable Wi-Fi |
+| `microphone stopped: …` but the status line still shows the camera and speaker running | the PC device failed; the session and the other paths are untouched | fix or re-select the device, then restart the command (the error line is printed once) |
 | speaker silent while the phone plays nothing | phone volume, or playback not started on the phone | check the app's playback toggle, raise the phone volume |
 | status shows `link down` | the session closed | re-run the command; the phone app must be in the foreground once |

@@ -74,6 +74,7 @@ class FakeAudioLink:
         self.kwargs = kwargs
         self.mic_started = False
         self.playback_started = False
+        self.mic_stopped = ""
         self.closed = False
         FakeAudioLink.instances.append(self)
 
@@ -100,6 +101,10 @@ class FakeAudioLink:
             mic_detail="",
             stats={"received": 7},
         )
+
+    async def stop_mic(self, reason: str = "stopped") -> None:
+        self.mic_stopped = reason
+        self.mic_started = False
 
     async def close(self, reason: str = "stopped") -> None:
         self.closed = True
@@ -300,3 +305,47 @@ def test_a_disconnected_session_is_reported_honestly() -> None:
 
     assert runner.status().connected is False
     assert runner.status().line().startswith("link down")
+
+
+def test_a_dead_microphone_device_stops_the_phone_capture_and_nothing_else() -> None:
+    """A PC-side device failure must cost the microphone *path*, not the call."""
+    plan = LivePlan(camera=CameraPlan(fps=60), mic=MicPlan(), speaker=SpeakerPlan())
+    runner, camera_sink, mic = _runner(plan)
+
+    async def scenario() -> None:
+        await runner.start()
+        try:
+            await asyncio.sleep(0.15)  # let the camera pump deliver a frame or two
+            before = len(camera_sink.frames)
+
+            # Exactly what CableMicSink does from its pump thread when the device dies.
+            runner._mic_failed(asyncio.get_running_loop(), "dtype mismatch")  # noqa: SLF001
+            await asyncio.sleep(0.05)
+
+            link = FakeAudioLink.instances[0]
+            assert "dtype mismatch" in link.mic_stopped, (
+                "the phone's capture must be stopped: nobody can hear it"
+            )
+            FakeCameraStream.instances[0].frame = object()  # the phone sends another
+            await asyncio.sleep(0.15)
+            assert len(camera_sink.frames) > before, "the camera pump must keep sending"
+            assert not runner._pump.done()  # noqa: SLF001
+            assert runner.status().speaker_state == "active"
+        finally:
+            await runner.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_two_argument_mic_factory_still_works() -> None:
+    """Tests and callers inject simple factories; the callback must be optional."""
+    plan = LivePlan(mic=MicPlan())
+    mic = FakeMicSink()
+    runner = LiveRunner(_session(), plan, mic_factory=lambda fmt, mic_plan: mic)
+
+    async def scenario() -> None:
+        await runner.start()
+        await runner.close()
+
+    asyncio.run(scenario())
+    assert mic.closed is True

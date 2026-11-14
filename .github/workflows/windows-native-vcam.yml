@@ -56,8 +56,13 @@ jobs:
       # place their device lookup and driver-missing messages run for real.
       - name: Install the PC client for the live-delivery tests
         # Same install a user performs; it pulls the two declared dependencies
-        # (websockets, cryptography) that the CLI's imports need.
-        run: python -m pip install -e windows
+        # (websockets, cryptography) that the CLI's imports need. numpy and
+        # Pillow are not dependencies of the CLI, but they are what the camera
+        # path really uses, and the tests that pin pyvirtualcam's array contract
+        # (uint8, (h, w, 3), C-contiguous) skip without them.
+        run: |
+          python -m pip install -e windows
+          python -m pip install numpy pillow
 
       - name: Run live-delivery tests (no hardware needed)
         shell: pwsh
@@ -70,6 +75,11 @@ jobs:
           windows/tests/test_live_devices.py
           windows/tests/test_live_runner.py
           windows/tests/test_live_cli.py
+          windows/tests/test_live_camera_contract.py
+          windows/tests/test_live_loopback.py
+          windows/tests/test_audio_sdout.py
+          windows/tests/test_audio_convert.py
+          windows/tests/test_transport_link.py
           windows/tests/test_setup_script.py
           -q
 

@@ -24,7 +24,9 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from ..audio.convert import LinearResampler, remix
 from ..audio.frames import AudioFormat
+from ..audio.sdout import SdOutputError, SoundDeviceOutput
 from .config import CameraPlan, MicPlan, SpeakerPlan
 from .jitter import JitterBuffer
 
@@ -185,50 +187,52 @@ def find_cable_input(name: str = "CABLE Input", *, sd: Any = None) -> int:
     )
 
 
-class SoundDeviceWriter:
-    """Blocking int16 writes into one device, opened lazily on first use."""
+class SoundDeviceWriter(SoundDeviceOutput):
+    """PCM16 writes into one device, opened on construction.
+
+    Opening here rather than on the first frame is deliberate: "the device opens"
+    is the property a user needs *before* the phone is asked to capture, so a
+    missing or busy endpoint fails the command instead of the second frame.
+
+    The base class owns the two things that used to be wrong: it writes through
+    ``RawOutputStream`` (the wire is bytes; ``OutputStream`` wants numpy arrays of
+    exactly its dtype) and negotiates the device's channel count and rate instead
+    of assuming the session's.
+    """
 
     def __init__(
         self, fmt: AudioFormat, device: int | None, *, sd: Any = None, latency: float = 0.0
     ) -> None:
-        self.fmt = fmt
-        self._sd = sd or _import_sounddevice()
-        self._device = device
-        self._stream: Any = None
-        self._latency = latency
+        try:
+            super().__init__(fmt, device, sd=sd, latency=latency)
+        except SdOutputError as exc:
+            raise DeviceUnavailable(
+                f"could not open the output device for the phone microphone: {exc}",
+                hint=_sounddevice_hint(),
+            ) from exc
 
-    def _open(self) -> Any:
-        if self._stream is None:
-            try:
-                self._stream = self._sd.OutputStream(
-                    samplerate=self.fmt.sample_rate,
-                    channels=self.fmt.channels,
-                    dtype="int16",
-                    device=self._device,
-                    blocksize=self.fmt.samples_per_frame,
-                    latency=self._latency,
-                )
-                self._stream.start()
-            except Exception as exc:  # noqa: BLE001
-                raise DeviceUnavailable(
-                    f"could not open the output device for the phone microphone: {exc}"
-                ) from exc
+    def _open(self) -> Any:  # noqa: SLF001 - kept for callers that re-assert it
+        """The stream, which construction already opened."""
         return self._stream
 
     def write(self, payload: bytes) -> None:
-        stream = self._open()
         try:
-            stream.write(payload)
-        except Exception as exc:  # noqa: BLE001
-            raise DeviceUnavailable(f"writing to the microphone device failed: {exc}") from exc
+            super().write(payload)
+        except SdOutputError as exc:
+            raise DeviceUnavailable(
+                f"writing to the microphone device failed: {exc}"
+            ) from exc
 
     def close(self) -> None:
-        if self._stream is not None:
-            with contextlib.suppress(Exception):
-                self._stream.stop()
-            with contextlib.suppress(Exception):
-                self._stream.close()
-            self._stream = None
+        with contextlib.suppress(Exception):
+            super().close()
+
+
+def _sounddevice_hint() -> str:
+    return (
+        f"check the device with `python -c \"import sounddevice; "
+        f'print(sounddevice.query_devices())"`; VB-CABLE is at {VB_CABLE_URL}'
+    )
 
 
 def _apply_gain(payload: bytes, gain: float) -> bytes:
@@ -280,10 +284,15 @@ class CableMicSink:
         writer: Any = None,
         buffer: JitterBuffer | None = None,
         clock: Callable[[], float] | None = None,
+        on_failure: Callable[[str], None] | None = None,
     ) -> None:
         self.fmt = fmt
         self.device = device
         self.gain = gain
+        #: Called once, from the pump thread, when the device dies. The runner
+        #: uses it to stop the phone's capture instead of leaving a microphone
+        #: running that nobody can hear.
+        self._on_failure = on_failure
         if buffer is not None:
             self._buffer = buffer
         elif clock is not None:
@@ -319,13 +328,22 @@ class CableMicSink:
             except DeviceUnavailable as exc:
                 # Sticky and reported: a device that vanished mid-call must not
                 # spin the thread writing into a closed handle.
-                self.error = str(exc)
-                log.warning("microphone sink stopped: %s", exc)
+                self._fail(str(exc))
                 return
             except Exception as exc:  # noqa: BLE001
-                self.error = f"microphone writer failed: {exc}"
-                log.warning("microphone sink stopped: %s", exc)
+                self._fail(f"microphone writer failed: {exc}")
                 return
+
+    def _fail(self, message: str) -> None:
+        """Record the failure, and let the runner stop the phone's capture."""
+        self.error = message
+        log.warning("microphone sink stopped: %s", message)
+        if self._on_failure is None:
+            return
+        try:
+            self._on_failure(message)
+        except Exception:  # noqa: BLE001 - a failing callback must not hide the error
+            log.debug("microphone failure callback raised", exc_info=True)
 
     def close(self) -> None:
         self._stop.set()
@@ -336,15 +354,25 @@ class CableMicSink:
             self._writer.close()
 
 
-def open_cable_sink(fmt: AudioFormat, plan: MicPlan, *, sd: Any = None) -> CableMicSink:
+def open_cable_sink(
+    fmt: AudioFormat,
+    plan: MicPlan,
+    *,
+    sd: Any = None,
+    on_failure: Callable[[str], None] | None = None,
+) -> CableMicSink:
     """Locate VB-CABLE and start a sink writing into it."""
     index = find_cable_input(plan.device, sd=sd)
+    # The constructor opens and starts the stream, so a device that cannot be
+    # opened fails here, before the phone is asked to capture.
     writer = SoundDeviceWriter(fmt, index, sd=sd)
-    # Fail now, not on the first frame: "the device opened" is the property the
-    # user needs before the phone starts capturing.
-    writer._open()  # noqa: SLF001 - deliberate: prove the device opens here
     return CableMicSink(
-        fmt, device=index, latency_ms=plan.latency_ms, gain=plan.gain, writer=writer
+        fmt,
+        device=index,
+        latency_ms=plan.latency_ms,
+        gain=plan.gain,
+        writer=writer,
+        on_failure=on_failure,
     )
 
 
@@ -365,6 +393,7 @@ class PyAudioLoopbackSource:
         self.fmt = fmt
         self._remainder = b""
         self._device_channels = 2
+        self._resampler: LinearResampler | None = None
         try:
             pyaudio = module or __import__("pyaudiowpatch")
         except Exception as exc:  # noqa: BLE001
@@ -380,15 +409,21 @@ class PyAudioLoopbackSource:
         try:
             info = self._resolve_device(pyaudio, device)
             self._device_channels = int(info.get("maxInputChannels", 2)) or 2
-            self._rate = int(info.get("defaultSampleRate", fmt.sample_rate))
-            self._stream = self._pa.open(
-                format=pyaudio.paInt16,
-                channels=self._device_channels,
-                rate=self._rate,
-                frames_per_buffer=fmt.samples_per_frame,
-                input=True,
-                input_device_index=int(info["index"]),
+            # Prefer the session's rate; shared-mode WASAPI may refuse it, and a
+            # capture running at a different rate has to be resampled or the phone
+            # plays it ~9 % fast (the classic "chipmunk" defect).
+            device_rate = int(info.get("defaultSampleRate", fmt.sample_rate))
+            self._rate, self._stream = self._open_stream(
+                pyaudio, info, fmt.sample_rate, device_rate
             )
+            if self._rate != fmt.sample_rate:
+                self._resampler = LinearResampler(self._rate, fmt.sample_rate)
+                log.info(
+                    "%s runs at %d Hz, resampling to %d Hz",
+                    info.get("name", "loopback"),
+                    self._rate,
+                    fmt.sample_rate,
+                )
         except DeviceUnavailable:
             self._pa.terminate()
             raise
@@ -423,12 +458,41 @@ class PyAudioLoopbackSource:
                 return info
         return candidates[0]
 
+    def _open_stream(self, pyaudio: Any, info: dict[str, Any], rate: int, device_rate: int) -> Any:
+        """Open at the session rate if the endpoint allows it, else at its own.
+
+        Shared-mode WASAPI normally locks the stream to the device's mix format,
+        so both are tried and the caller is told which one won.
+        """
+        attempts = [rate] + ([device_rate] if device_rate and device_rate != rate else [])
+        last: Exception | None = None
+        for candidate in attempts:
+            try:
+                stream = self._pa.open(
+                    format=pyaudio.paInt16,
+                    channels=self._device_channels,
+                    rate=candidate,
+                    frames_per_buffer=max(1, candidate * self.fmt.frame_ms // 1000),
+                    input=True,
+                    input_device_index=int(info["index"]),
+                )
+            except Exception as exc:  # noqa: BLE001 - try the next rate
+                last = exc
+                continue
+            return candidate, stream
+        raise DeviceUnavailable(
+            f"loopback capture could not open at {rate} Hz or {device_rate} Hz: {last}",
+            hint="check the output device in Windows sound settings",
+        )
+
     def read(self) -> bytes:
         try:
             raw = self._stream.read(self.fmt.samples_per_frame, exception_on_overflow=False)
         except Exception as exc:  # noqa: BLE001
             raise DeviceUnavailable(f"loopback capture failed: {exc}") from exc
-        pcm = _downmix(raw, self._device_channels, self.fmt.channels)
+        pcm = remix(raw, self._device_channels, self.fmt.channels)
+        if self._resampler is not None:
+            pcm = self._resampler.process(pcm)
         self._remainder += pcm
         want = self.fmt.bytes_per_frame
         if len(self._remainder) < want:
@@ -443,23 +507,6 @@ class PyAudioLoopbackSource:
             self._stream.close()
         with contextlib.suppress(Exception):
             self._pa.terminate()
-
-
-def _downmix(payload: bytes, source_channels: int, target_channels: int) -> bytes:
-    """Stereo to mono by averaging, mono to stereo by duplication, else pass."""
-    if source_channels == target_channels or source_channels < 2:
-        return payload
-    from array import array  # noqa: PLC0415
-
-    samples = array("h")
-    samples.frombytes(payload[: len(payload) - (len(payload) % (2 * source_channels))])
-    if target_channels == 1:
-        mono = array(
-            "h",
-            (int((samples[i] + samples[i + 1]) / 2) for i in range(0, len(samples) - 1, 2)),
-        )
-        return mono.tobytes()
-    return payload
 
 
 def open_loopback_source(fmt: AudioFormat, plan: SpeakerPlan, *, module: Any = None) -> Any:
