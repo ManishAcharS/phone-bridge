@@ -259,5 +259,5 @@ def test_beacon_restart_cannot_leak_the_previous_worker() -> None:
 
 def test_manifest_still_declares_the_connected_device_service() -> None:
     manifest = read(MANIFEST)
-    assert 'android:foregroundServiceType="connectedDevice"' in manifest
+    assert 'android:foregroundServiceType="connectedDevice|camera|microphone|mediaPlayback"' in manifest
     assert "FOREGROUND_SERVICE_CONNECTED_DEVICE" in manifest

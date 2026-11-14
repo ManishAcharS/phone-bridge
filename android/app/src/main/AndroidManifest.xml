@@ -9,6 +9,22 @@
     <!-- Keep the bridge alive with the screen off. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!--
+      Android 14+ requires a *type-specific* permission for every kind of work a
+      foreground service does, in addition to FOREGROUND_SERVICE:
+
+        camera         streaming the phone's camera while the screen is off
+        microphone     streaming the phone's microphone while the screen is off
+        mediaPlayback  playing the PC's audio through AudioTrack
+
+      All three are "normal" permissions: granted at install, never prompted, and
+      they grant nothing on their own - CAMERA and RECORD_AUDIO stay the runtime
+      permissions the user actually decides on, and the service only claims a type
+      while the matching runtime permission is held (see BridgeService).
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
@@ -109,9 +125,15 @@
             </intent-filter>
         </activity>
 
+        <!--
+          connectedDevice is the primary type: the service exists to hold a
+          connection to the PC. camera, microphone and mediaPlayback describe the
+          work it does *through* that connection, and each is only claimed while
+          the phone has the matching runtime permission.
+        -->
         <service
             android:name=".service.BridgeService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice" />
+            android:foregroundServiceType="connectedDevice|camera|microphone|mediaPlayback" />
     </application>
 </manifest>
