@@ -58,6 +58,7 @@ target_link_libraries(PhoneBridgeVcamSource PRIVATE
     mfuuid.lib
     mfsensorgroup.lib   # MFCreateVirtualCamera lives here
     ole32.lib
+    runtimeobject.lib
 )
 set_target_properties(PhoneBridgeVcamSource PROPERTIES
     OUTPUT_NAME "PhoneBridgeVcamSource"
