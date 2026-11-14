@@ -255,7 +255,9 @@ IFACEMETHODIMP MediaSource::GetSourceAttributes(IMFAttributes** attributes) {
     if (!m_sourceAttributes && FAILED(MFCreateAttributes(&m_sourceAttributes, 2))) {
         return E_OUTOFMEMORY;
     }
-    return m_sourceAttributes.CopyTo(attributes);
+    const HRESULT copied = m_sourceAttributes.CopyTo(attributes);
+    TraceHr(L"MediaSource::GetSourceAttributes: CopyTo", copied);
+    return copied;
 }
 
 IFACEMETHODIMP MediaSource::GetStreamAttributes(DWORD streamId, IMFAttributes** attributes) {
