@@ -100,7 +100,7 @@ jobs:
             # reason in "* What went wrong:", the compiler in "e: "/"error:".
             summary=$(awk '/\* What went wrong:/{flag=1;next} flag && NF {print; if(++n>=12) exit}' /tmp/gradle.log | tr '\n' ' ' | cut -c1-1200)
             # Kotlin writes "e: <path>: (line, col): <reason>"; repeat those first.
-            errors=$(grep -E '^e: ' /tmp/gradle.log | head -n 10 | sed 's|file://[^ ]*/android/|android/|' | tr '\n' ' ' | cut -c1-1400)
+            errors=$(grep -E '^e: ' /tmp/gradle.log | head -n 40 | sed 's|file://[^ ]*/android/|android/|' | tr '\n' ' ' | cut -c1-4500)
             echo "::error::gradlew assembleDebug exited $code -- wrong: ${summary:-none} -- errors: ${errors:-none}"
             exit "$code"
           fi

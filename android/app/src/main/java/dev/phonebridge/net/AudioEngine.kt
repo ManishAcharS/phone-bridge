@@ -372,4 +372,6 @@ class AudioEngine(
 }
 
 /** An RPC-level refusal that the PC shows as-is (docs/03 error codes). */
-class RpcFailure(val code: String, message: String) : RuntimeException(message)
+// `open`: BleFailure, CameraFailure, FileFailure, StorageFailure and SensorFailure
+// all extend it, and a final class cannot be inherited from.
+open class RpcFailure(val code: String, message: String) : RuntimeException(message)
