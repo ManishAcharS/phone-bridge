@@ -51,7 +51,7 @@ void TraceLine(const wchar_t* message) {
 
 void TraceGuid(const wchar_t* label, REFGUID value) {
     wchar_t guid[40] = {};
-    if (StringFromGUID2(value, guid, static_cast<int>(std::size(guid))) > 0) {
+    if (StringFromGUID2(value, guid, 40) > 0) {
         ::OutputDebugStringW(L"[PhoneBridge] ");
         ::OutputDebugStringW(label);
         ::OutputDebugStringW(L": ");
