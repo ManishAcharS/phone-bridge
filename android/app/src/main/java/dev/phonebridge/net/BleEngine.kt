@@ -930,7 +930,7 @@ class BleEngine(
         val bytes = value.copyOf()
         val payload = linkedMapOf<String, Any?>(
             "address" to link.address,
-            "service" to (findServiceUuid(link, characteristic.uuid) ?: ""),
+            "service" to (findServiceUuid(link, characteristic.uuid.toString()) ?: ""),
             "characteristic" to characteristic.uuid.toString(),
             "value_b64" to if (bytes.size <= MAX_VALUE_BYTES) {
                 Base64.encodeToString(bytes, Base64.NO_WRAP)

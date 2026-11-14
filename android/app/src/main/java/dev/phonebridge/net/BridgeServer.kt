@@ -629,6 +629,29 @@ class BridgeServer(
         releaseAudioIfIdle()
     }
 
+    /**
+     * Called whenever a session leaves the ready set.
+     *
+     * Nothing may stay open for a PC that is gone: this used to live inside
+     * `PeerSession`, where `unregisterSession` could not see it, so the whole
+     * file did not compile.
+     */
+    private fun releaseAudioIfIdle() {
+        if (sessions.none { it.isReady }) {
+            audio.release()
+            camera.release()
+            // A camera held open for a session that has gone is a privacy bug,
+            // so it is closed on the same edge as the microphone.
+            camera.onSessionClosed("last session ended")
+            // Phase 5: a sensor listener, a GATT link or a half-written file held
+            // open for a PC that is gone is a privacy and battery bug, so all three
+            // are released on the same edge as the microphone and the lens.
+            sensors.onSessionClosed("last session ended")
+            files.onSessionClosed("last session ended")
+            bluetooth.onSessionClosed("last session ended")
+        }
+    }
+
     private fun publishPeers() {
         // One row per PC, however many sessions it holds (a `watch` and a
         // `ping` at the same time are two sessions, one peer).
@@ -1337,24 +1360,6 @@ class BridgeServer(
         }
 
         private fun responseSasNormalised(formatted: String) = formatted.replace(" ", "")
-
-        /** @return true when this session was admitted; false means it was closed. */
-        /** Called whenever a session leaves the ready set. */
-    private fun releaseAudioIfIdle() {
-        if (sessions.none { it.isReady }) {
-            audio.release()
-            camera.release()
-            // A camera held open for a session that has gone is a privacy bug,
-            // so it is closed on the same edge as the microphone.
-            camera.onSessionClosed("last session ended")
-            // Phase 5: a sensor listener, a GATT link or a half-written file held
-            // open for a PC that is gone is a privacy and battery bug, so all three
-            // are released on the same edge as the microphone and the lens.
-            sensors.onSessionClosed("last session ended")
-            files.onSessionClosed("last session ended")
-            bluetooth.onSessionClosed("last session ended")
-        }
-    }
 
     private fun markReady(): Boolean {
             cancelSetupTimeout()

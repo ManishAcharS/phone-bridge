@@ -174,7 +174,10 @@ class SensorEngine(
             val id = built.size + 1
             val known = SensorFrames.KINDS.containsKey(sensor.type)
             val reason = when {
-                sensor.type == Sensor.TYPE_STRING -> "text sensors cannot be sent as numbers"
+                // `Sensor.TYPE_STRING` was never part of the public SDK; the
+                // supported way to recognise a text sensor is its string type.
+                sensor.stringType != Sensor.STRING_TYPE_NONE ->
+                    "text sensors cannot be sent as numbers"
                 requiresBiometricPermission(sensor.type) ->
                     "needs the BODY_SENSORS permission, which this build does not request"
                 SensorFrames.UNSUPPORTED_REASONS.containsKey(sensor.type) ->

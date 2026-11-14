@@ -56,7 +56,8 @@ object DeviceFacts {
         val label: String,
         val hardware: Boolean?,
         val implemented: Boolean,
-        val phase: Int?,
+        /** The roadmap phase that would implement it; null when there is none. */
+        val phase: Int? = null,
         val note: String,
         val permission: String? = null,
     ) {
