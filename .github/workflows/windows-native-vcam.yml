@@ -68,38 +68,45 @@ jobs:
 
       # Report-only mode: everything OBS and VB-CABLE related must be a message,
       # never an installer, and a missing component must be reported, not fatal.
+      # Python supervises the child process: PowerShell's own stderr handling and
+      # GitHub's `$ErrorActionPreference = 'Stop'` preamble made a shell-level
+      # check unreliable, and subprocess gives an exit code and both streams.
       - name: Check the setup script is report-only and does not crash
-        shell: pwsh
+        shell: python
         run: |
-          # Actions runs this shell with $ErrorActionPreference = 'Stop'. A child
-          # process writing to stderr would then abort the step before the exit
-          # code is read, so relax it and handle the code ourselves.
-          $ErrorActionPreference = 'Continue'
-          # Run it as a child process: the script calls `exit`, which would end
-          # this shell before the exit code could be inspected.
-          $output = @()
-          try {
-            $output = pwsh -NoProfile -File ./scripts/setup-windows.ps1 -Check 2>&1
-            $code = $LASTEXITCODE
-          } catch {
-            Write-Output "::error::setup-windows.ps1 could not be started: $_"
-            exit 1
-          }
-          # Join first: `-notmatch` on an array returns the non-matching items,
-          # which is truthy whenever any line lacks the phrase.
-          $text = ($output | Out-String)
-          Write-Host $text
-          $tail = (($text -split "`n") | Select-Object -Last 10) -join ' | '
-          if ($code -gt 1) {
-            # 2 means the script could not run at all; ::error:: puts the reason
-            # somewhere that can be read without the job log.
-            Write-Output "::error::setup-windows.ps1 -Check exited $code; last lines: $tail"
-            exit 1
-          }
+          import pathlib, subprocess, sys
+
+          script = pathlib.Path("scripts/setup-windows.ps1")
+          if not script.is_file():
+              print(f"::error::missing {script}")
+              sys.exit(1)
+
+          try:
+              done = subprocess.run(
+                  ["pwsh", "-NoProfile", "-File", str(script), "-Check"],
+                  capture_output=True,
+                  text=True,
+                  errors="replace",
+                  timeout=900,
+              )
+          except Exception as error:  # noqa: BLE001 - report, never traceback
+              print(f"::error::could not run {script}: {error}")
+              sys.exit(1)
+
+          print(done.stdout)
+          if done.stderr.strip():
+              print("--- stderr ---")
+              print(done.stderr)
+
+          code = done.returncode
+          if code > 1:
+              tail = " | ".join(done.stdout.strip().splitlines()[-10:])
+              print(f"::error::{script} -Check exited {code}; last lines: {tail}")
+              sys.exit(1)
           # 1 means "something still needs a human": it must say what, and it must
           # have reached the summary instead of dying halfway through.
-          if ($code -eq 1 -and $text -notmatch 'still to do by hand') {
-            Write-Output "::error::the setup script reported a missing component without saying which; last lines: $tail"
-            exit 1
-          }
-          Write-Host "setup-windows.ps1 -Check exited $code as expected"
+          if code == 1 and "still to do by hand" not in done.stdout:
+              tail = " | ".join(done.stdout.strip().splitlines()[-10:])
+              print(f"::error::the setup script reported a missing component without saying which; last lines: {tail}")
+              sys.exit(1)
+          print(f"{script} -Check exited {code} as expected")

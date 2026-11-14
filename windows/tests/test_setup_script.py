@@ -79,37 +79,21 @@ def test_it_detects_the_virtual_camera_device_through_the_same_lookup_the_cli_us
     assert "cable input" in text.lower()
 
 
-def test_the_ci_check_reads_the_script_output_as_one_string() -> None:
-    """`-notmatch` on an array returns the *non*-matching items.
+def test_the_ci_check_supervises_the_script_from_python() -> None:
+    """The workflow must learn what happened from the exit code, not the shell.
 
-    The workflow used to test `$output -notmatch 'still to do by hand'`, which
-    is truthy whenever a single line lacks the phrase, so the step failed even
-    when the script behaved. The output has to be joined first.
+    Running the script straight from a `pwsh` step was unreliable: GitHub runs
+    that shell with `$ErrorActionPreference = 'Stop'`, so a child process writing
+    to stderr aborted the step before the code could be read. Python supervises
+    it instead, which gives an exit code and both streams.
     """
     workflow = (REPO / ".github" / "workflows" / "windows-native-vcam.yml").read_text(encoding="utf-8")
     step = workflow.split("Check the setup script is report-only", 1)[1]
 
-    assert "setup-windows.ps1 -Check" in step
-    assert "$text = ($output | Out-String)" in step
-    assert "$text -notmatch" in step
-    for line in step.splitlines():
-        assert not line.strip().startswith("#") or "$output -notmatch" not in line
-        assert "$output -notmatch" not in line, "match on $output directly: it is an array"
-
-
-def test_a_missing_package_is_data_not_a_terminating_error() -> None:
-    """Report-only mode asks Python for packages that are *not* installed.
-
-    On PowerShell 7.4+ a native command's non-zero exit can become a terminating
-    error under `$ErrorActionPreference = 'Stop'`, which would abort the script
-    before it printed its summary. The script must switch that off, and must
-    survive a probe that throws anyway.
-    """
-    text = setup_text()
-
-    assert "PSNativeCommandUseErrorActionPreference = $false" in text
-    assert text.index("PSNativeCommandUseErrorActionPreference") < text.index("Write-Step 'locating Python'")
-
-    for function in ("Get-PackageVersion", "Test-CableInstalled"):
-        body = text.split(f"function {function}", 1)[1].split("\nfunction ", 1)[0]
-        assert "try {" in body and "catch {" in body, f"{function} does not survive a failing probe"
+    assert "shell: python" in step
+    assert "subprocess.run(" in step
+    assert '"-Check"' in step
+    assert "returncode" in step
+    # Exit 1 is only acceptable when the script reached its summary and named
+    # what a human still has to install.
+    assert 'code == 1 and "still to do by hand" not in done.stdout' in step
