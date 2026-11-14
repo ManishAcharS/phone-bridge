@@ -53,6 +53,7 @@ class BridgeService : Service() {
     private var server: BridgeServer? = null
     private var beacon: DiscoveryBeacon? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var startAttempts = 0
 

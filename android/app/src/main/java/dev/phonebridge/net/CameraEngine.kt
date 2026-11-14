@@ -417,7 +417,7 @@ class CameraEngine(
      *   nothing.
      */
     private fun buildAnalysis(requested: VideoFrames.Config): ImageAnalysis {
-        val body = ImageAnalysis.Builder()
+        val builder = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setResolutionSelector(
                 ResolutionSelector.Builder()
@@ -438,7 +438,10 @@ class CameraEngine(
                     Path.RGBA -> ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888
                 }
             )
-            .build()
+        // The AE target frame rate is a *builder* option (Camera2Interop wraps the
+        // builder), so it has to go on before `build()`.
+        applyFpsRange(builder)
+        val body = builder.build()
         // Make the rotation metadata mean something. `rotationDegrees` is
         // relative to the use case's target rotation, and a use case that is
         // not attached to a window defaults that to 0 - so every frame was
@@ -448,7 +451,6 @@ class CameraEngine(
         // "turn the picture this far clockwise to be upright as the phone is
         // held now", which is exactly what the receiver does with it.
         body.targetRotation = displayRotation()
-        applyFpsRange(body)
         return body
     }
 
