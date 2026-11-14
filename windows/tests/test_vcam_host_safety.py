@@ -196,7 +196,7 @@ def test_media_foundation_startup_failure_is_propagated() -> None:
 
 def test_the_media_source_is_an_IMFMediaSourceEx() -> None:
     header = SOURCE_H.read_text(encoding="utf-8")
-    base_list = body(header, "class MediaSource", "public:")
+    base_list = runtime_base_list(header, "MediaSource")
     assert "IMFMediaSourceEx" in base_list
     assert "IMFMediaStream" in base_list
     # IMFMediaSourceEx inherits IMFMediaEventGenerator; listing it as well would
@@ -306,8 +306,26 @@ REFERENCE_SOURCE_INTERFACES = (
 )
 
 
+def runtime_base_list(header: str, class_name: str) -> str:
+    """The interface list `class_name` inherits, following a named WRL alias.
+
+    The base may be spelled `class MediaSource : public MediaSourceRuntime` with
+    `using MediaSourceRuntime = Microsoft::WRL::RuntimeClass<...>` above it, so a
+    diagnostic QueryInterface override can forward to WRL's implementation. These
+    guards are about which interfaces the object exposes, not about how the base
+    is spelled, so the alias is resolved rather than required to be inline.
+    """
+    base = body(header, f"class {class_name}", "public:")
+    derived_from = re.search(r"public\s+(\w+)\s*\{", base)
+    if derived_from:
+        alias = f"using {derived_from.group(1)} = Microsoft::WRL::RuntimeClass<"
+        if alias in header:
+            return body(header, alias, ">;")
+    return base
+
+
 def source_base_list(header: str) -> str:
-    return body(header, "class MediaSource", "public:")
+    return runtime_base_list(header, "MediaSource")
 
 
 def method_body(name: str, end_marker: str = "// ---") -> str:
