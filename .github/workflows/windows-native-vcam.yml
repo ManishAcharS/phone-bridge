@@ -66,24 +66,40 @@ jobs:
           windows/tests/test_setup_script.py
           -q
 
-      # Report-only mode: it must tell us OBS and VB-CABLE are absent on a fresh
-      # runner (exit 1) without touching the machine or failing on an error (2).
+      # Report-only mode: everything OBS and VB-CABLE related must be a message,
+      # never an installer, and a missing component must be reported, not fatal.
       - name: Check the setup script is report-only and does not crash
         shell: pwsh
         run: |
+          # Actions runs this shell with $ErrorActionPreference = 'Stop'. A child
+          # process writing to stderr would then abort the step before the exit
+          # code is read, so relax it and handle the code ourselves.
+          $ErrorActionPreference = 'Continue'
           # Run it as a child process: the script calls `exit`, which would end
           # this shell before the exit code could be inspected.
-          $output = pwsh -NoProfile -File ./scripts/setup-windows.ps1 -Check 2>&1
-          $code = $LASTEXITCODE
+          $output = @()
+          try {
+            $output = pwsh -NoProfile -File ./scripts/setup-windows.ps1 -Check 2>&1
+            $code = $LASTEXITCODE
+          } catch {
+            Write-Output "::error::setup-windows.ps1 could not be started: $_"
+            exit 1
+          }
           # Join first: `-notmatch` on an array returns the non-matching items,
           # which is truthy whenever any line lacks the phrase.
           $text = ($output | Out-String)
           Write-Host $text
-          if ($code -gt 1) { throw "setup-windows.ps1 -Check exited $code" }
-          # 1 means "something still needs a human"; it must say what, and it must
+          $tail = (($text -split "`n") | Select-Object -Last 10) -join ' | '
+          if ($code -gt 1) {
+            # 2 means the script could not run at all; ::error:: puts the reason
+            # somewhere that can be read without the job log.
+            Write-Output "::error::setup-windows.ps1 -Check exited $code; last lines: $tail"
+            exit 1
+          }
+          # 1 means "something still needs a human": it must say what, and it must
           # have reached the summary instead of dying halfway through.
           if ($code -eq 1 -and $text -notmatch 'still to do by hand') {
-            $head = ($text -split "`n" | Select-Object -First 5) -join ' / '
-            throw "the setup script reported a missing component without saying which; first lines: $head"
+            Write-Output "::error::the setup script reported a missing component without saying which; last lines: $tail"
+            exit 1
           }
           Write-Host "setup-windows.ps1 -Check exited $code as expected"

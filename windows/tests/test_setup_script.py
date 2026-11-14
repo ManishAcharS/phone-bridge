@@ -95,3 +95,21 @@ def test_the_ci_check_reads_the_script_output_as_one_string() -> None:
     for line in step.splitlines():
         assert not line.strip().startswith("#") or "$output -notmatch" not in line
         assert "$output -notmatch" not in line, "match on $output directly: it is an array"
+
+
+def test_a_missing_package_is_data_not_a_terminating_error() -> None:
+    """Report-only mode asks Python for packages that are *not* installed.
+
+    On PowerShell 7.4+ a native command's non-zero exit can become a terminating
+    error under `$ErrorActionPreference = 'Stop'`, which would abort the script
+    before it printed its summary. The script must switch that off, and must
+    survive a probe that throws anyway.
+    """
+    text = setup_text()
+
+    assert "PSNativeCommandUseErrorActionPreference = $false" in text
+    assert text.index("PSNativeCommandUseErrorActionPreference") < text.index("Write-Step 'locating Python'")
+
+    for function in ("Get-PackageVersion", "Test-CableInstalled"):
+        body = text.split(f"function {function}", 1)[1].split("\nfunction ", 1)[0]
+        assert "try {" in body and "catch {" in body, f"{function} does not survive a failing probe"

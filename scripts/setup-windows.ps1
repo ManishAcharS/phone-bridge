@@ -41,6 +41,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Several probes below run Python and *expect* a non-zero exit ("that package is
+# not installed"). On PowerShell 7.4+ a native command's exit code can be turned
+# into a terminating error, which would kill the script instead of reporting, so
+# switch that off and keep reading $LASTEXITCODE by hand.
+if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 $script:Missing = @()
 
 function Write-Step { param([string]$Text) Write-Host "==> $Text" -ForegroundColor Cyan }
@@ -85,7 +92,11 @@ function Invoke-Python {
 function Get-PackageVersion {
     param([string]$Name)
     $probe = "import importlib.metadata as m; print(m.version('$Name'))"
-    $output = Invoke-Python @('-c', $probe) 2>$null
+    try {
+        $output = Invoke-Python @('-c', $probe) 2>$null
+    } catch {
+        return $null  # not installed: the import failed, which is the answer
+    }
     if ($LASTEXITCODE -ne 0) { return $null }
     return ($output | Select-Object -First 1).Trim()
 }
@@ -149,9 +160,14 @@ names = [str(d["name"]) for d in sounddevice.query_devices()]
 hit = [n for n in names if "cable input" in n.lower()]
 print("found:" + hit[0] if hit else "missing")
 '@
-    $output = Invoke-Python @('-c', $probe) 2>$null
+    try {
+        $output = Invoke-Python @('-c', $probe) 2>$null
+    } catch {
+        return 'unknown'
+    }
     if ($LASTEXITCODE -ne 0) { return 'unknown' }
     $line = ($output | Select-Object -Last 1)
+    if ($null -eq $line) { return 'unknown' }
     if ($line -like 'found:*') { return $line.Substring(6) }
     if ($line -eq 'missing') { return $null }
     return 'unknown'
