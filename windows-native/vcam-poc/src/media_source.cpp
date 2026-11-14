@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <stdio.h>
 
 namespace phonebridge {
 
