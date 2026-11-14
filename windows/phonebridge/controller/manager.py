@@ -168,6 +168,8 @@ class Snapshot:
     camera_height: int = 720
     camera_fps: int = 15
     camera_frames: int = 0
+    #: Degrees the phone said to rotate the last frame (0/90/180/270).
+    camera_rotation: int = 0
     wifi_status: str = "not checked yet"
     server_reachable: bool | None = None
     auth_ok: bool = False
@@ -1115,6 +1117,7 @@ class ConnectionManager:
             camera_height=int(config.get("height", 720) or 720),
             camera_fps=int(config.get("fps", 15) or 15),
             camera_frames=int(snap.stats.get("received", 0) or 0),
+            camera_rotation=int(snap.stats.get("last_rotation", 0) or 0),
         )
         self._active_camera_keys(snap.state)
         if snap.state == CAMERA_ERROR:

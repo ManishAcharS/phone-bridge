@@ -276,6 +276,7 @@ class CameraStream:
         self.stats.bytes_received += len(body)
         self.stats.last_seq = frame.seq
         self.stats.last_timestamp_ms = frame.timestamp_ms
+        self.stats.last_rotation = frame.rotation
         for ordered in self._gate.offer(frame):
             # Newest wins: whatever was waiting is older than this frame.
             self._frame = ordered

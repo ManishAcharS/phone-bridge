@@ -102,6 +102,8 @@ class View:
     camera_height: int = 720
     camera_fps: int = 15
     camera_frames: int = 0
+    #: Degrees the phone said to rotate the last frame; shown for diagnosis.
+    camera_rotation: int = 0
     wifi: str = "—"
     server: str = "—"
     auth_ok: str = "—"
@@ -268,6 +270,7 @@ def build_view(snapshot: Snapshot) -> View:
         camera_height=snapshot.camera_height,
         camera_fps=snapshot.camera_fps,
         camera_frames=snapshot.camera_frames,
+        camera_rotation=snapshot.camera_rotation,
         wifi=snapshot.wifi_status or "not checked yet",
         server=server_text(snapshot),
         auth_ok=auth_text(snapshot),

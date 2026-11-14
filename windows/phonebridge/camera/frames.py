@@ -213,6 +213,10 @@ class VideoStats:
     bytes_received: int = 0
     last_seq: int = 0
     last_timestamp_ms: int = 0
+    #: What the phone said the *last* frame needed: 0/90/180/270. Shown in the
+    #: window so a sideways picture can be diagnosed from the number rather than
+    #: guessed at, and so a ROM reporting nonsense is visible immediately.
+    last_rotation: int = 0
     last_error: str = ""
 
     def to_dict(self) -> dict[str, int | str]:
@@ -227,6 +231,7 @@ class VideoStats:
             "bytes_received": self.bytes_received,
             "last_seq": self.last_seq,
             "last_timestamp_ms": self.last_timestamp_ms,
+            "last_rotation": self.last_rotation,
             "last_error": self.last_error,
         }
 
