@@ -609,3 +609,89 @@ def test_the_tone_source_is_what_was_sent(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert seen["seconds"] == 0.5
     assert seen["frequency"] == 440.0
+
+
+# --------------------------------------------------------------------------- #
+# underruns during silence are the feed's doing, not the link's
+# --------------------------------------------------------------------------- #
+def test_underruns_while_the_pc_is_silent_do_not_count_as_faults() -> None:
+    """A starved track underruns by definition; that must not read as a fault.
+
+    The reported symptom was "hundreds of underruns" from a PC that was simply
+    not playing anything: loopback delivers no packets from an idle endpoint, the
+    phone's AudioTrack runs dry, and the counter climbs. The counter is still
+    reported — as ``underruns_silent`` — but it no longer dominates the number
+    that means "this path is broken".
+    """
+
+    async def scenario():
+        session = FakePhone(status={"playback": "playing"})
+        audio = link(session)
+        # The phone starts a fresh track at zero, so the first answer is a baseline.
+        audio._absorb_phone_status({"build_id": "1.0.0 (1) abc12345", "underruns": 0})
+        audio.pc_silent = True
+        audio._absorb_phone_status({"underruns": 300})  # 300 while silent
+        while_silent = dict(audio.phone_status)
+        audio.pc_silent = False
+        audio._absorb_phone_status({"underruns": 305})  # 5 while playing
+        return while_silent, dict(audio.phone_status)
+
+    while_silent, playing = run(scenario())
+
+    assert while_silent["underruns"] == 0, "silence is not a fault"
+    assert while_silent["underruns_silent"] == 300
+    assert while_silent["underruns_total"] == 300, "the raw counter is not hidden"
+    assert playing["underruns"] == 5, "underruns while playing are the real thing"
+    assert playing["underruns_silent"] == 300
+
+
+def test_the_phone_build_reaches_the_status_the_runner_reads() -> None:
+    async def scenario():
+        session = FakePhone(status={"build_id": "1.0.0 (1) e807c93a", "route": "speaker"})
+        audio = link(session)
+        await audio.start_playback()
+        try:
+            assert await wait_for(lambda: "build_id" in audio.phone_status)
+            return audio.snapshot()
+        finally:
+            await audio.close()
+
+    snapshot = run(scenario())
+
+    assert snapshot.phone["build_id"] == "1.0.0 (1) e807c93a"
+    assert "keepalive_frames" in snapshot.stats
+
+
+def test_the_status_line_says_zero_when_every_underrun_was_silence() -> None:
+    """`underruns 312` from a silent PC read as a broken link. It was a starved one."""
+    status = LiveStatus(
+        connected=True,
+        speaker_state="active",
+        latency_ms=60,
+        speaker_stats={
+            "rx_fps": 50.0,
+            "written_fps": 50.0,
+            "underruns": 0,
+            "underruns_silent": 312,
+            "underruns_total": 312,
+        },
+        pc_silent=True,
+    )
+
+    line = status.line()
+
+    assert "pc silent" in line
+    assert "underruns 0 (silent 312 of 312)" in line, line
+    assert "rx 50 f/s" in line, "keep-alive at 20 ms shows up as 50 frames a second"
+
+
+def test_a_real_underrun_is_still_printed_first() -> None:
+    status = LiveStatus(
+        connected=True,
+        speaker_state="active",
+        speaker_stats={"underruns": 5, "underruns_silent": 300, "underruns_total": 305},
+    )
+
+    line = status.line()
+
+    assert "underruns 5 (silent 300 of 305)" in line, line

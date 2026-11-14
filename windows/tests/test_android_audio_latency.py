@@ -95,8 +95,11 @@ def test_an_adaptive_target_grows_on_underruns_and_shrinks_only_on_quiet() -> No
     assert "track.underrunCount" in body
     assert "targetFrames++" in body and "targetFrames--" in body
     assert "fresh > 0 || wasEmpty" in body
-    # Silence is not pressure: nothing written and nothing underrun teaches nothing.
-    assert "if (writes == 0 && fresh == 0) return" in body
+    # Silence is not pressure: with nothing written in the window the queue was
+    # never starved by the *sender*, so neither an empty queue nor an underrun
+    # may grow it (the PC's loopback underruns continuously while silent).
+    assert "if (writes == 0) return" in body
+    assert "if (writes == 0 && fresh == 0) return" not in body
     assert "if (!adaptive) return" in body
 
 

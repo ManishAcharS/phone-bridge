@@ -274,6 +274,65 @@ frame arrived from the socket, then when `playbackHeadPosition` passed the frame
 wrote. That is arrival → the mixer consuming it. The `AudioTrack` buffer is
 *inside* that number, not additional, which is why the table says so.
 
+### 7b. Which device is captured, and why the PC keeps playing
+
+WASAPI loopback copies what an **endpoint renders**. Capturing the default output
+is therefore capturing the speakers: the person at the PC hears everything, and
+the phone hears the same thing a moment later. Muting that endpoint in Windows
+also zeroes what loopback hands over, so "mute it so I do not have to listen" is
+the one workaround that cannot work.
+
+The good setup gives the phone its **own** endpoint:
+
+```
+  app (Zoom, a player, a browser)  ->  "CABLE-A Input"   (a second virtual cable)
+                                             |
+                                             +--> WASAPI loopback --> phone --> headphones
+                                             |
+                                    nothing is connected to its output
+                                             |
+  PC speakers (default output)     <-  everything else, unchanged
+```
+
+1. Install a **second** virtual cable so the microphone keeps its own:
+   VB-CABLE's A+B pack gives `CABLE Input`/`CABLE Output` (the microphone, as
+   before) plus `CABLE-A Input`/`CABLE-A Output`. VoiceMeeter's virtual inputs work
+   too. `scripts/setup-windows.ps1` now says which cables it can see.
+2. Send the audio you want on the phone to it — either:
+   * **everything**: Settings → System → Sound → set the output to *CABLE-A Input*,
+     and keep your actual speakers selected in the app you are listening from; or
+   * **one application**: Settings → System → Sound → **Volume mixer** → set that
+     app's *Output device* to *CABLE-A Input* (Windows 11 keeps this per app).
+3. Capture that device, not the default:
+
+   ```powershell
+   phonebridge speaker --list-loopback-devices
+   phonebridge speaker --loopback-device "CABLE-A Input"
+   phonebridge start --camera --mic --speaker --loopback-device "CABLE-A Input"
+   ```
+
+`--list-loopback-devices` marks the default output and every virtual cable it can
+see, and says which of them will still be heard in the room:
+
+```
+  devices this PC can capture (WASAPI loopback)
+  ------------------------------------------------------------------
+  Speakers (Realtek(R) Audio)  [default output]
+    2 ch, 48000 Hz
+  CABLE-A Input (VB-Audio Cable A)  [virtual cable]
+    2 ch, 48000 Hz
+  CABLE Input (VB-Audio Virtual Cable)  [virtual cable]
+    2 ch, 48000 Hz
+```
+
+`--loopback-device` matches a **substring** of the name, case-insensitively, so
+`--loopback-device cable-a` is enough. `--loopback` is the same flag under its old
+name. Nothing is muted or rerouted by PhoneBridge itself: it reads the endpoint the
+user chose and leaves Windows' audio configuration alone.
+
+Capturing the same cable the microphone writes to is the one combination to avoid:
+the phone would play its own microphone back to itself.
+
 ### `rx 0 f/s` is usually not a fault
 
 WASAPI loopback captures what the *endpoint* renders. When nothing on the PC is
@@ -292,6 +351,75 @@ link up | speaker active pc-buf 60 ms -> bluetooth_a2dp pc silent rx 0 f/s ...
 the PC is silent, so the phone's `AudioTrack` and the Bluetooth link stay warm and
 playback does not re-buffer the moment something does start playing. It costs
 about 24 KB/s and changes nothing else.
+
+The cadence is the whole point, and it was wrong: the feed ran at about **20
+frames a second** for a 20 ms frame, so the track underran continuously — hundreds
+of underruns, from a path that was working. Two things were wrong and both are
+fixed:
+
+* the feeding shared a loop with the silence *watcher*, so half of every cycle
+  went into observing instead of sending;
+* it slept *between* frames, so every period was `frame + work`, not `frame`.
+
+The keep-alive now runs on its own loop against an absolute deadline
+(`next_at += 20 ms`), which holds 50 frames a second; a late tick resets the
+schedule instead of firing a burst the phone cannot use. Two consequences worth
+knowing:
+
+* `stale`/dropped frames stay zero while the PC is silent, because silence is now
+  paced rather than burst;
+* underruns reported **while the PC is silent** are counted apart, as
+  `underruns_silent`, and do not inflate `underruns`. A starved track underruns by
+  definition; counting that as a fault made a healthy stream look broken. The raw
+  counter is still there as `underruns_total`, and the phone (`AudioEngine.adapt`)
+  no longer grows its queue for underruns reported while nothing was written — it
+  used to sit at eight frames of latency for audio nobody sent.
+
+```
+link up | speaker active pc-buf 60 ms -> bluetooth_a2dp pc silent rx 50 f/s
+         wrote 50 f/s target 60 ms underruns 0 (silent 312 of 312)
+```
+
+`rx 50 f/s` next to `pc silent` *is* the keep-alive working: the phone is receiving a
+frame every 20 ms while the PC plays nothing. Without keep-alive the same line says
+`pc silent rx 0 f/s`, which is correct too.
+
+### 7c. Which build is on the phone
+
+`speaker --latency-test` used to end with *"the phone never reported the probe
+reaching its mixer"* in two very different situations: an APK that predates the
+probe, and an APK whose probe is broken. Nothing on the wire carried a version, so
+the message could not be more specific.
+
+The APK now names itself — `BuildInfo.id`, `1.0.0 (1) e807c93a` (version, version
+code, short git commit, with `nogit` for a source archive) — in three places:
+
+| where | field | why |
+| --- | --- | --- |
+| handshake (`auth_ok` / `pair_required`) | `build`, `features` | the first thing the PC sees, before any command |
+| `system.info` | `build_id`, `git_sha` | `phonebridge info`, and any bug report |
+| `audio.status`, `camera.status` | `build_id` | survives a reconnect; travels with the numbers it explains |
+
+`features` is a map of booleans (`latency_probe`, `fps_range`, `adaptive_queue`),
+so a capability that is *missing* reads `false` instead of timing out. The PC
+prints the build at connect:
+
+```
+connected to Xiaomi 24115RA8EI (paired) over usb - app 1.0.0 (1) e807c93a
+```
+
+and, on an older APK, says so instead of pretending:
+
+```
+connected to Xiaomi 24115RA8EI (paired) over usb - app build not reported (APK older than this field)
+phone app build not reported: its APK predates both the build id and the latency
+  probe, so there is nothing to time yet.
+```
+
+`--latency-test` checks `features.latency_probe` from the handshake **before**
+starting the measurement, so the six-second wait for a probe that cannot come is
+gone. `phonebridge selftest` treats both keys as optional — an old APK is a
+finding, not a failure — and prints `app build not reported (older APK)`.
 
 ## 8. Known limitations
 

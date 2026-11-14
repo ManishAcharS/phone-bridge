@@ -362,7 +362,8 @@ it is just not evidence that the phone played anything.
 | --- | --- |
 | `--test-tone` | 440 Hz at -12 dBFS for 3 s instead of WASAPI loopback, then exits by itself |
 | `--muted` | start muted (silence with the `MUTED` flag); the default sends audio, because that is the command's job |
-| `--loopback NAME` | with a real run, pick the output device to capture |
+| `--loopback-device NAME` (alias `--loopback`) | with a real run, pick the output device to capture; see `docs/19` §7b for the two-cable setup |
+| `--list-loopback-devices` | every device this PC can capture, with the default and the virtual cables marked; no phone needed |
 
 The two numbers to watch, both from the phone:
 
@@ -372,9 +373,41 @@ The two numbers to watch, both from the phone:
   JSON (`--format json`), which says `playing`, `paused`, `stopped` or
   `no_track`.
 
+`underruns N (silent M of T)` splits the phone's counter in two: `M` happened while
+this PC was sending nothing, which is what a starved track does, and `N` happened
+while audio was flowing, which is the number worth chasing. `docs/19` §7a has the
+keep-alive side of it (50 frames a second, not 20).
+
 The tone is an `AudioSource` like the loopback one, so its frames ride the same
 queue, the same encrypted session and the same protocol frames. Nothing about
 the wire format changes: this is a test of the phone, using the production path.
+
+## 7a. The app build, on the connect line
+
+Every run prints which APK it is talking to, because "the feature does nothing" and
+"the APK is old" are indistinguishable from outside:
+
+```
+connected to Xiaomi 24115RA8EI (paired) over usb - app 1.0.0 (1) e807c93a
+```
+
+An APK that predates the field prints `app build not reported (APK older than this
+field)`, which is the diagnosis rather than a gap. `docs/19` §7c lists where the id
+travels (handshake, `system.info`, `audio.status`, `camera.status`) and why.
+
+## 7b. The camera status line, and its spike line
+
+`--stats` prints a second line only when a stage had a bad frame:
+
+```
+  pc   19.4 fps  rx 20  57 KB/frame  decode   3.1 ms  convert  1.2 ms  send 0.9 ms  queue 0  dropped 0
+  peak decode 45.2 ms   (worst in the last second)
+```
+
+A mean cannot show a 45 ms frame among fifty 3 ms ones, and that is exactly the
+frame that gets dropped. Which stage is named is the diagnosis: `decode` is
+allocation/GC on this PC, `send` is the virtual-camera consumer, `convert` is the
+numpy copy. `docs/20` §8.4 has the measurements and the thread split.
 
 ## 8. Known limits, stated plainly
 
@@ -424,7 +457,9 @@ the wire format changes: this is a test of the phone, using the production path.
 | speaker line says `-> speaker` but you expected headphones | Android did not route to Bluetooth | pair the headset with the *phone* and check its media output; PhoneBridge never pairs anything |
 | `underruns` climbing | the phone's device buffer ran dry — usually a slow link or a stalled stream | check `dropped` in `--format json` and whether the link is on USB; a Bluetooth route adds its own buffering |
 | silence with `pc-buf 200 ms` and no phone numbers on the line | an APK older than this build, so `audio.status` has no playback block | no fix needed on the PC; the telephone-side numbers need the current APK |
-| `speaker` runs but nothing is audible anywhere | the PC is capturing the wrong output, or nothing is playing | `--loopback "Speakers"`, and remember WASAPI loopback captures the *device*, not the application |
+| `speaker` runs but nothing is audible anywhere | the PC is capturing the wrong output, or nothing is playing | `--list-loopback-devices`, then `--loopback-device "<name>"`; loopback captures the *device*, not the application |
+| the PC's own speakers keep playing | you are capturing the default output, which is what you hear | that is the point of loopback; capture a second virtual cable instead (`docs/19` §7b) and send the app's output there |
+| muting Windows silences the phone too | muting an endpoint zeroes what WASAPI loopback hands over | do not mute the captured endpoint; give the phone its own virtual cable and leave that one unmuted |
 | `dtype mismatch: 'bytes…' vs 'int16'` | a sounddevice `OutputStream` (numpy arrays) was used for raw PCM — fixed; you are on an older build | `py -3 -m pip install -e .\windows` from the branch head |
 | `the output device accepts none of these formats` | the endpoint will not take 48 kHz mono or stereo | set the device to 48 kHz (Windows sound settings or the VB-CABLE control panel) |
 | phone microphone audible but fast/high-pitched | the capture rate was not the device's rate | fixed by negotiation; if you still hear it, note the device's rate in `sounddevice.query_devices()` |

@@ -447,3 +447,83 @@ def test_the_playback_stop_path_leaves_nothing_polling():
         return link
 
     run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# the build id: "the APK is old" has to be readable, not guessed
+# --------------------------------------------------------------------------- #
+def test_the_latency_failure_names_the_phone_build():
+    """The one number that turns "it does not work" into "install the new APK"."""
+    import pytest
+
+    async def scenario():
+        session = PhoneSession({"build_id": "0.9.0 (7) deadbeef", "playback": "playing"})
+        link = _link(session, SilentSource(), probe=True)
+        await link.start_playback()
+        try:
+            with pytest.raises(AudioError) as caught:
+                await link.measure_latency(timeout_s=0.6)
+            return str(caught.value)
+        finally:
+            await link.stop_playback()
+
+    message = run(scenario())
+
+    assert "never reported the probe" in message
+    assert "0.9.0 (7) deadbeef" in message, "the build is the diagnosis, so it belongs here"
+
+
+def test_the_latency_failure_says_when_the_apk_reports_no_build():
+    import pytest
+
+    async def scenario():
+        session = PhoneSession({"playback": "playing"})  # an APK older than the field
+        link = _link(session, SilentSource(), probe=True)
+        await link.start_playback()
+        try:
+            with pytest.raises(AudioError) as caught:
+                await link.measure_latency(timeout_s=0.6)
+            return str(caught.value)
+        finally:
+            await link.stop_playback()
+
+    message = run(scenario())
+
+    assert "no build id at all" in message
+    assert "predates" in message, "say what an absent build id means"
+
+
+def test_keep_alive_paces_at_the_frame_period_not_at_twice_it():
+    """The reported bug: ~20 frames/s from a 20 ms frame, so the track starved.
+
+    Fifty frames a second is what an AudioTrack at 20 ms consumes; anything below
+    that underruns continuously during silence. The feed used to spend half of
+    every cycle inside the silence watcher, which is exactly 20 a second.
+    """
+    import time
+
+    async def scenario():
+        session = PhoneSession()
+        link = _link(session, SilentSource(), keep_alive=True)
+        await link.start_playback()
+        try:
+            for _ in range(300):
+                if link.pc_silent:
+                    break
+                await asyncio.sleep(0.02)
+            assert link.pc_silent
+            before = len(session.audio)
+            started = time.monotonic()
+            await asyncio.sleep(1.2)
+            elapsed = time.monotonic() - started
+            return len(session.audio) - before, elapsed
+        finally:
+            await link.stop_playback()
+
+    sent, elapsed = run(scenario())
+    rate = sent / elapsed
+
+    assert rate >= 40, (
+        f"keep-alive sent {sent} frames in {elapsed:.2f} s ({rate:.0f}/s); the phone "
+        "consumes 50 a second at 20 ms and underruns below that"
+    )

@@ -219,3 +219,69 @@ def test_the_readme_has_a_daily_use_section_naming_the_launcher() -> None:
     assert "OBS Virtual Camera" in section
     assert "CABLE Output" in section
     assert "--host" in section or "-HostName" in section
+
+
+# --------------------------------------------------------------------------- #
+# the crash: "Cannot bind argument to parameter 'Path' because it is null"
+# --------------------------------------------------------------------------- #
+def test_the_launcher_never_derives_its_own_path_from_a_function() -> None:
+    """`$MyInvocation.MyCommand.Path` is empty inside a function — that was the crash.
+
+    The launcher asked a helper where it lived; a function has no script path, so
+    the value was ``$null``, ``Split-Path -Parent $null`` refused to bind, and the
+    script died at ``==> locating Python`` before doing anything at all.
+    """
+    text = code_only(ps1())
+
+    script_root = text.index("$PSScriptRoot")
+    assert "$PSScriptRoot" in text
+    # It may still be a *guarded* fallback for hosts that do not set $PSScriptRoot,
+    # but only after $PSScriptRoot was tried, and only behind an if().
+    for line in text.splitlines():
+        if "$MyInvocation.MyCommand.Path" in line:
+            assert line.strip().startswith("if ("), line
+            assert text.index(line) > script_root, "the script's own folder is tried first"
+
+
+def test_every_path_root_is_guarded_before_it_is_used() -> None:
+    """A null root must produce "no Python found", not a parameter-binding error."""
+    text = code_only(ps1())
+
+    # Join-Path, Test-Path and Get-ChildItem all reject a null -Path.
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("Join-Path", "Get-ChildItem", "Test-Path")):
+            assert "$null" not in stripped, stripped
+    assert "Test-Path $root" in text or "Test-Path -LiteralPath $root" in text
+
+
+def test_a_failure_names_the_step_the_expectation_and_the_fix() -> None:
+    """The contract the user asked for: readable, not a PowerShell parameter dump."""
+    text = ps1()
+
+    assert "trap" in text.lower()
+    assert "python -m phonebridge start" in text, (
+        "when the launcher itself fails it must print the command that does the work"
+    )
+    assert "interpreter" in text.lower() and "3.10" in text
+    assert "pip install -e" in text or "-m pip install" in text
+
+
+def test_python_discovery_uses_the_real_interpreter_launchers() -> None:
+    text = code_only(ps1())
+
+    for candidate in ("'py'", "'python'", "'python3'", ".venv", "LOCALAPPDATA", "ProgramFiles"):
+        assert candidate in text, candidate
+    # `-Command[1..($Command.Count - 1)]` counts *down* for one element, so a bare
+    # `python` became `python.exe <path to python>` and every probe failed.
+    assert "Select-Object -Skip 1" in text
+    assert not re.search(r"\[\s*1\s*\.\.\s*\(", text)
+
+
+def test_the_launcher_can_capture_a_second_cable() -> None:
+    """The room keeps hearing the PC otherwise: loopback copies the default output."""
+    text = code_only(ps1())
+
+    assert "[string]$LoopbackDevice" in text
+    assert "'--loopback-device', $LoopbackDevice" in text
+    assert "list-loopback-devices" in text, "point at the command that explains the choice"

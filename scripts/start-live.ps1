@@ -74,7 +74,11 @@ param(
     [switch]$KeepAlive,
     [double]$Duration = 0,
     [switch]$SkipChecks,
-    [string]$Python
+    [string]$Python,
+    # Which output the speaker path captures, as a name substring. Empty means the
+    # default output - which is also the speakers you are listening to, so the PC
+    # keeps playing. A second virtual cable is what makes the capture private.
+    [string]$LoopbackDevice = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -83,6 +87,18 @@ $ErrorActionPreference = 'Stop'
 # Switch that off and read $LASTEXITCODE by hand, like setup-windows.ps1 does.
 if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
     $PSNativeCommandUseErrorActionPreference = $false
+}
+
+# Anything that escapes the checks below is a bug in *this script*, and a raw
+# PowerShell stack trace is not a useful thing to hand somebody at 9 a.m. Say what
+# happened, say it is the launcher's fault, and print the command that works.
+trap {
+    Write-Host ''
+    Write-Host '  the launcher hit an unexpected error:' -ForegroundColor Red
+    Write-Host "    $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host '  that is a bug in start-live.ps1, not in the bridge. Start it yourself:' -ForegroundColor DarkGray
+    Write-Host "    python -m phonebridge start --camera --mic --speaker --host $HostName --port $Port" -ForegroundColor DarkGray
+    exit 1
 }
 
 $script:Failures = @()
@@ -94,21 +110,121 @@ function Write-Warn { param([string]$Text) Write-Host "  [warn] $Text" -Foregrou
 function Write-Bad  { param([string]$Text) Write-Host "  [fail] $Text" -ForegroundColor Red }
 function Write-Hint { param([string]$Text) Write-Host "         $Text" -ForegroundColor DarkGray }
 
+function Get-ScriptDirectory {
+    # `$MyInvocation.MyCommand.Path` is null inside a *function* - a function has no
+    # path - and `Split-Path -Parent $null` throws "Cannot bind argument to
+    # parameter 'Path' because it is null" before any useful fallback runs. That is
+    # exactly how this script failed the first time it was run. $PSScriptRoot is the
+    # script's own folder and needs no call at all; the other two are fallbacks for
+    # `powershell -File` in odd hosts, guarded rather than assumed.
+    if ($PSScriptRoot) { return $PSScriptRoot }
+    if ($MyInvocation.MyCommand.Path) { return (Split-Path -Parent $MyInvocation.MyCommand.Path) }
+    return (Get-Location).ProviderPath
+}
+
+$script:RepoRoot = Split-Path -Parent (Get-ScriptDirectory)
+
+function Invoke-PythonCandidate {
+    # A candidate is an *array*: `py -3` is a launcher plus an argument, and Python
+    # 3.14 from python.org is a path. Slicing with `$Command[1..($Command.Count-1)]`
+    # silently turns a one-element command into `python.exe <itself>` (PowerShell
+    # ranges count *down*), so the tail is built by hand.
+    param([string[]]$Command, [string[]]$Arguments)
+    $exe = $Command[0]
+    $prefix = @()
+    if ($Command.Count -gt 1) {
+        $prefix = @($Command | Select-Object -Skip 1)
+    }
+    return (& $exe @prefix @Arguments 2>$null)
+}
+
+function Test-Interpreter {
+    # A candidate is only a candidate: it has to run, and it has to be Python 3.10+.
+    # `py -3` and the Store alias for `python` both exist on PATH without being a
+    # usable interpreter, which is why "Get-Command python" was never enough.
+    param([string[]]$Command)
+    try {
+        $output = Invoke-PythonCandidate -Command $Command -Arguments @(
+            '-c', 'import sys; print(sys.version_info[0], sys.version_info[1])'
+        )
+    } catch {
+        return $null
+    }
+    if ($LASTEXITCODE -ne 0 -or -not $output) { return $null }
+    $parts = ("$output").Trim().Split(' ')
+    if ($parts.Count -lt 2) { return $null }
+    $major = [int]$parts[0]
+    $minor = [int]$parts[1]
+    if ($major -lt 3 -or ($major -eq 3 -and $minor -lt 10)) { return $null }
+    return "$major.$minor"
+}
+
+function Test-PhonebridgeImportable {
+    param([string[]]$Command)
+    try {
+        Invoke-PythonCandidate -Command $Command -Arguments @('-c', 'import phonebridge') | Out-Null
+    } catch {
+        return $false
+    }
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Get-PythonCandidates {
+    # Ordered by how likely each one is to be the interpreter setup-windows.ps1
+    # installed into. The repo's virtualenv wins, then the launcher `py`, then
+    # every python on PATH, then the per-user installs under AppData - Python 3.14
+    # from python.org installs to %LOCALAPPDATA%\Programs\Python\Python314 and is
+    # on PATH for the *user* only, which is easy to miss from an elevated shell.
+    $candidates = @()
+    if ($Python) { $candidates += , @($Python) }
+    foreach ($venv in @('.venv', 'venv')) {
+        $exe = Join-Path (Join-Path $script:RepoRoot $venv) 'Scripts\python.exe'
+        if (Test-Path $exe) { $candidates += , @($exe) }
+    }
+    foreach ($name in @(@('py', '-3'), @('py'), @('python'), @('python3'))) {
+        if (Get-Command $name[0] -ErrorAction SilentlyContinue) { $candidates += , $name }
+    }
+    # Per-user installs: Python 3.14 from python.org lands in
+    # %LOCALAPPDATA%\Programs\Python\Python314 and is only on the *user* PATH,
+    # which an elevated shell does not inherit. Both roots are checked, and only
+    # when the variable actually holds a path.
+    $roots = @()
+    if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA 'Programs\Python') }
+    if ($env:ProgramFiles) { $roots += $env:ProgramFiles }
+    foreach ($root in $roots) {
+        # Guarded, not assumed: Join-Path and Get-ChildItem both refuse a null path,
+        # and a thrown binding error here is the same class of crash as the one that
+        # stopped the script before it started.
+        if (-not $root -or -not (Test-Path $root)) { continue }
+        foreach ($pattern in @('Python3*\python.exe', 'Python3*\python3.exe')) {
+            $path = Join-Path $root $pattern
+            foreach ($exe in @(Get-ChildItem -Path $path -ErrorAction SilentlyContinue)) {
+                if ($exe.PSIsContainer) { continue }
+                $candidates += , @($exe.FullName)
+            }
+        }
+    }
+    return $candidates
+}
+
 function Resolve-Python {
-    if ($Python) {
-        if (-not (Get-Command $Python -ErrorAction SilentlyContinue)) { return $null }
-        return @($Python)
+    # Returns @{ Command = @(...); Version = '3.x'; HasPackage = $true/$false } for
+    # the first interpreter that runs *and* can import phonebridge. A working
+    # interpreter without the package is remembered, so the message can say
+    # "Python 3.14 is here, it just does not have phonebridge installed" instead of
+    # the useless "Python was not found".
+    $fallback = $null
+    foreach ($candidate in (Get-PythonCandidates)) {
+        $version = Test-Interpreter -Command $candidate
+        if (-not $version) { continue }
+        if (Test-PhonebridgeImportable -Command $candidate) {
+            return @{ Command = $candidate; Version = $version; HasPackage = $true }
+        }
+        if (-not $fallback) {
+            $fallback = @{ Command = $candidate; Version = $version; HasPackage = $false }
+        }
     }
-    # The repo's own virtualenv first: running a different interpreter than the
-    # one setup-windows.ps1 installed into is the classic "it says sounddevice is
-    # missing but it is installed" morning.
-    $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-    $venv = Join-Path $repo '.venv\Scripts\python.exe'
-    if (Test-Path $venv) { return @($venv) }
-    foreach ($candidate in @(@('py', '-3'), @('python'))) {
-        if (Get-Command $candidate[0] -ErrorAction SilentlyContinue) { return $candidate }
-    }
-    return $null
+    return $fallback
 }
 
 function Invoke-Phonebridge {
@@ -180,24 +296,25 @@ Write-Host '--------------------------------------------------------------'
 Write-Host ''
 
 Write-Step 'locating Python'
-$script:PythonCommand = Resolve-Python
-if (-not $script:PythonCommand) {
-    Write-Bad 'Python 3.10+ was not found (and there is no .venv in this repo).'
-    Write-Hint 'install Python from https://www.python.org/downloads/windows/ then run'
-    Write-Hint '  powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1'
+$resolved = Resolve-Python
+if (-not $resolved) {
+    Write-Bad 'no usable Python was found (this needs Python 3.10 or newer).'
+    Write-Hint 'looked at: .venv\Scripts\python.exe, venv\Scripts\python.exe, py -3, py, python,'
+    Write-Hint 'python3, %LOCALAPPDATA%\Programs\Python\Python3*\python.exe, %ProgramFiles%\Python3*'
+    Write-Hint 'install it from https://www.python.org/downloads/windows/ (tick "Add python.exe to PATH")'
+    Write-Hint 'then run: powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1'
+    Write-Hint 'or point this script at one directly: start-live.bat -Python C:\Python311\python.exe'
     exit 2
 }
-$version = (& $script:PythonCommand @('-c', "import sys; print('%d.%d.%d' % sys.version_info[:3])")).Trim()
-$moduleOk = $true
-& $script:PythonCommand @('-c', 'import phonebridge') 2>$null
-if ($LASTEXITCODE -ne 0) { $moduleOk = $false }
-if (-not $moduleOk) {
-    Write-Bad "Python $version has no phonebridge package installed"
-    Write-Hint 'from the repo root: python -m pip install -e .\windows'
-    Write-Hint '(or run this script from the repo and let it find .venv)'
+$script:PythonCommand = $resolved.Command
+if (-not $resolved.HasPackage) {
+    Write-Bad "Python $($resolved.Version) at $($script:PythonCommand -join ' ') cannot import phonebridge"
+    Write-Hint 'the interpreter works, the package is not installed into it. From the repo root:'
+    Write-Hint "  $($script:PythonCommand -join ' ') -m pip install -e .\windows"
+    Write-Hint 'or run setup-windows.ps1, which installs into a .venv this script prefers.'
     exit 2
 }
-Write-Ok "Python $version ($($script:PythonCommand -join ' ')) - phonebridge importable"
+Write-Ok "Python $($resolved.Version) ($($script:PythonCommand -join ' ')) - phonebridge importable"
 Write-Host ''
 
 if (-not $SkipChecks) {
@@ -259,6 +376,15 @@ if (-not $SkipChecks) {
         Write-Hint 'install from https://vb-audio.com/Cable/ then REBOOT, and run setup-windows.ps1'
         $script:Warnings += 'VB-CABLE'
     }
+    # The speaker path captures an *output*, and by default that is the one you are
+    # listening to - so the PC keeps playing and muting it kills the phone's audio.
+    # A second cable is the fix, and it is worth saying here rather than in a doc.
+    if ($LoopbackDevice) {
+        Write-Ok "speaker captures: $LoopbackDevice"
+    } elseif ($cable -and $cable -ne 'unknown') {
+        Write-Hint 'speaker captures the default output unless you pass -LoopbackDevice:'
+        Write-Hint '  phonebridge speaker --list-loopback-devices   (a second VB-CABLE keeps the room quiet)'
+    }
     Write-Host ''
 
     Write-Step 'Python packages for the live paths'
@@ -303,6 +429,7 @@ $arguments = @(
     '--fps-mode', $FpsMode
 )
 if ($KeepAlive) { $arguments += '--keep-alive' }
+if ($LoopbackDevice) { $arguments += @('--loopback-device', $LoopbackDevice) }
 if ($Duration -gt 0) { $arguments += @('--duration', "$Duration") }
 
 Write-Step "starting: camera + microphone + speaker"

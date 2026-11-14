@@ -22,8 +22,12 @@ decode and ~7 ms when the device wants 480p (with ``Image.draft``, see
 :func:`phonebridge.camera.preview.decode_into_box`). Two of those per tick is
 already over budget, which is why the numbers on a real call were 5-8 fps.
 
-This pump is deliberately the simplest thing that removes all three: one
-thread, one slot, newest wins. Frames are **dropped, not queued** — a late
+This pump removes all four the same way: one slot, newest wins, and the two
+stages that behave differently — a CPU-bound decode, and a device send that
+blocks until the consumer takes the frame — on their own threads. A slow
+consumer used to hold the decoder, so *incoming* frames piled up and were
+dropped; now a stalled send costs at most the one frame in flight. Frames are
+**dropped, not queued** — a late
 frame is worth less than the newest one — and the asyncio loop only ever hands a
 frame over.
 """
@@ -40,6 +44,9 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+#: A stage costing this long, even once, costs a frame at 20-30 fps.
+SPIKE_MS = 25.0
+
 
 @dataclass(frozen=True)
 class PumpSnapshot:
@@ -55,6 +62,13 @@ class PumpSnapshot:
     decode_ms: float = 0.0
     convert_ms: float = 0.0
     send_ms: float = 0.0
+    #: Worst sample of each stage in the last second. A mean hides a 45 ms spike
+    #: among fifty 3 ms frames, and the spike is what costs a frame.
+    decode_peak_ms: float = 0.0
+    convert_peak_ms: float = 0.0
+    send_peak_ms: float = 0.0
+    #: Decoded, then replaced before the device took it.
+    stale: int = 0
     decode_error: str = ""
     send_error: str = ""
     decode_failures: int = 0
@@ -75,6 +89,10 @@ class PumpSnapshot:
             "decode_ms": round(self.decode_ms, 2),
             "convert_ms": round(self.convert_ms, 2),
             "send_ms": round(self.send_ms, 2),
+            "decode_peak_ms": round(self.decode_peak_ms, 2),
+            "convert_peak_ms": round(self.convert_peak_ms, 2),
+            "send_peak_ms": round(self.send_peak_ms, 2),
+            "stale": self.stale,
         }
 
 
@@ -92,6 +110,12 @@ class _Mean:
         cutoff = now - self._window
         values = [value for timestamp, value in self._samples if timestamp >= cutoff]
         return sum(values) / len(values) if values else 0.0
+
+    def peak(self, now: float) -> float:
+        """The worst sample in the window: the frame that got dropped."""
+        cutoff = now - self._window
+        values = [value for timestamp, value in self._samples if timestamp >= cutoff]
+        return max(values) if values else 0.0
 
 
 class CameraPump:
@@ -134,6 +158,15 @@ class CameraPump:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+        # Decoded frames wait here for the device, on their own condition: the
+        # decoder never touches the sink, so a send that blocks (pyvirtualcam's
+        # backend waits for its consumer) cannot delay the next decode and turn
+        # a full incoming stream into drops.
+        self._send_cond = threading.Condition()
+        self._ready: tuple[Any, ...] | None = None
+        self._send_thread: threading.Thread | None = None
+        self._stale = 0
+
         self._received = 0
         self._sent = 0
         self._dropped = 0
@@ -156,8 +189,11 @@ class CameraPump:
         if self._thread is not None:
             return
         thread = threading.Thread(target=self._run, name="phonebridge-vcam-pump", daemon=True)
+        sender = threading.Thread(target=self._send_loop, name="phonebridge-vcam-send", daemon=True)
         self._thread = thread
+        self._send_thread = sender
         thread.start()
+        sender.start()
 
     def submit(self, frame: Any) -> bool:
         """Offer a frame. Returns True when it displaced one that was waiting.
@@ -181,16 +217,24 @@ class CameraPump:
         self._stop.set()
         with self._cond:
             self._cond.notify_all()
-        thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
+        with self._send_cond:
+            self._send_cond.notify_all()
+        current = threading.current_thread()
+        for thread in (self._thread, self._send_thread):
+            if thread is not None and thread is not current:
+                thread.join(timeout=2.0)
         self._thread = None
+        self._send_thread = None
 
     def snapshot(self) -> PumpSnapshot:
         now = self._perf()
         with self._cond:
             received, sent, dropped = self._received, self._sent, self._dropped
             depth = 1 if self._pending is not None else 0
+            stale = self._stale
+        with self._send_cond:
+            if self._ready is not None:
+                depth += 1
             decode_error, send_error = self._decode_error, self._send_error
             failures = self._decode_failures
             bytes_in, chunks = self._bytes, self._chunks
@@ -205,6 +249,10 @@ class CameraPump:
             decode_ms=self._decode_ms.mean(now),
             convert_ms=self._convert_ms.mean(now),
             send_ms=self._send_ms.mean(now),
+            decode_peak_ms=self._decode_ms.peak(now),
+            convert_peak_ms=self._convert_ms.peak(now),
+            send_peak_ms=self._send_ms.peak(now),
+            stale=stale,
             decode_error=decode_error,
             send_error=send_error,
             decode_failures=failures,
@@ -259,27 +307,21 @@ class CameraPump:
             return frame
 
     def _blank_if_stalled(self) -> None:
-        """Nothing new arrived: keep the last picture, then go black."""
-        if self._stall_s <= 0 or not self._last_sent_at or self._blanked:
-            return
-        if self._clock() - self._last_sent_at <= self._stall_s:
-            return
-        if self._send_error:
-            return
-        started = self._perf()
-        try:
-            self._sink.send_black()
-        except Exception as exc:  # noqa: BLE001 - the device died, the session did not
-            with self._cond:
-                self._send_error = f"{type(exc).__name__}: {exc}"
-            return
-        finished = self._perf()
-        self._blanked = True
+        """Nothing new arrived: keep the last picture, then go black.
+
+        The blank is *posted* to the sender rather than sent here, so the sink is
+        only ever touched by one thread.
+        """
         with self._cond:
-            self._sent += 1
-            self._send_ms.add(finished, (finished - started) * 1000.0)
+            if self._stall_s <= 0 or self._blanked or self._send_error:
+                return
+            last_sent = self._last_sent_at
+        if not last_sent or self._clock() - last_sent <= self._stall_s:
+            return
+        self._offer_ready(("blank",), count_stale=False)
 
     def _publish(self, frame: Any) -> None:
+        """Decode and convert one frame, then hand it to the sender."""
         started = self._perf()
         try:
             image = self._decode(frame, self._width, self._height)
@@ -299,11 +341,58 @@ class CameraPump:
                     self._decode_error = f"{type(exc).__name__}: {exc}"
             return
         converted = self._perf()
+        with self._cond:
+            # Recorded here, not at send time: the frame that took 45 ms is
+            # usually the one that got replaced before the device took it, so
+            # timing only sent frames hides exactly the spike worth seeing.
+            self._decode_ms.add(decoded, (decoded - started) * 1000.0)
+            self._convert_ms.add(converted, (converted - decoded) * 1000.0)
         if self._send_error:
             # The device is gone: stop pushing at it, keep counting the loss.
             with self._cond:
                 self._dropped += 1
             return
+        self._offer_ready(("frame", array, converted))
+
+    # ------------------------------------------------------------------ #
+    # the sender thread
+    # ------------------------------------------------------------------ #
+    def _offer_ready(self, item: tuple[Any, ...], *, count_stale: bool = True) -> None:
+        """Put one decoded frame in the send slot, newest wins.
+
+        Counting the displaced frame as ``stale`` matters: it is the difference
+        between "the phone stopped sending" and "this PC could not take what the
+        phone sent", and the two have completely different fixes.
+        """
+        with self._send_cond:
+            if self._ready is not None and count_stale:
+                self._stale += 1
+            self._ready = item
+            self._send_cond.notify()
+
+    def _take_ready(self) -> tuple[Any, ...] | None:
+        with self._send_cond:
+            if self._ready is None and not self._stop.is_set():
+                self._send_cond.wait(timeout=self._tick_s)
+            item, self._ready = self._ready, None
+            return item
+
+    def _send_loop(self) -> None:
+        """Everything that touches the device, in one thread."""
+        try:
+            while not self._stop.is_set():
+                item = self._take_ready()
+                if item is None or self._stop.is_set():
+                    continue
+                if item[0] == "blank":
+                    self._send_blank()
+                    continue
+                self._send_frame(item[1], item[2])
+        except Exception as exc:  # noqa: BLE001 - a sender may never break the session
+            with self._cond:
+                self._send_error = f"{type(exc).__name__}: {exc}"
+
+    def _send_frame(self, array: Any, converted: float) -> None:
         try:
             self._sink.send(array)
         except Exception as exc:  # noqa: BLE001 - the device is gone, the session is not
@@ -314,12 +403,26 @@ class CameraPump:
         with self._cond:
             self._sent += 1
             self._chunks += 1
-            self._decode_ms.add(decoded, (decoded - started) * 1000.0)
-            self._convert_ms.add(converted, (converted - decoded) * 1000.0)
             self._send_ms.add(sent, (sent - converted) * 1000.0)
             self._sent_at.append(sent)
-        self._last_sent_at = self._clock()
-        self._blanked = False
+            self._last_sent_at = self._clock()
+            self._blanked = False
+
+    def _send_blank(self) -> None:
+        if self._blanked or self._send_error:
+            return
+        started = self._perf()
+        try:
+            self._sink.send_black()
+        except Exception as exc:  # noqa: BLE001 - the device died, the session did not
+            with self._cond:
+                self._send_error = f"{type(exc).__name__}: {exc}"
+            return
+        finished = self._perf()
+        with self._cond:
+            self._sent += 1
+            self._send_ms.add(finished, (finished - started) * 1000.0)
+            self._blanked = True
 
     def _fps(self, now_perf: float) -> float:
         """Frames per second over the last two seconds of sends."""
@@ -358,6 +461,9 @@ def stats_lines(pc: Any = None, phone: Any = None) -> list[str]:
             f"send {float(pc.get('send_ms', 0.0)):4.1f} ms  "
             f"queue {int(pc.get('depth', 0))}  dropped {int(pc.get('dropped', 0))}"
         )
+    peak = _peak_line(pc) if pc else ""
+    if peak:
+        lines.append(peak)
     phone = phone or {}
     if phone:
         quality = phone.get("quality")
@@ -392,6 +498,29 @@ def stats_lines(pc: Any = None, phone: Any = None) -> list[str]:
         if fps_line:
             lines.append(fps_line)
     return lines
+
+
+def _peak_line(pc: dict[str, Any]) -> str:
+    """``peak decode 45.2 ms`` — which stage produced the spike, if any.
+
+    A mean cannot show this: 45 ms spent on one frame among fifty 3 ms frames is
+    a 3.8 ms mean and one dropped frame. The stage with the worst peak is named
+    first, because that is the one to look at, and only stages above ``SPIKE_MS``
+    are listed at all — two milliseconds is not a spike, it is a measurement.
+    """
+    stages = (
+        ("decode", float(pc.get("decode_peak_ms", 0.0) or 0.0)),
+        ("convert", float(pc.get("convert_peak_ms", 0.0) or 0.0)),
+        ("send", float(pc.get("send_peak_ms", 0.0) or 0.0)),
+    )
+    hot = [(name, value) for name, value in stages if value >= SPIKE_MS]
+    if not hot:
+        return ""
+    hot.sort(key=lambda item: item[1], reverse=True)
+    parts = "  ".join(f"{name} {value:.1f} ms" for name, value in hot)
+    stale = int(pc.get("stale", 0) or 0)
+    stale_text = f"  stale {stale}" if stale else ""
+    return f"  peak {parts}{stale_text}   (worst in the last second)"
 
 
 def _fps_line(phone: dict[str, Any]) -> str:

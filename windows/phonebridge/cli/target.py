@@ -338,7 +338,12 @@ async def open_session(
     )
     if not quiet and session.phone is not None:
         state = "paired" if session.phone.paired else "newly paired"
-        note(f"connected to {session.phone.name} ({state}) over {uri}")
+        # The build goes on this line because it is the line people read when
+        # something later behaves like an older version: an APK built before a
+        # feature reports no build at all, and "no build" is a diagnosis.
+        build = session.phone.build
+        suffix = f" - app {build}" if build else " - app build not reported (APK older than this field)"
+        note(f"connected to {session.phone.name} ({state}) over {uri}{suffix}")
     return session, target
 
 

@@ -56,6 +56,15 @@ INFO_KEYS = {
     "rom": str,
 }
 
+#: Keys that only a current build reports. An APK that predates them is not a
+#: failed selftest — being old is a *finding*, and it is the answer to "why did
+#: --latency-test say nothing?". So these are type-checked when present and
+#: reported as "not reported" when absent.
+OPTIONAL_INFO_KEYS = {
+    "build_id": str,
+    "git_sha": str,
+}
+
 STATS_KEYS = {
     "frames_in": int,
     "frames_out": int,
@@ -184,6 +193,12 @@ class WorkflowRunner:
     async def check_info(self) -> str:
         info = await _call(self.session, "system.info")
         _check_types(info, INFO_KEYS, "system.info")
+        for key, expected in OPTIONAL_INFO_KEYS.items():
+            if key in info and not isinstance(info[key], expected):
+                raise AssertionError(
+                    f"system.info: {key!r} must be {expected.__name__}, "
+                    f"got {type(info[key]).__name__}"
+                )
         if info["protocol_version"] != 1:
             raise AssertionError(
                 f"protocol_version is {info['protocol_version']!r}, expected 1"
@@ -192,9 +207,11 @@ class WorkflowRunner:
             # The id in system.info must be the one the handshake authenticated.
             raise AssertionError("system.info device_id does not match the authenticated peer")
         self.notes["info"] = info
+        build = info.get("build_id")
+        build_text = f", app build {build}" if build else ", app build not reported (older APK)"
         return (
             f"{len(info)} keys, {info['model']} / android {info['android_version']} "
-            f"(sdk {info['sdk_int']}), protocol v{info['protocol_version']}"
+            f"(sdk {info['sdk_int']}), protocol v{info['protocol_version']}{build_text}"
         )
 
     async def check_capabilities(self) -> str:

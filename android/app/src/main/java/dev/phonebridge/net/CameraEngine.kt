@@ -30,6 +30,7 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import dev.phonebridge.BuildInfo
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -642,6 +643,8 @@ class CameraEngine(
     }
 
     fun status(): Map<String, Any?> = mapOf(
+        // The build that produced this answer; the PC prints it at connect.
+        "build_id" to BuildInfo.id,
         "streaming" to running.get(),
         "facing" to config.facing,
         "width" to config.width,

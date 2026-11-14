@@ -199,6 +199,7 @@ Everything below is what `scripts\start-live.bat` does for you. Double-click it
 scripts\start-live.bat                       # USB: adb forward + camera + mic + speaker
 scripts\start-live.bat -Profile 720p         # USB, bigger picture
 scripts\start-live.bat -HostName 192.168.43.1   # Wi-Fi or hotspot: the phone's own address
+scripts\start-live.bat -LoopbackDevice CABLE-A  # PC audio the room does not hear
 ```
 
 It re-runs `adb forward tcp:8765 tcp:8765` (a forward does not survive an unplug),
@@ -211,6 +212,16 @@ In the other application, pick:
 
 * camera → **OBS Virtual Camera** (open OBS once per boot so the device exists);
 * microphone → **CABLE Output** (that is VB-CABLE's *recording* side).
+
+The connect line names the APK it is talking to — `app 1.0.0 (1) e807c93a` — so
+"that feature does nothing" can be told apart from "that build is old". An APK from
+before the field says `app build not reported` instead.
+
+PC audio goes to the phone *and* to your speakers, because WASAPI loopback copies
+an output and the default output is the one you are listening to; muting it silences
+the phone too. `phonebridge speaker --list-loopback-devices` lists what can be
+captured, and a second virtual cable (VB-CABLE A+B) gives the phone a private copy —
+`docs/19-audio.md` §7b has the Windows steps.
 
 A dropped link is not the end of the run: the launcher's bridge rebuilds the
 session and asks the phone for the camera, microphone and speaker again, so

@@ -509,6 +509,119 @@ class PyAudioLoopbackSource:
             self._pa.terminate()
 
 
+def list_loopback_devices(*, module: Any = None) -> list[dict[str, Any]]:
+    """Every device this PC can capture from, with the default output marked.
+
+    WASAPI loopback captures what an *endpoint renders*, so "which device" is the
+    question that decides whether the person next to the PC hears anything: by
+    default PhoneBridge captures the default output, which is also the speakers, so
+    the PC keeps playing. Pointing it at a **second** virtual cable instead gives
+    the phone a private copy and leaves the microphone's cable alone.
+
+    Returns one dict per candidate::
+
+        {"name": "Speakers (Realtek)", "index": 3, "channels": 2,
+         "sample_rate": 48000, "default": True, "virtual": False}
+
+    ``virtual`` is a guess from the name (VB-CABLE, VoiceMeeter, Virtual Audio
+    Cable), and it is only used to phrase advice — never to hide a device.
+
+    PyAudioWPatch is used when present because it is what the capture path uses,
+    so the names match what ``--loopback-device`` matches against. ``soundcard``
+    is the fallback, and a machine with neither gets a sentence, not a traceback.
+    """
+    try:
+        pyaudio = module or __import__("pyaudiowpatch")
+    except Exception:  # noqa: BLE001 - fall back to soundcard below
+        return _loopback_devices_via_soundcard()
+
+    devices: list[dict[str, Any]] = []
+    pa = pyaudio.PyAudio()
+    try:
+        wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        default_index = int(wasapi.get("defaultOutputDevice", -1))
+        for info in pa.get_loopback_device_info_generator():
+            if int(info.get("maxInputChannels", 0)) <= 0:
+                continue
+            name = str(info.get("name", "?"))
+            devices.append(
+                {
+                    "name": name,
+                    "index": int(info.get("index", -1)),
+                    "channels": int(info.get("maxInputChannels", 0)),
+                    "sample_rate": int(info.get("defaultSampleRate", 0)),
+                    "default": int(info.get("index", -1)) == default_index,
+                    "virtual": is_virtual_cable(name),
+                }
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            pa.terminate()
+    if not devices:
+        raise DeviceUnavailable(
+            "this PC exposes no WASAPI loopback device",
+            hint="check that an output device is enabled in Windows sound settings",
+        )
+    return devices
+
+
+def _loopback_devices_via_soundcard() -> list[dict[str, Any]]:
+    """The ``soundcard`` fallback: same shape, fewer fields."""
+    try:
+        import soundcard  # noqa: PLC0415 - optional extra
+    except Exception as exc:  # noqa: BLE001
+        raise DeviceUnavailable(
+            "listing capture devices needs PyAudioWPatch (or soundcard)",
+            hint=PYAUDIOWPATCH_HINT,
+        ) from exc
+    try:
+        default_name = str(getattr(soundcard.default_speaker(), "name", ""))
+        microphones = soundcard.all_microphones(include_loopback=True)
+    except Exception as exc:  # noqa: BLE001
+        raise DeviceUnavailable(f"soundcard could not list devices: {exc}") from exc
+    devices = []
+    for entry in microphones:
+        name = str(getattr(entry, "name", "?"))
+        devices.append(
+            {
+                "name": name,
+                "index": -1,
+                "channels": int(getattr(entry, "channels", 0) or 0),
+                "sample_rate": 0,
+                "default": name == default_name,
+                "virtual": is_virtual_cable(name),
+            }
+        )
+    return devices
+
+
+#: Name fragments of the virtual cables people use for this, in the order worth
+#: recommending. VB-CABLE's A+B pack is the cheapest way to get a *second* cable
+#: while the microphone keeps "CABLE Input"/"CABLE Output" to itself.
+VIRTUAL_CABLE_NAMES = ("cable-a", "cable-b", "cable", "voicemeeter", "virtual audio")
+
+#: Fragments that mean "this is an output that also plays out loud". Capturing one
+#: of these is fine, but the PC's own speakers will still be heard.
+PHYSICAL_OUTPUT_NAMES = ("speakers", "headphones", "realtek", "display audio", "monitor")
+
+
+def is_virtual_cable(name: str) -> bool:
+    """Whether ``name`` looks like a virtual audio cable rather than a speaker."""
+    lowered = name.lower()
+    return any(fragment in lowered for fragment in VIRTUAL_CABLE_NAMES)
+
+
+def describe_loopback_choice(name: str) -> str:
+    """One sentence about what capturing ``name`` means for the PC's own audio."""
+    if is_virtual_cable(name):
+        return "a virtual cable: the phone gets its own copy and these speakers stay quiet"
+    return (
+        "a device that plays out loud: the PC will still be heard, because loopback "
+        "copies what the endpoint renders. Use a second virtual cable for a silent "
+        "capture (phonebridge speaker --list-loopback-devices)"
+    )
+
+
 def open_loopback_source(fmt: AudioFormat, plan: SpeakerPlan, *, module: Any = None) -> Any:
     """PyAudioWPatch loopback, with the existing ``soundcard`` backend as fallback.
 

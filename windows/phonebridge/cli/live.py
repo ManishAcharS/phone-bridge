@@ -38,7 +38,13 @@ from ..live.config import (
     SpeakerPlan,
     profile_size,
 )
-from ..live.devices import OBS_DOWNLOAD_URL, VB_CABLE_URL, DeviceUnavailable
+from ..live.devices import (
+    OBS_DOWNLOAD_URL,
+    VB_CABLE_URL,
+    DeviceUnavailable,
+    describe_loopback_choice,
+    list_loopback_devices,
+)
 from ..live.pump import stats_lines
 from ..live.runner import STATUS_INTERVAL_S, LiveRunner
 from .target import EXIT_ERROR, EXIT_USAGE, CliError, note, open_session, reconnect_factory
@@ -231,11 +237,25 @@ def add_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> Non
         help="delay the camera by this much so picture matches audio",
     )
     speaker.add_argument(
+        "--loopback-device",
         "--loopback",
         dest="loopback_device",
         default="",
         metavar="NAME",
-        help="loopback device name substring (default: the default output)",
+        help=(
+            "which output to capture, matched as a name substring (default: the "
+            "default output). Point it at a second virtual cable for a silent "
+            "capture; see --list-loopback-devices"
+        ),
+    )
+    speaker.add_argument(
+        "--list-loopback-devices",
+        dest="list_loopback_devices",
+        action="store_true",
+        help=(
+            "list the devices this PC can capture, mark the default and the virtual "
+            "cables, and exit without touching the phone"
+        ),
     )
     speaker.add_argument(
         "--test-tone",
@@ -289,6 +309,23 @@ def add_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> Non
         dest="keep_alive",
         action="store_true",
         help="send silence from an otherwise silent PC so the phone's AudioTrack stays warm",
+    )
+    start.add_argument(
+        "--loopback-device",
+        "--loopback",
+        dest="loopback_device",
+        default="",
+        metavar="NAME",
+        help=(
+            "which output the speaker path captures (default: the default output); a "
+            "second virtual cable keeps the PC's own speakers quiet"
+        ),
+    )
+    start.add_argument(
+        "--list-loopback-devices",
+        dest="list_loopback_devices",
+        action="store_true",
+        help="list capture devices and exit without touching the phone",
     )
     start.add_argument("--lipsync", dest="lipsync_ms", type=int, default=0, metavar="MS")
     start.add_argument("--duration", type=float, default=None, metavar="SECONDS")
@@ -369,6 +406,7 @@ def plan_from_args(args: argparse.Namespace) -> LivePlan:
                 speaker=SpeakerPlan(
                     latency_ms=args.speaker_latency_ms,
                     lipsync_ms=args.lipsync_ms,
+                    device=str(getattr(args, "loopback_device", "") or ""),
                     keep_alive=bool(getattr(args, "keep_alive", False)),
                 )
                 if args.speaker
@@ -530,6 +568,24 @@ async def _run_latency_test(args: argparse.Namespace, plan: LivePlan) -> int:
     )
     report: dict[str, Any] | None = None
     try:
+        phone = getattr(session, "phone", None)
+        if phone is not None and phone.build:
+            note(f"phone app build {phone.build}")
+            if not phone.has("latency_probe"):
+                # Say it before the six-second wait, not after it: this is the
+                # answer, and it is in the handshake.
+                note(
+                    "  this APK predates the latency probe, so --latency-test has "
+                    "nothing to time. Install the current APK (the build printed "
+                    "here is what is on the phone)."
+                )
+                return EXIT_ERROR
+        elif phone is not None:
+            note(
+                "  the phone did not report a build id: its APK predates both the "
+                "build id and the latency probe, so there is nothing to time yet."
+            )
+            return EXIT_ERROR
         note(f"measuring the speaker path to {target.describe()} ...")
         if not await link.start_playback():
             note(f"playback did not start: {link.snapshot().detail}")
@@ -551,6 +607,70 @@ async def _run_latency_test(args: argparse.Namespace, plan: LivePlan) -> int:
         _print_json(report)
     else:
         _print_latency_report(report)
+    return 0
+
+
+def _run_list_loopback(args: argparse.Namespace) -> int:
+    """``--list-loopback-devices``: what can be captured, and what it means.
+
+    Deliberately does not connect to the phone: this is a question about *this PC*,
+    and answering it with "pair a phone first" would be a lie.
+    """
+    try:
+        devices = list_loopback_devices()
+    except DeviceUnavailable as exc:
+        note(str(exc))
+        hint = getattr(exc, "hint", "") or ""
+        if hint:
+            note(f"  {hint}")
+        return EXIT_ERROR
+    if getattr(args, "format", "text") == "json":
+        _print_json(devices)
+        return 0
+    print("", flush=True)
+    print("  devices this PC can capture (WASAPI loopback)", flush=True)
+    print("  " + "-" * 66, flush=True)
+    for device in devices:
+        marks = []
+        if device["default"]:
+            marks.append("default output")
+        if device["virtual"]:
+            marks.append("virtual cable")
+        marker = f"  [{', '.join(marks)}]" if marks else ""
+        print(f"  {device['name']}{marker}", flush=True)
+        detail = f"    {device['channels']} ch"
+        if device["sample_rate"]:
+            detail += f", {device['sample_rate']} Hz"
+        print(detail, flush=True)
+    print("", flush=True)
+    print('  use one with: phonebridge speaker --loopback-device "<name here>"', flush=True)
+    virtuals = [device for device in devices if device["virtual"]]
+    if len(virtuals) >= 2:
+        print(
+            "  two virtual cables: keep the microphone on one and point the speaker "
+            "path at the other, so the two never collide",
+            flush=True,
+        )
+    elif len(virtuals) == 1:
+        print(
+            "  one virtual cable is installed (the microphone's). Capturing it would "
+            "feed the phone its own echo; install VB-CABLE A+B (or VoiceMeeter) for a "
+            "second one, then capture that: https://vb-audio.com/Cable/",
+            flush=True,
+        )
+    else:
+        print(
+            "  no virtual cable is installed, so the only thing to capture is an "
+            "output that also plays out loud. Install VB-CABLE for the microphone "
+            "(https://vb-audio.com/Cable/ - A+B gives a second cable) and point this "
+            "at the extra one.",
+            flush=True,
+        )
+    print("", flush=True)
+    for device in devices:
+        if device["default"]:
+            note(f"  {device['name']}: {describe_loopback_choice(device['name'])}")
+    print("", flush=True)
     return 0
 
 
@@ -644,6 +764,10 @@ def _store(args: argparse.Namespace) -> Any:
 
 
 def run(args: argparse.Namespace) -> int:
+    # Answering "which device" needs no phone, no pairing and no session: it is a
+    # question about this PC, so it is handled before anything dials out.
+    if getattr(args, "list_loopback_devices", False):
+        return _run_list_loopback(args)
     try:
         return asyncio.run(_run(args))
     except DeviceUnavailable as exc:

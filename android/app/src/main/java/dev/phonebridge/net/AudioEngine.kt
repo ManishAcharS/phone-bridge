@@ -13,6 +13,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
+import dev.phonebridge.BuildInfo
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -374,10 +375,13 @@ class AudioEngine(
         writesInWindow = 0
         lastAdaptAtMs = now
         if (!adaptive) return
-        // Nothing was written and nothing underran: the PC is simply silent (its
-        // loopback device produces no packets when the endpoint is idle). An
-        // empty queue here is not pressure, it is silence, so learn nothing.
-        if (writes == 0 && fresh == 0) return
+        // Silence is not pressure. With nothing written in the window the queue
+        // cannot be "too shallow" - there was nothing to put in it - so neither
+        // the underrun counter nor an empty queue says anything about its depth.
+        // The PC's loopback produces no packets when the endpoint is idle, so a
+        // silent PC makes the track underrun continuously; growing the queue for
+        // that is how it sat at eight frames (160 ms) for audio nobody sent.
+        if (writes == 0) return
         if (fresh > 0 || wasEmpty) {
             if (targetFrames < maxFrames) {
                 targetFrames++
@@ -538,6 +542,10 @@ class AudioEngine(
     // ------------------------------------------------------------------ //
     fun status(): Map<String, Any> = synchronized(lock) {
         mapOf(
+            // Which APK produced this answer. The PC prints it at connect and next
+            // to any "the phone never reported X" error, so a stale build is
+            // visible instead of inferred.
+            "build_id" to BuildInfo.id,
             "playback" to playbackState,
             "mic" to micState,
             "volume" to volumePercent,

@@ -247,7 +247,93 @@ def test_the_snapshot_is_json_shaped() -> None:
         "decode_ms",
         "convert_ms",
         "send_ms",
+        "decode_peak_ms",
+        "convert_peak_ms",
+        "send_peak_ms",
+        "stale",
     }
+
+
+def test_a_peak_is_reported_apart_from_the_mean() -> None:
+    """45 ms on one frame of fifty is a 3.8 ms mean and one lost frame."""
+    calls = {"n": 0}
+
+    def spiky(frame: Any, width: int, height: int) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            time.sleep(0.045)
+        return "rgb"
+
+    source = pump(decode=spiky)
+    source.start()
+    try:
+        for _ in range(8):
+            source.submit(object())
+            time.sleep(0.03)
+        time.sleep(0.2)
+        snapshot = source.snapshot()
+    finally:
+        source.close()
+
+    assert snapshot.decode_peak_ms >= 40, snapshot.decode_peak_ms
+    assert snapshot.decode_ms < 25, "the mean must not be dragged to the spike"
+    assert snapshot.stale >= 0
+
+
+def test_a_blocked_send_does_not_stop_the_decoder() -> None:
+    """The consumer being slow costs the frames in flight, not the incoming ones.
+
+    Before the sender had its own thread, a 40 ms send held the decoder for 40 ms,
+    so the phone's 20 fps stream filled the single slot and was dropped there —
+    which read as "the PC cannot keep up" when the truth was "the device is slow".
+    """
+    sink = Recorder()
+    sink.delay_s = 0.04  # harsher than any real virtual camera
+    source = pump(sink=sink)
+    source.start()
+    try:
+        feed(source, rate=20, seconds=1.0)
+        time.sleep(0.3)
+        snapshot = source.snapshot()
+    finally:
+        source.close()
+
+    assert snapshot.received >= 15, snapshot.received
+    assert snapshot.sent >= 10, f"a 40 ms send still manages ~20 fps: {snapshot.sent}"
+    assert snapshot.dropped <= 2, (
+        f"a slow device must not make the incoming stream look slow: "
+        f"dropped {snapshot.dropped} of {snapshot.received}"
+    )
+
+
+def test_the_peak_line_names_the_stage_that_spiked() -> None:
+    lines = stats_lines(
+        {
+            "fps": 19.4,
+            "received": 20,
+            "bytes_per_frame": 58000,
+            "decode_ms": 3.1,
+            "decode_peak_ms": 45.2,
+            "convert_ms": 1.2,
+            "convert_peak_ms": 4.0,
+            "send_ms": 0.9,
+            "send_peak_ms": 2.0,
+            "stale": 4,
+            "depth": 0,
+            "dropped": 0,
+        },
+        None,
+    )
+
+    peak = lines[1]
+    assert "peak decode 45.2 ms" in peak, peak
+    assert "stale 4" in peak, peak
+    assert "convert" not in peak, "a 4 ms peak is not a spike"
+
+
+def test_no_peak_line_without_a_spike() -> None:
+    lines = stats_lines({"fps": 20.0, "decode_ms": 3.0, "decode_peak_ms": 6.0}, None)
+    assert len(lines) == 1, lines
 
 
 # --------------------------------------------------------------------------- #

@@ -82,8 +82,13 @@ function Resolve-Python {
 
 function Invoke-Python {
     param([string[]]$Arguments)
+    # Select-Object -Skip 1, not [$Command[1..($Command.Count - 1)]]: for a
+    # one-element array that slice counts *down* to zero, so `python` was invoked
+    # as `python.exe <path to python>` and every probe failed.
     if ($script:PythonCommand -is [array]) {
-        & $script:PythonCommand[0] $script:PythonCommand[1..($script:PythonCommand.Count - 1)] @Arguments
+        $exe = [string]$script:PythonCommand[0]
+        $rest = @($script:PythonCommand | Select-Object -Skip 1)
+        & $exe @rest @Arguments
     } else {
         & $script:PythonCommand @Arguments
     }
@@ -144,6 +149,44 @@ function Test-ObsInstalled {
         if (Test-Path $key) { return $key }
     }
     return $null
+}
+
+function Get-LoopbackDevices {
+    # Every endpoint WASAPI loopback can capture, with the same probe the speaker
+    # command uses. Two of them is the good case: the microphone writes into one
+    # (VB-CABLE's "CABLE Input") and the speaker path captures the *other*, so the
+    # phone hears the PC without the PC's speakers having to be audible, and
+    # without capturing its own microphone.
+    $probe = @'
+import sys
+names = []
+try:
+    import pyaudiowpatch as pyaudio
+    pa = pyaudio.PyAudio()
+    try:
+        for info in pa.get_loopback_device_info_generator():
+            if int(info.get("maxInputChannels", 0)) > 0:
+                names.append(str(info.get("name", "")))
+    finally:
+        pa.terminate()
+except Exception:
+    try:
+        import soundcard
+        names = [str(m) for m in soundcard.all_microphones(include_loopback=True)]
+    except Exception:
+        print("unknown")
+        sys.exit(0)
+print("|".join(names))
+'@
+    try {
+        $output = Invoke-Python @('-c', $probe) 2>$null
+    } catch {
+        return $null
+    }
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $line = ($output | Select-Object -Last 1)
+    if ($null -eq $line -or $line -eq 'unknown') { return $null }
+    return @($line -split '\|' | Where-Object { $_ })
 }
 
 function Test-CableInstalled {
@@ -219,6 +262,33 @@ if ($cable -and $cable -ne 'unknown') {
     Write-Host '         install from https://vb-audio.com/Cable/ then REBOOT (the driver only'
     Write-Host '         appears after a restart), and re-run this script'
     $script:Missing += 'VB-CABLE (https://vb-audio.com/Cable/) - reboot after installing'
+}
+Write-Host ''
+
+Write-Step 'a second virtual cable (speaker path: keep the microphone's cable free)'
+$loopbacks = Get-LoopbackDevices
+if ($null -eq $loopbacks) {
+    Write-Need 'could not list capture devices yet (install PyAudioWPatch, then re-run)'
+} else {
+    $virtuals = @($loopbacks | Where-Object { $_ -match 'cable|voicemeeter|virtual audio' })
+    Write-Host "         capture devices visible: $($loopbacks.Count)" -ForegroundColor DarkGray
+    foreach ($name in $virtuals) { Write-Host "           $name" -ForegroundColor DarkGray }
+    if ($virtuals.Count -ge 2) {
+        Write-Ok "$($virtuals.Count) virtual cables: keep the microphone on one, capture the other"
+        Write-Host '         next: phonebridge speaker --list-loopback-devices, then' -ForegroundColor DarkGray
+        Write-Host '               phonebridge speaker --loopback-device "CABLE-A Input"' -ForegroundColor DarkGray
+    } elseif ($virtuals.Count -eq 1) {
+        Write-Need 'one virtual cable: that is the microphone path'
+        Write-Host '         capturing it too would feed the phone its own microphone. For a' -ForegroundColor DarkGray
+        Write-Host '         silent PC-audio capture, install VB-CABLE A+B (or VoiceMeeter) and' -ForegroundColor DarkGray
+        Write-Host '         point the speaker path at the second cable:' -ForegroundColor DarkGray
+        Write-Host '           https://vb-audio.com/Cable/' -ForegroundColor DarkGray
+        $script:Missing += 'a second virtual cable for the speaker path (https://vb-audio.com/Cable/)'
+    } else {
+        Write-Need 'no virtual cable: the speaker path can only capture an output that also plays out loud'
+        Write-Host '         install VB-CABLE (A+B for two cables): https://vb-audio.com/Cable/' -ForegroundColor DarkGray
+        $script:Missing += 'VB-CABLE for the speaker path (https://vb-audio.com/Cable/)'
+    }
 }
 Write-Host ''
 

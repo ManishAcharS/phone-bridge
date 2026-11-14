@@ -17,6 +17,29 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0.0"
+
+        // A *build* string the phone can report and the PC can print at connect.
+        //
+        // "Which APK is on the phone?" was unanswerable: versionName is the same
+        // for every build between releases, so a phone running a build from three
+        // commits ago looked identical to today's - which is exactly how "the
+        // latency probe never reported" turned into a guessing game. The short git
+        // SHA is read at configuration time; a source archive with no .git gets
+        // "nogit" instead of failing the build.
+        val gitSha = run {
+            try {
+                val process = ProcessBuilder("git", "rev-parse", "--short=8", "HEAD")
+                    .directory(rootProject.projectDir.parentFile)
+                    .redirectErrorStream(true)
+                    .start()
+                val text = process.inputStream.bufferedReader().use { it.readText() }.trim()
+                process.waitFor()
+                if (process.exitValue() == 0 && text.isNotEmpty()) text else "nogit"
+            } catch (e: Exception) {
+                "nogit"
+            }
+        }
+        buildConfigField("String", "GIT_SHA", "\"$gitSha\"")
     }
 
     // Release signing is read from android/keystore.properties, which is NOT in
@@ -66,6 +89,9 @@ android {
 
     buildFeatures {
         compose = true
+        // BuildConfig is off by default in AGP 8: without this, VERSION_NAME and
+        // the GIT_SHA field above do not exist as Java symbols at all.
+        buildConfig = true
     }
 
     composeOptions {

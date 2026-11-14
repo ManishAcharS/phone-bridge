@@ -1,6 +1,7 @@
 package dev.phonebridge.net
 
 import android.content.Context
+import dev.phonebridge.BuildInfo
 import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorManager
@@ -101,6 +102,9 @@ object DeviceFacts {
         "target_sdk" to context.applicationInfo.targetSdkVersion,
         "app_version" to appVersion(context),
         "app_version_code" to appVersionCode(context),
+        // `versionName` alone cannot tell two builds apart; this can.
+        "build_id" to BuildInfo.id,
+        "git_sha" to BuildInfo.gitSha,
         "package" to context.packageName,
         "rom" to romName(),
         "rom_version" to romVersion(),

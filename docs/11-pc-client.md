@@ -430,7 +430,8 @@ Options worth knowing:
 phonebridge camera --virtual --width 1920 --height 1080 --fps 30 --facing front
 phonebridge camera --virtual --fps-mode variable     # brighter picture, variable rate
 phonebridge mic --to-cable --latency 80 --gain 1.5
-phonebridge speaker --latency 60 --lipsync 120 --loopback "Speakers"
+phonebridge speaker --latency 60 --lipsync 120 --loopback-device "CABLE-A Input"
+phonebridge speaker --list-loopback-devices          # what can be captured, and why
 phonebridge speaker --latency-test                   # one click, per-stage numbers
 phonebridge speaker --keep-alive                     # silence while the PC is silent
 phonebridge speaker --test-tone                      # 440 Hz for 3 s: tests the phone alone
@@ -446,6 +447,12 @@ that Bluetooth has already put 100-250 ms behind. `--keep-alive` sends silence
 while the PC is not playing anything, which keeps the phone's track and the
 Bluetooth link warm. `--latency-test` prints the delay per stage, including the
 stages nobody can measure (see `docs/19-audio.md` §7a).
+
+`--loopback-device` chooses which output the speaker path captures; by default it
+is the default output, which is also the speakers you are listening to. Point it
+at a **second** virtual cable (VB-CABLE A+B) to give the phone a private copy and
+leave the room quiet — `docs/19-audio.md` §7b has the Windows steps, and
+`--list-loopback-devices` prints what this PC offers.
 
 `--fps-mode fixed` (the default) pins the phone's auto-exposure to the requested
 frame rate through `CONTROL_AE_TARGET_FPS_RANGE`: 30 fps means 30 fps, and a dim

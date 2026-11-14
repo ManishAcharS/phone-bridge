@@ -2,6 +2,7 @@ package dev.phonebridge.net
 
 import android.content.Context
 import android.util.Log
+import dev.phonebridge.BuildInfo
 import dev.phonebridge.Permissions
 import dev.phonebridge.protocol.Crypto
 import dev.phonebridge.protocol.Framing
@@ -1309,6 +1310,11 @@ class BridgeServer(
                         "id" to identity.deviceId,
                         "name" to identity.name,
                         "capabilities" to capabilities(),
+                        // The PC prints this at connect. It is the only way to tell
+                        // "the APK has no latency probe" from "the phone is ignoring
+                        // the request", which cost an evening of guessing once.
+                        "build" to BuildInfo.id,
+                        "features" to BuildInfo.features,
                     )
                 )
                 return
@@ -1323,6 +1329,8 @@ class BridgeServer(
                     "name" to identity.name,
                     "sas" to Crypto.formatSas(sas),
                     "capabilities" to capabilities(),
+                    "build" to BuildInfo.id,
+                    "features" to BuildInfo.features,
                 )
             )
             stage = Stage.AWAIT_PAIR_CONFIRM

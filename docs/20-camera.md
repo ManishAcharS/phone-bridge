@@ -432,6 +432,39 @@ I/CameraEngine: camera warm-up: 2400 ms (first frame 5200 B, now 34000 B)
 camera is still warming up. It is reported in `camera.status.stats` and printed by
 `--stats`.
 
+## 8.4 Decode spikes: 40-50 ms on a 3 ms path
+
+At 640x480 q70 the report was decode spiking to **40-50 ms** while the mean sat
+near 3 ms, with dropped frames climbing. Measuring the pieces separately ruled
+out the obvious suspects — `Image.draft("RGB", ...)` was already called before
+`convert`, the letterbox canvas is only allocated when the aspect ratio differs,
+and a 148 KB 640x480 q70 JPEG decodes and converts in **3.05 ms** with
+`rotate(-90, expand=True)` adding **0.26 ms**. The JPEG path was not it.
+
+What was left was the shape of the worker, and two things change:
+
+* **the device send moved to its own thread.** `pyvirtualcam.send()` blocks until
+  the consumer collects the frame, and with one thread a slow consumer held the
+  *decoder*: incoming frames piled up in the single slot and were counted as
+  drops. Now a stalled send costs the one frame in flight, and the decoder keeps
+  consuming at the source's rate. `stale` counts frames that were decoded and
+  replaced before the device took them — the number that separates "the phone
+  stopped sending" from "this PC could not take what it sent";
+* **each stage reports its worst sample, not only its mean.** A 45 ms frame among
+  fifty 3 ms ones is a 3.8 ms mean and one dropped frame, which is why the report
+  said "decode spikes" but the status line said 3 ms. `--stats` now prints the
+  stage that spiked:
+
+```
+  pc   19.4 fps  rx 20  57 KB/frame  decode   3.1 ms  convert  1.2 ms  send 0.9 ms  queue 0  dropped 0
+  peak decode 45.2 ms   (worst in the last second)
+```
+
+A peak is named only above 25 ms, because two milliseconds is a measurement, not a
+spike. Which stage appears there is the diagnosis: `decode` means allocation or
+GC pressure on this PC, `send` means the virtual-camera consumer (OBS or the app
+reading it) is slow, `convert` means the numpy copy.
+
 ## 9. Manual hardware checklist (not yet done)
 
 Nothing below has been run: this development environment has no phone, no JDK, no

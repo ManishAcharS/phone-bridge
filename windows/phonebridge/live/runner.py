@@ -168,8 +168,17 @@ class LiveStatus:
             # latency; `buf` above is where it is right now.
             text += f" target {target} ms"
         underruns = stats.get("underruns")
+        silent = stats.get("underruns_silent")
+        total = stats.get("underruns_total")
         if isinstance(underruns, int) and underruns:
             text += f" underruns {underruns}"
+        elif isinstance(silent, int) and silent:
+            # Every underrun so far happened while this PC was silent: say zero,
+            # then say where the rest of the counter came from. Printing "312"
+            # here is what made a healthy stream look broken.
+            text += " underruns 0"
+        if isinstance(silent, int) and silent:
+            text += f" (silent {silent}" + (f" of {total}" if isinstance(total, int) else "") + ")"
         track = str(stats.get("track_state") or "")
         if track and track not in ("playing", "no_track"):
             text += f" track {track}"
