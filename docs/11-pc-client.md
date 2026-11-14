@@ -116,6 +116,10 @@ The build previously emitted a setuptools deprecation warning
 | `discover` | who is on this network right now? | no |
 | `info` | device facts from the phone (JSON by default) | yes |
 | `capabilities` | what the phone can *actually* do today | yes |
+| `camera --virtual` | phone camera → Windows webcam device (OBS Virtual Camera) | yes |
+| `mic --to-cable` | phone microphone → VB-CABLE ("CABLE Output") | yes |
+| `speaker` | PC audio → phone → Bluetooth headphones | yes |
+| `start --camera --mic --speaker` | all three on one session, one status line | yes |
 | `audio status` | headset, profile, relay state | yes |
 | `audio last` | the last capability probe the phone kept | yes |
 | `ping` | application-level RTT | yes |
@@ -388,6 +392,63 @@ phonebridge audio last --device "Pixel 7" --json
 ```
 
 If no probe has run, `audio last` exits 1 and tells you which command to run.
+
+---
+
+## 7a. Windows delivery: camera, microphone, speaker
+
+These four commands are the shortest path from "the phone has the hardware" to
+"another Windows application can use it". They all ride the session you already
+have — same pairing, same AES-GCM channel, same reconnect behaviour — and none of
+them installs a driver or changes a Windows setting.
+
+```powershell
+phonebridge camera --virtual                     # Zoom/Meet see a webcam
+phonebridge mic --to-cable                       # Voice Recorder sees a microphone
+phonebridge speaker                              # headphones hear the PC
+phonebridge start --camera --mic --speaker       # all three, one status line
+```
+
+What each one needs on the PC (once, by hand — PhoneBridge never installs these):
+
+| Command | Requirement | Where |
+| --- | --- | --- |
+| `camera --virtual` | pyvirtualcam + OBS Studio (its virtual camera device) | `scripts/setup-windows.ps1`, then <https://obsproject.com/download> |
+| `mic --to-cable` | sounddevice + VB-CABLE | `scripts/setup-windows.ps1`, then <https://vb-audio.com/Cable/> |
+| `speaker` | PyAudioWPatch (WASAPI loopback); `soundcard` works as a fallback | `scripts/setup-windows.ps1` |
+
+Then pick the device in the *other* application:
+
+* camera → **OBS Virtual Camera**;
+* microphone → **CABLE Output (VB-Audio Virtual Cable)**;
+* speaker → nothing to select: the phone plays it, and Android routes it to
+  connected Bluetooth headphones on its own.
+
+Options worth knowing:
+
+```powershell
+phonebridge camera --virtual --width 1920 --height 1080 --fps 30 --facing front
+phonebridge mic --to-cable --latency 80 --gain 1.5
+phonebridge speaker --latency 200 --lipsync 120 --loopback "Speakers"
+phonebridge start --camera --mic --speaker --format json --duration 30
+```
+
+`--latency` on `mic` is the jitter buffer depth: smaller is snappier, larger
+survives a worse network. `--lipsync` on `speaker` delays *video* so the picture
+matches audio that Bluetooth has already put 100-200 ms behind.
+
+Status is printed once a second and looks like this:
+
+```
+link up | camera active 29.8 fps | mic active -21 dBFS buf 120 ms | speaker active 200 ms
+```
+
+**What is verified, and what is not.** The framing, the jitter buffer, the
+device lookup, the missing-driver errors and the CLI surface are covered by
+tests, and they run on the Windows CI job as well. Whether OBS's virtual camera
+accepts these frames on your machine, and whether a call client picks up
+`CABLE Output`, are hardware facts that can only be checked on your PC — see
+`docs/26-windows-live-delivery.md` for the checklist.
 
 ---
 
