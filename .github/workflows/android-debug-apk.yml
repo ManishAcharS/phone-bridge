@@ -1,0 +1,88 @@
+name: Android debug APK
+
+# Builds the app from android/ and uploads the debug APK as a downloadable
+# artifact. Nothing is signed with a secret: the debug keystore Gradle generates
+# on the runner is enough to `adb install` the result.
+#
+# There is deliberately no `branches:` filter, so it runs for a push to any
+# branch that touches android/ (a workflow that is not on the default branch
+# cannot be started with workflow_dispatch from the UI).
+on:
+  push:
+    paths:
+      - "android/**"
+      - ".github/workflows/android-debug-apk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One build per branch: pushing twice in a minute should not queue two Gradles.
+concurrency:
+  group: android-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Provides cmdline-tools, ANDROID_HOME and accepted licences, so AGP can
+      # install whatever platform it needs (compileSdk 34 here).
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle.kts', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Build the debug APK
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --console=plain --stacktrace assembleDebug
+
+      # The method names the PC client calls live in the dex string pool, so this
+      # is a cheap way to show the APK being uploaded is not a stale one. It is a
+      # warning, not a failure: the phone is the only real proof.
+      - name: Check the APK mentions the live handlers
+        working-directory: android
+        run: |
+          apk=app/build/outputs/apk/debug/app-debug.apk
+          ls -l "$apk"
+          sha256sum "$apk"
+          for method in audio.mic.start camera.start audio.playback.start; do
+            count=$(unzip -p "$apk" 'classes*.dex' | grep -a -o -- "$method" | wc -l)
+            echo "$method: $count occurrence(s)"
+            if [ "$count" -eq 0 ]; then
+              echo "::warning::$method is not in the APK's dex strings"
+            fi
+          done
+
+      - name: Stage the APK
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/debug/app-debug.apk "out/phonebridge-debug-${GITHUB_SHA::12}.apk"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: phonebridge-debug-apk
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 30
