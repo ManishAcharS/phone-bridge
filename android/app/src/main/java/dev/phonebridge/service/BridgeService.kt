@@ -1,5 +1,6 @@
 package dev.phonebridge.service
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,11 +8,15 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import androidx.core.app.ServiceCompat
 import dev.phonebridge.MainActivity
 import dev.phonebridge.R
 import dev.phonebridge.net.BridgeServer
@@ -32,8 +37,15 @@ import kotlinx.coroutines.launch
  *
  * A foreground service is mandatory here: Android will otherwise freeze or kill
  * the process and the PC's audio stream would die the moment the phone locks.
- * The service type is `connectedDevice`, which is the accurate declaration for
- * "maintaining a connection to an external device" over USB/Wi-Fi.
+ *
+ * The types are the accurate description of what the service does: it holds a
+ * connection to the PC (`connectedDevice`) and, through it, streams the camera,
+ * streams the microphone and plays the PC's audio. Android 11+ silences a
+ * microphone that is used from a foreground service without the `microphone`
+ * type once the app is in the background, and Android 14+ refuses to start a
+ * service whose types it was not granted the runtime permission for - so the
+ * camera and microphone types are only claimed while their runtime permission
+ * is actually held. See [foregroundTypes].
  */
 class BridgeService : Service() {
 
@@ -41,6 +53,7 @@ class BridgeService : Service() {
     private var server: BridgeServer? = null
     private var beacon: DiscoveryBeacon? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var startAttempts = 0
 
@@ -67,9 +80,8 @@ class BridgeService : Service() {
         // entered. That applies to the stop and restart paths below too: doing
         // them before startForeground() got the process killed on Android 12+
         // (ForegroundServiceDidNotStartInTimeException) instead of stopped.
-        startForeground(
-            NOTIFICATION_ID,
-            buildNotification(if (server == null) "Starting…" else "Listening…"),
+        promoteToForeground(
+            buildNotification(if (server == null) "Starting…" else "Listening…")
         )
 
         when (intent?.action) {
@@ -91,6 +103,55 @@ class BridgeService : Service() {
         if (server == null) startBridge()
         return START_STICKY
     }
+
+    /**
+     * Become a foreground service, claiming only the work this phone can do.
+     *
+     * `startForeground(id, notification)` would claim *every* type declared in the
+     * manifest, and on Android 14+ a camera/microphone type without its runtime
+     * permission is a SecurityException that kills the service. So the types are
+     * computed from `checkSelfPermission` instead, and a refusal (a vendor ROM, or
+     * a permission revoked between the check and the call) falls back to the
+     * connection-only type, which needs no runtime permission at all: the bridge
+     * always comes up.
+     */
+    private fun promoteToForeground(notification: Notification) {
+        val types = foregroundTypes()
+        try {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, types)
+            return
+        } catch (e: RuntimeException) {
+            android.util.Log.w("BridgeService", "startForeground(type=$types) refused: ${e.message}")
+        }
+        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, connectionType())
+    }
+
+    /** The types this phone has the runtime permissions for, right now. */
+    private fun foregroundTypes(): Int {
+        var types = connectionType()
+        if (types == 0) return 0 // below API 29 the platform has no typed services
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && hasPermission(Manifest.permission.RECORD_AUDIO)) {
+            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        }
+        if (hasPermission(Manifest.permission.CAMERA)) {
+            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+        }
+        return types
+    }
+
+    /**
+     * connectedDevice (the connection) plus mediaPlayback (the AudioTrack). Both
+     * are normal permissions granted at install, so this pair can never be
+     * refused; `0` on API < 29, where typed services do not exist.
+     */
+    private fun connectionType(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+        return ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+    }
+
+    private fun hasPermission(permission: String): Boolean =
+        checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
 
     private fun startBridge() {
         if (server != null) return
@@ -251,11 +312,32 @@ class BridgeService : Service() {
             // working day; the service is restarted long before that in practice.
             acquire(12L * 60 * 60 * 1000)
         }
+        // A partial wake lock keeps the *CPU* awake; it does not stop the Wi-Fi
+        // radio from going into power save, which over a hotspot shows up as a
+        // burst of late frames every few seconds and, worse, as a link that
+        // times out while the screen is off. HIGH_PERF asks for the radio to stay
+        // on at full power for as long as the bridge is streaming. Guarded: a
+        // device without the permission (or with Wi-Fi off entirely) must still
+        // run over USB.
+        runCatching {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifiLock = wm.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                "PhoneBridge::wifi",
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.onFailure {
+            android.util.Log.w("BridgeService", "wifi lock unavailable: ${it.message}")
+        }
     }
 
     private fun releaseWakeLock() {
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
     }
 
     private fun createChannel() {

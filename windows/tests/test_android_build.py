@@ -246,18 +246,56 @@ def test_min_sdk_matches_the_documented_floor():
 # --------------------------------------------------------------------------- #
 # 3. manifest correctness
 # --------------------------------------------------------------------------- #
-def test_connected_device_foreground_service_has_its_permissions():
+def test_foreground_service_has_its_permissions_for_every_type():
+    """Android 14+: one permission per service type, or SecurityException.
+
+    The service holds a connection (connectedDevice) and, through it, streams the
+    camera, streams the microphone and plays the PC's audio, so all four types are
+    declared. Each type-specific permission is a *normal* permission: granted at
+    install, never prompted.
+    """
     text = read(MANIFEST)
-    assert 'android:foregroundServiceType="connectedDevice"' in text
+    assert 'android:foregroundServiceType="connectedDevice|camera|microphone|mediaPlayback"' in text
     perms = permissions()
     assert "android.permission.FOREGROUND_SERVICE" in perms
-    assert "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" in perms, (
-        "Android 14+ throws SecurityException without this"
-    )
+    for extra in (
+        "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
+        # Android 14+ typed foreground services: camera, microphone, playback.
+        "android.permission.FOREGROUND_SERVICE_CAMERA",
+        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+        "android.permission.FOREGROUND_SERVICE_CAMERA",
+        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+    ):
+        assert extra in perms, f"Android 14+ throws SecurityException without {extra}"
     assert perms & FGS_CONNECTED_DEVICE_PREREQUISITES, (
         "connectedDevice also requires one of "
         f"{sorted(FGS_CONNECTED_DEVICE_PREREQUISITES)}; the app declares none"
     )
+
+
+def test_the_service_claims_types_it_actually_holds_permission_for():
+    """Declaring a type is not enough: it must also be claimed at start, gated.
+
+    `startForeground(id, notification)` claims *every* declared type, and on
+    Android 14+ a camera/microphone type whose runtime permission is missing is a
+    SecurityException. The service therefore computes its types from
+    checkSelfPermission and falls back to the connection-only pair.
+    """
+    text = read(KOTLIN_DIR / "service" / "BridgeService.kt")
+
+    assert "ServiceCompat.startForeground(" in text, "typed promotion is required, not the 2-arg form"
+    assert "startForeground(\n            NOTIFICATION_ID," not in text, (
+        "the two-argument startForeground would claim every manifest type"
+    )
+    assert "hasPermission(Manifest.permission.RECORD_AUDIO)" in text
+    assert "hasPermission(Manifest.permission.CAMERA)" in text
+    assert "FOREGROUND_SERVICE_TYPE_MICROPHONE" in text
+    assert "FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE" in text
+    # The fallback is what keeps the bridge starting on a ROM that refuses.
+    assert "catch (e: RuntimeException)" in text
+    assert "connectionType()" in text
 
 
 def test_every_declared_permission_is_a_real_permission_string():
@@ -299,6 +337,10 @@ def test_declared_permissions_are_exactly_the_ones_the_code_uses():
         "android.permission.ACCESS_WIFI_STATE",
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
+        # Android 14+ typed foreground services: camera, microphone, playback.
+        "android.permission.FOREGROUND_SERVICE_CAMERA",
+        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
         "android.permission.WAKE_LOCK",
         "android.permission.POST_NOTIFICATIONS",
         "android.permission.CHANGE_NETWORK_STATE",

@@ -89,13 +89,37 @@ class WebSocketLink:
             raise LinkError(f"cannot connect to {self.uri}: {exc}") from exc
         log.debug("link open: %s", self.uri)
 
+    def explain_close(self, exc: ConnectionClosed) -> str:
+        """Say *who* ended the link, and whether the phone gave a reason.
+
+        ``str(exc)`` is "no close frame received or sent" for every abrupt death,
+        which reads like a bug in the PC. It is not: with no close frame the
+        connection simply stopped, and the usual cause is this side's own
+        keepalive giving up because the phone went quiet (the app frozen or
+        killed, or the Wi-Fi link dropping). A phone that closes on purpose
+        always sends a frame with a code and a reason, and says so here.
+        """
+        received = getattr(exc, "rcvd", None)
+        if received is None:
+            return (
+                "the phone stopped answering: no reply to a keepalive for "
+                f"{self.ping_timeout:.0f} s, then no close frame (1006). The app was "
+                "probably frozen or killed — keep PhoneBridge in the phone's Autostart "
+                "list and out of battery optimisation — or the network dropped"
+            )
+        code = getattr(received, "code", None)
+        reason = (getattr(received, "reason", "") or "").strip()
+        if code == 1000:
+            return f"the phone closed the session ({reason or 'no reason given'})"
+        return f"the phone closed the connection ({code}: {reason or 'no reason given'})"
+
     async def send(self, data: bytes) -> None:
         if self._ws is None:
             raise LinkError("link is not open")
         try:
             await self._ws.send(data)
         except ConnectionClosed as exc:
-            raise LinkError(f"link closed while sending: {exc}") from exc
+            raise LinkError(f"link closed while sending: {self.explain_close(exc)}") from exc
 
     async def recv(self) -> bytes:
         if self._ws is None:
@@ -103,7 +127,7 @@ class WebSocketLink:
         try:
             msg = await self._ws.recv()
         except ConnectionClosed as exc:
-            raise LinkError(f"link closed: {exc}") from exc
+            raise LinkError(f"link closed: {self.explain_close(exc)}") from exc
         if isinstance(msg, str):
             raise LinkError("phone sent a text WebSocket frame; protocol requires binary")
         return bytes(msg)

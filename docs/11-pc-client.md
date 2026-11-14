@@ -116,6 +116,10 @@ The build previously emitted a setuptools deprecation warning
 | `discover` | who is on this network right now? | no |
 | `info` | device facts from the phone (JSON by default) | yes |
 | `capabilities` | what the phone can *actually* do today | yes |
+| `camera --virtual` | phone camera → Windows webcam device (OBS Virtual Camera); reconnects and restarts the camera if the link drops | yes |
+| `mic --to-cable` | phone microphone → VB-CABLE ("CABLE Output") | yes |
+| `speaker` | PC audio → phone → Bluetooth headphones | yes |
+| `start --camera --mic --speaker` | all three on one session, one status line | yes |
 | `audio status` | headset, profile, relay state | yes |
 | `audio last` | the last capability probe the phone kept | yes |
 | `ping` | application-level RTT | yes |
@@ -388,6 +392,98 @@ phonebridge audio last --device "Pixel 7" --json
 ```
 
 If no probe has run, `audio last` exits 1 and tells you which command to run.
+
+---
+
+## 7a. Windows delivery: camera, microphone, speaker
+
+These four commands are the shortest path from "the phone has the hardware" to
+"another Windows application can use it". They all ride the session you already
+have — same pairing, same AES-GCM channel, same reconnect behaviour — and none of
+them installs a driver or changes a Windows setting.
+
+```powershell
+phonebridge camera --virtual                     # Zoom/Meet see a webcam
+phonebridge mic --to-cable                       # Voice Recorder sees a microphone
+phonebridge speaker                              # headphones hear the PC
+phonebridge start --camera --mic --speaker       # all three, one status line
+```
+
+What each one needs on the PC (once, by hand — PhoneBridge never installs these):
+
+| Command | Requirement | Where |
+| --- | --- | --- |
+| `camera --virtual` | pyvirtualcam + OBS Studio (its virtual camera device) | `scripts/setup-windows.ps1`, then <https://obsproject.com/download> |
+| `mic --to-cable` | sounddevice + VB-CABLE | `scripts/setup-windows.ps1`, then <https://vb-audio.com/Cable/> |
+| `speaker` | PyAudioWPatch (WASAPI loopback); `soundcard` works as a fallback. `--test-tone` needs neither | `scripts/setup-windows.ps1` |
+
+Then pick the device in the *other* application:
+
+* camera → **OBS Virtual Camera**;
+* microphone → **CABLE Output (VB-Audio Virtual Cable)**;
+* speaker → nothing to select: the phone plays it, and Android routes it to
+  connected Bluetooth headphones on its own.
+
+Options worth knowing:
+
+```powershell
+phonebridge camera --virtual --width 1920 --height 1080 --fps 30 --facing front
+phonebridge camera --virtual --fps-mode variable     # brighter picture, variable rate
+phonebridge mic --to-cable --latency 80 --gain 1.5
+phonebridge speaker --latency 60 --lipsync 120 --loopback-device "CABLE-A Input"
+phonebridge speaker --list-loopback-devices          # what can be captured, and why
+phonebridge speaker --latency-test                   # one click, per-stage numbers
+phonebridge speaker --keep-alive                     # silence while the PC is silent
+phonebridge speaker --test-tone                      # 440 Hz for 3 s: tests the phone alone
+phonebridge start --camera --mic --speaker --fps-mode fixed --keep-alive --format json
+```
+
+`--latency` on `mic` is the *receive* jitter buffer depth: smaller is snappier,
+larger survives a worse network. `--latency` on `speaker` is different and is now
+the queue target the phone is told to hold (**60 ms** by default, three 20 ms
+frames); the phone grows it on its own if the device underruns, so a number here
+is a floor, not a promise. `--lipsync` delays *video* so the picture matches audio
+that Bluetooth has already put 100-250 ms behind. `--keep-alive` sends silence
+while the PC is not playing anything, which keeps the phone's track and the
+Bluetooth link warm. `--latency-test` prints the delay per stage, including the
+stages nobody can measure (see `docs/19-audio.md` §7a).
+
+`--loopback-device` chooses which output the speaker path captures; by default it
+is the default output, which is also the speakers you are listening to. Point it
+at a **second** virtual cable (VB-CABLE A+B) to give the phone a private copy and
+leave the room quiet — `docs/19-audio.md` §7b has the Windows steps, and
+`--list-loopback-devices` prints what this PC offers.
+
+`--fps-mode fixed` (the default) pins the phone's auto-exposure to the requested
+frame rate through `CONTROL_AE_TARGET_FPS_RANGE`: 30 fps means 30 fps, and a dim
+room is darker. `--fps-mode variable` lets the device drop to ~15 fps for a
+brighter picture. `--stats` prints the AE range, the ranges the device lists, and
+the measured warm-up (see `docs/20-camera.md` §8.2).
+
+Status is printed once a second and looks like this:
+
+```
+link up | camera active 29.8 fps | mic active -21 dBFS buf 120 ms | speaker active pc-buf 60 ms -> bluetooth_a2dp rx 50 f/s wrote 50 f/s played 41.2 s buf 40 ms target 60 ms
+```
+
+`pc silent` appears in place of those numbers when the PC is not playing anything:
+WASAPI loopback delivers no packets from an idle endpoint, so `rx 0 f/s` is
+silence, not a broken link. Use `--keep-alive` if you would rather the phone's
+track stayed fed.
+
+`pc-buf` is the buffer *this PC* was asked to send; everything after the arrow
+comes from the phone's own `AudioTrack` — which device Android routed it to, how
+many frames a second it received and wrote, how much it has played. A speaker
+that is `active` with `wrote 0 f/s` is receiving audio and not playing it, which
+is the difference the old line could not show. `phonebridge speaker --test-tone`
+exercises the phone with no capture device at all.
+
+**What is verified, and what is not.** The framing, the jitter buffer, the
+device lookup, the missing-driver errors and the CLI surface are covered by
+tests, and they run on the Windows CI job as well. Whether OBS's virtual camera
+accepts these frames on your machine, and whether a call client picks up
+`CABLE Output`, are hardware facts that can only be checked on your PC — see
+`docs/26-windows-live-delivery.md` for the checklist.
 
 ---
 

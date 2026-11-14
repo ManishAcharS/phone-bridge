@@ -1,0 +1,138 @@
+name: Windows native virtual camera
+
+# Windows is the only runner where the PC client's device lookup, driver-missing
+# messages and setup script run for real, so the whole client is covered here and
+# not just the native camera.
+on:
+  push:
+    branches: [main, "work/**"]
+    paths:
+      - "windows-native/vcam-poc/**"
+      - "windows/**"
+      - "scripts/**"
+      - ".github/workflows/windows-native-vcam.yml"
+  pull_request:
+    paths:
+      - "windows-native/vcam-poc/**"
+      - "windows/**"
+      - "scripts/**"
+      - ".github/workflows/windows-native-vcam.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure x64 native camera
+        run: cmake -S windows-native/vcam-poc -B build/vcam -A x64
+
+      - name: Build Release
+        run: cmake --build build/vcam --config Release --parallel
+
+      - name: Verify host command surface (read-only)
+        shell: pwsh
+        run: |
+          & .\build\vcam\Release\vcam_host.exe --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcam_host --help failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Set up Python for source-safety tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test runner
+        run: python -m pip install pytest
+
+      - name: Run native host safety tests
+        shell: pwsh
+        run: python -m pytest windows/tests/test_vcam_host_safety.py windows/tests/test_vcam_media_source_contract.py -q
+
+      # The live delivery paths are Python, not C++, but Windows is the only
+      # place their device lookup and driver-missing messages run for real.
+      - name: Install the PC client for the live-delivery tests
+        # Same install a user performs; it pulls the two declared dependencies
+        # (websockets, cryptography) that the CLI's imports need. numpy and
+        # Pillow are not dependencies of the CLI, but they are what the camera
+        # path really uses, and the tests that pin pyvirtualcam's array contract
+        # (uint8, (h, w, 3), C-contiguous) skip without them.
+        run: |
+          python -m pip install -e windows
+          python -m pip install numpy pillow
+
+      - name: Run live-delivery tests (no hardware needed)
+        shell: pwsh
+        env:
+          PYTHONPATH: ${{ github.workspace }}\windows
+        run: >-
+          python -m pytest
+          windows/tests/test_live_config.py
+          windows/tests/test_live_jitter.py
+          windows/tests/test_live_devices.py
+          windows/tests/test_live_runner.py
+          windows/tests/test_live_cli.py
+          windows/tests/test_live_camera_contract.py
+          windows/tests/test_live_loopback.py
+          windows/tests/test_audio_sdout.py
+          windows/tests/test_audio_convert.py
+          windows/tests/test_transport_link.py
+          windows/tests/test_live_camera_failures.py
+          windows/tests/test_live_camera_stats.py
+          windows/tests/test_live_pump.py
+          windows/tests/test_camera_decode.py
+          windows/tests/test_android_camera_threading.py
+          windows/tests/test_android_camera_throughput.py
+          windows/tests/test_audio_tone.py
+          windows/tests/test_live_speaker_stats.py
+          windows/tests/test_android_audio_stats.py
+          windows/tests/test_setup_script.py
+          -q
+
+      # Report-only mode: everything OBS and VB-CABLE related must be a message,
+      # never an installer, and a missing component must be reported, not fatal.
+      # Python supervises the child process: PowerShell's own stderr handling and
+      # GitHub's `$ErrorActionPreference = 'Stop'` preamble made a shell-level
+      # check unreliable, and subprocess gives an exit code and both streams.
+      - name: Check the setup script is report-only and does not crash
+        shell: python
+        run: |
+          import pathlib, subprocess, sys
+
+          script = pathlib.Path("scripts/setup-windows.ps1")
+          if not script.is_file():
+              print(f"::error::missing {script}")
+              sys.exit(1)
+
+          try:
+              done = subprocess.run(
+                  ["pwsh", "-NoProfile", "-File", str(script), "-Check"],
+                  capture_output=True,
+                  text=True,
+                  errors="replace",
+                  timeout=900,
+              )
+          except Exception as error:  # noqa: BLE001 - report, never traceback
+              print(f"::error::could not run {script}: {error}")
+              sys.exit(1)
+
+          print(done.stdout)
+          if done.stderr.strip():
+              print("--- stderr ---")
+              print(done.stderr)
+
+          code = done.returncode
+          if code > 1:
+              tail = " | ".join(done.stdout.strip().splitlines()[-10:])
+              print(f"::error::{script} -Check exited {code}; last lines: {tail}")
+              sys.exit(1)
+          # 1 means "something still needs a human": it must say what, and it must
+          # have reached the summary instead of dying halfway through.
+          if code == 1 and "still to do by hand" not in done.stdout:
+              tail = " | ".join(done.stdout.strip().splitlines()[-10:])
+              print(f"::error::the setup script reported a missing component without saying which; last lines: {tail}")
+              sys.exit(1)
+          print(f"{script} -Check exited {code} as expected")

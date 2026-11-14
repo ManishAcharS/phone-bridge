@@ -32,6 +32,10 @@
 #include <atomic>
 #include <mutex>
 
+//: QueryInterface tracing for the objects this DLL owns. Compiles to nothing
+//: when PB_TRACE_QUERY_INTERFACE is 0.
+#include "query_trace.h"
+
 namespace phonebridge {
 
 //: 1280x720 at 30 fps NV12 — the lowest common denominator every consumer
@@ -97,16 +101,25 @@ using Microsoft::WRL::ComPtr;
 // as well. One object answering both halves is legal (GetMediaSource returns it)
 // and keeps the proof of concept to a single class.
 // ---------------------------------------------------------------------------
-class MediaSource
-    : public Microsoft::WRL::RuntimeClass<
-          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
-          IMFMediaSourceEx,
-          IMFMediaStream2,
-          IMFGetService,
-          IKsControl,
-          IMFSampleAllocatorControl> {
+//: The WRL base, named so the diagnostic QueryInterface override below can
+//: forward to WRL's implementation instead of reimplementing interface dispatch.
+using MediaSourceRuntime = Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    IMFMediaSourceEx,
+    IMFMediaStream2,
+    IMFGetService,
+    IKsControl,
+    IMFSampleAllocatorControl>;
+
+class MediaSource : public MediaSourceRuntime {
 public:
     MediaSource();
+
+#if PB_TRACE_QUERY_INTERFACE
+    //: Diagnostic only: logs the requested IID and the HRESULT, then returns
+    //: WRL's own answer unchanged. Never alters what this object exposes.
+    STDMETHOD(QueryInterface)(REFIID riid, void** object) noexcept override;
+#endif
 
     // IMFMediaEventGenerator
     IFACEMETHODIMP GetEvent(DWORD flags, IMFMediaEvent** event) override;

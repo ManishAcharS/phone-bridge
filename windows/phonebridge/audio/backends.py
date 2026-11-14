@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from .frames import AudioFormat
+from .sdout import SdOutputError, SoundDeviceOutput
 
 log = logging.getLogger(__name__)
 
@@ -122,9 +123,10 @@ class SoundDeviceSink:
     """Plays received PCM on a Windows output device (optional ``sounddevice``).
 
     Default device unless one is named. This is the *in-app monitor*: it makes the
-    phone's microphone audible on the PC. It is **not** a Windows recording device
-    — a third-party app such as a call client cannot select it, and PhoneBridge
-    does not claim otherwise (see docs/19-audio.md, "virtual microphone").
+    phone's microphone audible on the PC. On its own it creates no Windows
+    recording device, so a call client cannot select it; to give one a microphone,
+    point this sink at VB-CABLE's "CABLE Input" (``phonebridge mic --to-cable``)
+    and the app records "CABLE Output" instead. See docs/26.
     """
 
     def __init__(self, fmt: AudioFormat, device: str | int | None = None) -> None:
@@ -137,31 +139,25 @@ class SoundDeviceSink:
                 "'sounddevice' package: run `pip install sounddevice`"
             ) from exc
         self._sd = sounddevice
+        # RawOutputStream (bytes, no dtype conversion) with the device's own
+        # channel count and rate, negotiated — see phonebridge.audio.sdout. The
+        # same two mistakes (numpy-array writes, session channels on a device
+        # that has its own) used to be in here and in live/devices.py.
         try:
-            self._stream = sounddevice.RawOutputStream(
-                samplerate=fmt.sample_rate,
-                channels=fmt.channels,
-                dtype="int16",
-                device=device,
-                blocksize=fmt.samples_per_frame,
-            )
-            self._stream.start()
-        except Exception as exc:  # noqa: BLE001
+            self._output = SoundDeviceOutput(fmt, device, sd=sounddevice)
+        except SdOutputError as exc:
             raise AudioBackendError(f"the output device could not be opened: {exc}") from exc
 
     def write(self, payload: bytes) -> None:
         if not payload:
             return
         try:
-            self._stream.write(payload)
-        except Exception as exc:  # noqa: BLE001
+            self._output.write(payload)
+        except SdOutputError as exc:
             raise AudioBackendError(f"playback failed: {exc}") from exc
 
     def close(self) -> None:
-        with contextlib.suppress(Exception):
-            self._stream.stop()
-        with contextlib.suppress(Exception):
-            self._stream.close()
+        self._output.close()
 
 
 def _to_pcm16(chunk: object) -> bytes:

@@ -68,6 +68,68 @@ ERROR = "error"
 #: Frame header is 8 bytes; a queue of 8 frames is 160 ms of audio at 20 ms.
 DEFAULT_QUEUE = 8
 
+#: How long the loopback may produce nothing before the PC admits it is silent.
+#: WASAPI loopback is driven by the endpoint: when nothing on this PC is
+#: rendering, the capture stream delivers no packets, `read()` blocks, and the
+#: phone reports ``rx 0 f/s`` while everything is healthy. This turns that into a
+#: fact the status line can print instead of a "fault" nobody can fix.
+PC_SILENT_AFTER_S = 0.6
+
+#: How often the silence watcher looks at the capture clock.
+SILENCE_TICK_S = 0.2
+
+#: The queue target the PC asks the phone to hold, in ms. Three 20 ms frames:
+#: one being written, one in the device, one for jitter. It was 200 ms.
+DEFAULT_TARGET_MS = 60
+
+#: What the Bluetooth A2DP path adds after the AudioTrack mixer, in ms, for the
+#: codecs an ordinary phone negotiates. **Not measured**: Android exposes neither
+#: the codec nor the Bluetooth buffer to an app (see `AudioEngine.a2dpCodec`), so
+#: the honest answer is a range, printed as one.
+A2DP_FLOOR_MS = (100, 250)
+
+#: How often the PC asks the phone what its `AudioTrack` is doing. One small RPC
+#: per second while a direction is running: `audio.playback.start` only says the
+#: phone agreed to play, and nothing else in the protocol reports whether the
+#: device ever consumed a sample. See :meth:`AudioLink.phone_status`.
+PHONE_STATUS_INTERVAL_S = 1.0
+
+#: Fields the PC keeps from `audio.status`. Anything else the phone sends is
+#: ignored, so a newer APK cannot break an older PC.
+_PHONE_AUDIO_KEYS = (
+    # Which APK answered. Empty on an APK older than the field, and the PC prints
+    # "not reported" rather than pretending it is the current build.
+    "build_id",
+    "playback",
+    "mic",
+    "route",
+    "device_name",
+    "track_state",
+    "buffered_ms",
+    "buffer_ms",
+    "underruns",
+    "played_ms",
+    "frames_in",
+    "frames_written",
+    "dropped",
+    "last_error",
+    # latency, per stage (docs/19): the queue the phone settled on, how deep it
+    # is, whether it is adapting, the track buffer the device granted, and the
+    # one-way probe when the PC armed it.
+    "queue_target_frames",
+    "queue_target_ms",
+    "queue_depth",
+    "adaptive",
+    "adapt_grow",
+    "adapt_shrink",
+    "low_latency",
+    "track_buffer_ms",
+    "probe_state",
+    "probe_latency_ms",
+    "a2dp_codec",
+    "a2dp_codec_note",
+)
+
 
 class AudioError(RuntimeError):
     """An audio direction refused or failed, with a message meant for a user."""
@@ -98,6 +160,13 @@ class AudioSnapshot:
     muted: bool = True
     format: dict[str, int] = field(default_factory=dict)
     stats: dict[str, int | str] = field(default_factory=dict)
+    #: The phone's own answer to `audio.status`, plus the rates the PC derives
+    #: from two consecutive answers. Empty when the phone has not answered yet.
+    phone: dict[str, Any] = field(default_factory=dict)
+    #: True when playback is running and this PC has produced no audio for
+    #: :data:`PC_SILENT_AFTER_S`. It is *not* an error: it means nothing is
+    #: playing here, so the loopback device has nothing to hand over.
+    pc_silent: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -109,6 +178,8 @@ class AudioSnapshot:
             "muted": self.muted,
             "format": dict(self.format),
             "stats": dict(self.stats),
+            "phone": dict(self.phone),
+            "pc_silent": self.pc_silent,
         }
 
 
@@ -124,6 +195,12 @@ class AudioLink:
         sink_factory: Callable[[AudioFormat], AudioSink] | None = None,
         on_change: Callable[[AudioSnapshot], None] | None = None,
         queue_size: int = DEFAULT_QUEUE,
+        status_interval: float = PHONE_STATUS_INTERVAL_S,
+        target_ms: int = DEFAULT_TARGET_MS,
+        adaptive: bool = True,
+        low_latency: bool = True,
+        probe: bool = False,
+        keep_alive: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._session = session
@@ -133,6 +210,14 @@ class AudioLink:
         self._on_change = on_change
         self._queue_size = max(2, queue_size)
         self._clock = clock
+        # Latency policy for the phone's queue. `adaptive` and `low_latency` are
+        # on because they are strictly better when they work and the phone falls
+        # back safely when they do not.
+        self._target_ms = max(20, int(target_ms))
+        self._adaptive = bool(adaptive)
+        self._low_latency = bool(low_latency)
+        self._probe = bool(probe)
+        self._keep_alive = bool(keep_alive)
 
         self.stats = AudioStats()
         self._gate = SequenceGate()
@@ -149,6 +234,27 @@ class AudioLink:
         self._sender: asyncio.Task[None] | None = None
         self._receiver: asyncio.Task[None] | None = None
         self._queue: asyncio.Queue[bytes | None] | None = None
+
+        # The phone's own view of its output, refreshed once a second (see
+        # `phone_status`). Rates are derived here because the phone sends
+        # cumulative counters.
+        self._status_interval = max(0.05, float(status_interval))
+        self._status_task: asyncio.Task[None] | None = None
+        self._phone: dict[str, Any] = {}
+        self._phone_at: float | None = None
+        self._phone_counters: dict[str, float] = {}
+
+        # PC-side silence: when the last loopback frame arrived, and whether the
+        # line is currently admitting that nothing is playing here.
+        self.pc_silent = False
+        self._captured_at: float | None = None
+        self._silence_task: asyncio.Task[None] | None = None
+        self._keep_alive_task: asyncio.Task[None] | None = None
+        self._keep_alive_frames = 0
+        #: Underruns the phone reported while this PC was silent. They are the
+        #: feed's fault, not the link's, so they are counted apart and cannot make
+        #: a healthy stream look broken.
+        self._silent_underruns = 0
 
     # ------------------------------------------------------------------ #
     # observation
@@ -174,8 +280,133 @@ class AudioLink:
             volume=self._volume,
             muted=self._muted,
             format=self._fmt.as_dict(),
-            stats=self.stats.to_dict(),
+            stats={
+                **self.stats.to_dict(),
+                # How many frames keep-alive injected, so "the phone says it is
+                # receiving frames while the PC is silent" is explainable.
+                "keepalive_frames": self._keep_alive_frames,
+            },
+            phone=self.phone_status,
+            pc_silent=self.pc_silent,
         )
+
+    @property
+    def phone_status(self) -> dict[str, Any]:
+        """What the *phone* reports about its own output.
+
+        `playback == "active"` means the phone accepted the stream. It does not
+        mean the phone played it: a muted stream, a route to a disconnected
+        headset, or an `AudioTrack` that stopped consuming all look identical
+        from here. This is the phone's answer to `audio.status` — its route, the
+        track's state, the audio waiting in front of it, its underrun count —
+        plus the two rates the PC can only compute from two answers:
+
+        ``rx_fps``
+            frames the phone received per second (what the link delivered).
+        ``written_fps``
+            frames it handed to `AudioTrack` per second. `rx_fps` above zero
+            with `written_fps` at zero is the signature of a phone that is
+            receiving a muted or unreachable stream.
+        """
+        return dict(self._phone)
+
+    # ------------------------------------------------------------------ #
+    # asking the phone what it is doing
+    # ------------------------------------------------------------------ #
+    def _ensure_status_poller(self) -> None:
+        """Start the once-a-second `audio.status` poll, if it is not running."""
+        if self._status_task is not None and not self._status_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no loop: nothing to poll on (plain construction)
+            return
+        self._status_task = loop.create_task(
+            self._poll_phone_status(), name="audio-phone-status"
+        )
+
+    def _stop_status_poller(self) -> None:
+        """Stop polling once neither direction can produce an answer."""
+        if self._playback.state in (ACTIVE, STARTING) or self._mic.state in (
+            ACTIVE,
+            STARTING,
+        ):
+            return
+        task, self._status_task = self._status_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _poll_phone_status(self) -> None:
+        """Ask the phone for its own numbers, once a second.
+
+        A debug aid must never break audio: every failure is swallowed and the
+        loop keeps its cadence, so a phone that answers nothing simply leaves the
+        PC's line showing what the PC knows.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._status_interval)
+                try:
+                    reply = await self._session.call("audio.status", {})
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - never fatal
+                    log.debug("audio.status failed: %s", exc)
+                    continue
+                self._absorb_phone_status(reply)
+        except asyncio.CancelledError:
+            raise
+
+    def _absorb_phone_status(self, reply: Any) -> None:
+        """Keep the phone's answer, and turn cumulative counters into rates."""
+        payload = reply.get("result", reply) if isinstance(reply, dict) else None
+        if not isinstance(payload, dict):
+            return
+        stats: dict[str, Any] = {
+            key: payload[key]
+            for key in _PHONE_AUDIO_KEYS
+            if isinstance(payload.get(key), (int, float, str))
+        }
+        now = self._clock()
+        # Underruns while this PC was silent are the *feed's* doing, not the
+        # link's: a phone that is starved of frames because nothing is playing
+        # underruns by definition, and counting those made a healthy stream look
+        # broken ("hundreds of underruns during silence"). They are counted, and
+        # reported apart, but they do not reach the number that means trouble.
+        reported_underruns = payload.get("underruns")
+        if isinstance(reported_underruns, (int, float)):
+            previous = self._phone_counters.get("underruns")
+            if previous is None or reported_underruns < previous:
+                # First answer, or the phone restarted its track: nothing to
+                # attribute yet.
+                self._silent_underruns = 0
+            elif self.pc_silent:
+                self._silent_underruns += int(reported_underruns - previous)
+            visible = max(0, int(reported_underruns - self._silent_underruns))
+            stats["underruns"] = visible
+            stats["underruns_total"] = int(reported_underruns)
+            stats["underruns_silent"] = self._silent_underruns
+        elapsed = 0.0 if self._phone_at is None else now - self._phone_at
+        if elapsed > 0:
+            for name, key in (
+                ("rx_fps", "frames_in"),
+                ("written_fps", "frames_written"),
+            ):
+                value = payload.get(key)
+                before = self._phone_counters.get(key)
+                if not isinstance(value, (int, float)) or before is None:
+                    continue
+                delta = float(value) - before
+                if delta < 0:  # the phone restarted its track: no rate yet
+                    continue
+                stats[name] = round(delta / elapsed, 1)
+        for key in ("frames_in", "frames_written", "underruns"):
+            value = payload.get(key)
+            if isinstance(value, (int, float)):
+                self._phone_counters[key] = float(value)
+        self._phone_at = now
+        self._phone = stats
+        self._notify()
 
     def _notify(self) -> None:
         if self._on_change is not None:
@@ -209,10 +440,18 @@ class AudioLink:
         if self._playback.state in (ACTIVE, STARTING):
             return self._playback.state == ACTIVE
         self._set_playback(STARTING)
+        # The phone sizes its queue from `target_ms` and, when `probe` is set,
+        # times the first frame it receives from arrival to the mixer. Older APKs
+        # ignore the extra keys and keep their fixed eight-frame queue.
+        params: dict[str, Any] = {
+            "format": self._fmt.as_dict(),
+            "target_ms": self._target_ms,
+            "adaptive": self._adaptive,
+            "low_latency": self._low_latency,
+            "probe": self._probe,
+        }
         try:
-            reply = await self._session.call(
-                "audio.playback.start", {"format": self._fmt.as_dict()}
-            )
+            reply = await self._session.call("audio.playback.start", params)
         except Exception as exc:  # noqa: BLE001 - every failure is a message
             self._set_playback(ERROR, _explain("the phone refused audio playback", exc))
             # The call may have started a route and then failed (a timeout after
@@ -245,10 +484,20 @@ class AudioLink:
         self._seq = 0
         self._started_at = self._clock()
         self._queue = asyncio.Queue(maxsize=self._queue_size)
+        self.pc_silent = False
+        self._captured_at = self._clock()
         loop = asyncio.get_running_loop()
         self._capture = loop.create_task(self._capture_loop(), name="audio-capture")
         self._sender = loop.create_task(self._send_loop(), name="audio-send")
+        self._silence_task = loop.create_task(self._silence_watch(), name="audio-silence")
+        self._keep_alive_frames = 0
+        self._silent_underruns = 0
+        if self._keep_alive:
+            self._keep_alive_task = loop.create_task(
+                self._keep_alive_loop(), name="audio-keep-alive"
+            )
         self._set_playback(ACTIVE)
+        self._ensure_status_poller()
         return True
 
     async def _capture_loop(self) -> None:
@@ -260,6 +509,7 @@ class AudioLink:
                 pcm = await loop.run_in_executor(None, self._source.read)
                 if not pcm:
                     continue  # device produced less than a frame; read again
+                self._mark_captured()
                 if self._muted:
                     pcm = b"\x00" * len(pcm)
                 try:
@@ -282,6 +532,94 @@ class AudioLink:
             if self._queue is not None:
                 with contextlib.suppress(asyncio.QueueFull):
                     self._queue.put_nowait(None)
+
+    def _mark_captured(self) -> None:
+        """Audio moved: clear the "PC is silent" flag if it was up."""
+        self._captured_at = self._clock()
+        if self.pc_silent:
+            self.pc_silent = False
+            self._notify()
+
+    async def _silence_watch(self) -> None:
+        """Say "the PC is silent" out loud.
+
+        WASAPI loopback capture is driven by the *endpoint*. When nothing on this
+        PC is rendering audio, the loopback stream hands over no packets, so
+        `read()` blocks and no frames are sent; the phone then reports ``rx 0 f/s``
+        while every component is working. That is silence, not a fault, and the
+        status line should say so.
+
+        This watcher only *observes*: the frames that keep the phone warm are
+        :meth:`_keep_alive_loop`'s job, on its own cadence. Mixing the two is how
+        keep-alive ended up running at 20 frames a second instead of 50 — the
+        feeding time was spent inside the observation window, so half of every
+        cycle produced nothing.
+        """
+        try:
+            while True:
+                await asyncio.sleep(SILENCE_TICK_S)
+                if self._playback.state not in (ACTIVE, STOPPING):
+                    return
+                last = self._captured_at
+                if last is None:
+                    continue
+                if self._clock() - last < PC_SILENT_AFTER_S:
+                    continue
+                if not self.pc_silent:
+                    self.pc_silent = True
+                    log.debug(
+                        "no loopback audio for %.1f s: the PC is not playing anything",
+                        PC_SILENT_AFTER_S,
+                    )
+                    self._notify()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a watcher may never break audio
+            log.debug("silence watcher stopped: %s", exc)
+
+    async def _keep_alive_loop(self) -> None:
+        """Send one silent frame per frame period while the PC is silent.
+
+        The cadence is the whole point. The phone's `AudioTrack` consumes 50 frames
+        a second at 20 ms; feeding it 20 a second makes it underrun continuously,
+        which is what "hundreds of underruns during silence" was. So this loop
+        schedules against an absolute deadline (`next_at += period`) rather than
+        sleeping *between* frames: the queue, the socket and the phone all take a
+        little time, and a relative sleep adds that time to every period, which is
+        exactly how a 50 fps feed becomes a 20 fps one.
+
+        A late tick does not fire a burst to catch up: a burst is audio the phone
+        cannot use, and dropping it would cost the same underrun. The schedule is
+        reset instead, so the stream stays a stream.
+        """
+        loop = asyncio.get_running_loop()
+        period = max(0.005, self._fmt.frame_ms / 1000.0)
+        silence = b"\x00" * self._fmt.bytes_per_frame
+        next_at = loop.time()
+        try:
+            while self._playback.state in (ACTIVE, STOPPING):
+                if self.pc_silent:
+                    queue = self._queue
+                    if queue is not None:
+                        try:
+                            queue.put_nowait(silence)
+                            self._keep_alive_frames += 1
+                        except asyncio.QueueFull:
+                            # The sender is behind; the oldest frame goes, exactly
+                            # as it would for real audio.
+                            self.stats.dropped_full += 1
+                next_at += period
+                delay = next_at - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                else:
+                    # Behind by more than a frame: restart the schedule.
+                    next_at = loop.time()
+                    await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep-alive may never break audio
+            log.debug("keep-alive stopped: %s", exc)
 
     async def _send_loop(self) -> None:
         """One frame per pull, so the queue — not the socket — bounds the latency."""
@@ -328,12 +666,19 @@ class AudioLink:
         # Cancel the pumps *before* the STOP frame: otherwise a frame already in
         # the queue would be sent after it, and the phone would accept audio for a
         # stream it has been told to close.
-        for task in (self._capture, self._sender):
+        for task in (
+            self._capture,
+            self._sender,
+            self._silence_task,
+            self._keep_alive_task,
+        ):
             if task is not None and not task.done():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
         self._capture = self._sender = None
+        self._silence_task = None
+        self._keep_alive_task = None
         self._queue = None
         # A STOP frame lets the phone drain its AudioTrack instead of clicking.
         with contextlib.suppress(Exception):
@@ -341,7 +686,139 @@ class AudioLink:
                 await self._send_frame(b"", flags=FLAG_STOP)
         await self._quiet_rpc("audio.playback.stop")
         self._source = None
+        self.pc_silent = False
+        self._captured_at = None
         self._set_playback(IDLE, reason)
+        self._stop_status_poller()
+
+    # ------------------------------------------------------------------ #
+    # measuring the speaker path
+    # ------------------------------------------------------------------ #
+    async def measure_latency(self, *, timeout_s: float = 6.0) -> dict[str, Any]:
+        """Time one marked frame from this PC to the phone's mixer, per stage.
+
+        Playback must already be running with ``probe=True`` (the CLI passes it),
+        because the probe times the *first* frame after `audio.playback.start`.
+        This method sends that frame itself — a short click — so the measurement
+        is repeatable on a PC that happens to be silent.
+
+        What is measured, and what is not:
+
+        ======================  ==============================================
+        stage                   how
+        ======================  ==============================================
+        PC capture block        one frame period, stated not guessed: the read
+                                returns a whole frame, so a sound is up to
+                                ``frame_ms`` old when it is sent
+        PC -> phone             no jitter buffer on this path: one frame per
+                                pull, sent as it is captured
+        phone queue             the target the phone reports, in ms
+        arrival -> mixer        the phone's own probe, on the phone's clock
+        Bluetooth               **not measurable** from an app: reported as the
+                                :data:`A2DP_FLOOR_MS` range, never as a number
+        ======================  ==============================================
+
+        Returns a dict of ``*_ms`` stages plus ``notes``; the CLI prints it.
+        """
+        if self._playback.state != ACTIVE:
+            raise AudioError(
+                "the speaker path is not running, so there is nothing to time: "
+                "start playback (with probe) first"
+            )
+        click = self._click_pcm()
+        sent_at = self._clock()
+        await self._send_frame(click)
+        probe: dict[str, Any] = {}
+        deadline = sent_at + max(0.5, timeout_s)
+        while self._clock() < deadline:
+            try:
+                reply = await self._session.call("audio.status", {})
+            except Exception as exc:  # noqa: BLE001 - turned into a sentence below
+                raise AudioError(_explain("the phone did not answer audio.status", exc)) from exc
+            payload = reply.get("result", reply) if isinstance(reply, dict) else None
+            if isinstance(payload, dict):
+                self._absorb_phone_status(payload)
+                done = payload.get("probe_state") == "done"
+                latency = payload.get("probe_latency_ms")
+                if done or (isinstance(latency, (int, float)) and latency >= 0):
+                    probe = payload
+                    break
+            await asyncio.sleep(0.05)
+        if not probe:
+            build = str(self._phone.get("build_id") or "").strip()
+            described = f"the phone reports build {build}" if build else (
+                "the phone reports no build id at all, which means its APK predates "
+                "the latency probe (install the current build)"
+            )
+            raise AudioError(
+                "the phone never reported the probe reaching its mixer, so there is "
+                f"nothing to time: {described}"
+            )
+
+        frame_ms = self._fmt.frame_ms
+        capture_ms = frame_ms  # a sound is at most one read block old
+        probe_ms = max(0, int(probe.get("probe_latency_ms") or 0))
+        to_mixer = capture_ms + probe_ms
+        route = str(probe.get("route") or "none")
+        bluetooth = route == "bluetooth_a2dp"
+        floor: tuple[int, int] | None = A2DP_FLOOR_MS if bluetooth else None
+        report: dict[str, Any] = {
+            "frame_ms": frame_ms,
+            "capture_ms": capture_ms,
+            "network_ms": 0,
+            "queue_target_ms": int(probe.get("queue_target_ms") or 0),
+            "queue_depth": int(probe.get("queue_depth") or 0),
+            "arrival_to_mixer_ms": probe_ms,
+            "track_buffer_ms": int(probe.get("track_buffer_ms") or probe.get("buffer_ms") or 0),
+            "underruns": int(probe.get("underruns") or 0),
+            "route": route,
+            "device_name": str(probe.get("device_name") or ""),
+            "low_latency": bool(probe.get("low_latency")),
+            "adaptive": bool(probe.get("adaptive")),
+            "build_id": str(probe.get("build_id") or ""),
+            "a2dp_codec": str(probe.get("a2dp_codec") or ""),
+            "a2dp_codec_note": str(probe.get("a2dp_codec_note") or ""),
+            "to_mixer_ms": to_mixer,
+            "bluetooth_floor_ms": list(floor) if floor else None,
+            "to_ear_ms": [to_mixer + floor[0], to_mixer + floor[1]] if floor else [to_mixer, to_mixer],
+        }
+        notes: list[str] = []
+        if not report["a2dp_codec"]:
+            notes.append(
+                "Android does not expose the A2DP codec or its buffer to an app, so the "
+                "Bluetooth stage is a range, not a measurement"
+                + (f" ({report['a2dp_codec_note']})" if report["a2dp_codec_note"] else "")
+            )
+        if bluetooth:
+            notes.append(
+                "A2DP is the floor here: even a perfect stream is re-buffered by the "
+                "headphones and the phone's Bluetooth stack before it reaches the ear"
+            )
+        if report["underruns"]:
+            notes.append(
+                f"{report['underruns']} underruns so far: the adaptive queue will grow, "
+                "which trades latency back for continuity"
+            )
+        report["notes"] = notes
+        return report
+
+    def _click_pcm(self) -> bytes:
+        """One frame of a short, loud click: enough to be heard and to be timed."""
+        import math
+        import struct
+
+        rate = self._fmt.sample_rate
+        count = self._fmt.samples_per_frame
+        # 6 ms of 1 kHz at 60 % amplitude, then silence: a click, not a tone.
+        burst = max(1, int(rate * 0.006))
+        samples = [
+            int(0.6 * 32767 * math.sin(2 * math.pi * 1000 * i / rate)) if i < burst else 0
+            for i in range(count)
+        ]
+        pcm = struct.pack(f"<{count}h", *samples)
+        if self._fmt.channels == 2:
+            pcm = b"".join(pcm[i : i + 2] * 2 for i in range(0, len(pcm), 2))
+        return pcm
 
     # ------------------------------------------------------------------ #
     # phone microphone -> PC
@@ -386,6 +863,7 @@ class AudioLink:
             self._receive_loop(queue), name="audio-receive"
         )
         self._set_mic(ACTIVE)
+        self._ensure_status_poller()
         return True
 
     async def _receive_loop(self, queue: asyncio.Queue[bytes | None]) -> None:
@@ -408,8 +886,18 @@ class AudioLink:
                 for ordered in self._gate.offer(frame):
                     if ordered.muted or not ordered.payload:
                         continue
-                    if self._sink is not None:
+                    if self._sink is None:
+                        continue
+                    try:
                         await loop.run_in_executor(None, self._sink.write, ordered.payload)
+                    except AudioBackendError as exc:
+                        # A dead *device* stops this direction and nothing else:
+                        # the session, the camera and the speaker keep running.
+                        self._set_mic(ERROR, str(exc))
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        self._set_mic(ERROR, f"microphone device failed: {exc}")
+                        return
         except asyncio.CancelledError:
             raise
         except AudioBackendError as exc:
@@ -432,6 +920,7 @@ class AudioLink:
                 self._sink.close()
             self._sink = None
         self._set_mic(IDLE, reason)
+        self._stop_status_poller()
 
     # ------------------------------------------------------------------ #
     # controls
@@ -472,6 +961,11 @@ class AudioLink:
             await self.stop_playback(reason)
         with contextlib.suppress(Exception):
             await self.stop_mic(reason)
+        task, self._status_task = self._status_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
 
 def _granted_format(reply: Any, fallback: AudioFormat) -> AudioFormat:
@@ -489,6 +983,16 @@ def _granted_format(reply: Any, fallback: AudioFormat) -> AudioFormat:
 
 
 def _explain(prefix: str, exc: Exception) -> str:
-    """Turn an RPC/transport failure into a sentence, keeping the code visible."""
+    """Turn an RPC/transport failure into a sentence, keeping the code visible.
+
+    A real session turns an error reply into ``SessionError("code: message")``, so
+    the code is usually already in the text. An in-process ``RpcError`` keeps it in
+    an attribute instead, and a user looking the failure up in the docs/03 table
+    needs it either way — so it is added when it is missing, not when it is
+    convenient.
+    """
     text = str(exc).strip() or type(exc).__name__
+    code = getattr(exc, "code", "")
+    if isinstance(code, str) and code and not text.startswith(f"{code}:"):
+        text = f"{code}: {text}"
     return f"{prefix}: {text}"

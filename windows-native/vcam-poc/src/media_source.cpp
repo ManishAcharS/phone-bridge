@@ -6,11 +6,41 @@
 
 #include "media_source.h"
 
+#include <ksmedia.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <stdio.h>
 
 namespace phonebridge {
+
+namespace {
+
+void TraceLine(const wchar_t* message) {
+    OutputDebugStringW(L"[PhoneBridge] ");
+    OutputDebugStringW(message);
+    OutputDebugStringW(L"\n");
+}
+
+void TraceHr(const wchar_t* operation, HRESULT hr) {
+    wchar_t buffer[256] = {};
+    swprintf_s(buffer, L"%ls: hr=0x%08lX", operation,
+               static_cast<unsigned long>(hr));
+    TraceLine(buffer);
+}
+
+}  // namespace
+
+#if PB_TRACE_QUERY_INTERFACE
+// Diagnostic: record every QueryInterface that reaches this object, then hand
+// back WRL's answer untouched. Nothing about interface dispatch changes here -
+// this exists only so a failing QI names itself in the debugger log.
+STDMETHODIMP MediaSource::QueryInterface(REFIID riid, void** object) noexcept {
+    const HRESULT hr = MediaSourceRuntime::QueryInterface(riid, object);
+    trace::Query(L"MediaSource", riid, hr);
+    return hr;
+}
+#endif
 
 MediaSource::MediaSource()
     : m_frameDuration(10'000'000LL / kFps) {
@@ -75,6 +105,7 @@ IFACEMETHODIMP MediaSource::QueueEvent(MediaEventType type, REFGUID extendedType
 // IMFMediaSource
 // ---------------------------------------------------------------------------
 IFACEMETHODIMP MediaSource::GetCharacteristics(DWORD* characteristics) {
+    TraceLine(L"MediaSource::GetCharacteristics entered");
     if (!characteristics) return E_POINTER;
     std::lock_guard<std::mutex> guard(m_lock);
     if (m_shutdown) return MF_E_SHUTDOWN;
@@ -85,6 +116,7 @@ IFACEMETHODIMP MediaSource::GetCharacteristics(DWORD* characteristics) {
 }
 
 IFACEMETHODIMP MediaSource::CreatePresentationDescriptor(IMFPresentationDescriptor** descriptor) {
+    TraceLine(L"MediaSource::CreatePresentationDescriptor entered");
     if (!descriptor) return E_POINTER;
     *descriptor = nullptr;
 
@@ -110,6 +142,7 @@ IFACEMETHODIMP MediaSource::CreatePresentationDescriptor(IMFPresentationDescript
 IFACEMETHODIMP MediaSource::Start(IMFPresentationDescriptor* descriptor,
                                   const GUID* timeFormat,
                                   const PROPVARIANT* /*startPosition*/) {
+    TraceLine(L"MediaSource::Start entered");
     if (!descriptor) return E_POINTER;
     // A live source only understands the default time format. Saying so is what
     // the reference sample does; silently ignoring a format we cannot honour
@@ -162,6 +195,7 @@ IFACEMETHODIMP MediaSource::Start(IMFPresentationDescriptor* descriptor,
     // queue wants would be ambiguous now that the class has four interface roots.
     ComPtr<IUnknown> stream;
     hr = this->QueryInterface(IID_PPV_ARGS(stream.GetAddressOf()));
+    TraceHr(L"MediaSource::Start: QueryInterface(IUnknown) for stream event", hr);
     if (FAILED(hr)) return hr;
     hr = m_events->QueueEventParamUnk(MENewStream, GUID_NULL, S_OK, stream.Get());
     if (FAILED(hr)) return hr;
@@ -219,22 +253,53 @@ IFACEMETHODIMP MediaSource::Shutdown() {
 // IMFMediaSourceEx
 // ---------------------------------------------------------------------------
 IFACEMETHODIMP MediaSource::GetSourceAttributes(IMFAttributes** attributes) {
+    TraceLine(L"MediaSource::GetSourceAttributes entered");
     if (!attributes) return E_POINTER;
     *attributes = nullptr;
 
     std::lock_guard<std::mutex> guard(m_lock);
     if (m_shutdown) return MF_E_SHUTDOWN;
 
-    // Built in the constructor. If Media Foundation was not ready then, the store
-    // is null; build it now instead of reporting a source whose attributes cannot
-    // be handed out - that would surface as a different Start failure later.
-    if (!m_sourceAttributes && FAILED(MFCreateAttributes(&m_sourceAttributes, 2))) {
-        return E_OUTOFMEMORY;
+    // The Windows virtual-camera reference sample attaches a sensor-profile
+    // collection to the source attributes. Its Legacy profile is mandatory for
+    // compatibility with applications that do not understand camera profiles.
+    if (!m_sourceAttributes) {
+        HRESULT hr = MFCreateAttributes(&m_sourceAttributes, 2);
+        TraceHr(L"MediaSource::GetSourceAttributes: MFCreateAttributes", hr);
+        if (FAILED(hr)) return hr;
     }
-    return m_sourceAttributes.CopyTo(attributes);
+
+    ComPtr<IMFSensorProfileCollection> profiles;
+    HRESULT hr = MFCreateSensorProfileCollection(&profiles);
+    TraceHr(L"MediaSource::GetSourceAttributes: MFCreateSensorProfileCollection", hr);
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IMFSensorProfile> legacyProfile;
+    hr = MFCreateSensorProfile(KSCAMERAPROFILE_Legacy, 0, nullptr, &legacyProfile);
+    TraceHr(L"MediaSource::GetSourceAttributes: MFCreateSensorProfile(Legacy)", hr);
+    if (FAILED(hr)) return hr;
+
+    hr = legacyProfile->AddProfileFilter(
+        kStreamId, L"((RES==;FRT<=30,1;SUT==))");
+    TraceHr(L"MediaSource::GetSourceAttributes: Legacy AddProfileFilter", hr);
+    if (FAILED(hr)) return hr;
+
+    hr = profiles->AddProfile(legacyProfile.Get());
+    TraceHr(L"MediaSource::GetSourceAttributes: Legacy AddProfile", hr);
+    if (FAILED(hr)) return hr;
+
+    hr = m_sourceAttributes->SetUnknown(
+        MF_DEVICEMFT_SENSORPROFILE_COLLECTION, profiles.Get());
+    TraceHr(L"MediaSource::GetSourceAttributes: Set sensor profile collection", hr);
+    if (FAILED(hr)) return hr;
+
+    const HRESULT copied = m_sourceAttributes.CopyTo(attributes);
+    TraceHr(L"MediaSource::GetSourceAttributes: CopyTo", copied);
+    return copied;
 }
 
 IFACEMETHODIMP MediaSource::GetStreamAttributes(DWORD streamId, IMFAttributes** attributes) {
+    TraceLine(L"MediaSource::GetStreamAttributes entered");
     if (!attributes) return E_POINTER;
     *attributes = nullptr;
 
@@ -422,6 +487,7 @@ IFACEMETHODIMP MediaSource::KsEvent(PKSEVENT event, ULONG eventLength,
 // IMFSampleAllocatorControl
 // ---------------------------------------------------------------------------
 IFACEMETHODIMP MediaSource::SetDefaultAllocator(DWORD outputStreamId, IUnknown* allocator) {
+    TraceLine(L"MediaSource::SetDefaultAllocator entered");
     std::lock_guard<std::mutex> guard(m_lock);
     if (m_shutdown) return MF_E_SHUTDOWN;
     if (outputStreamId != kStreamId) return MF_E_INVALIDSTREAMNUMBER;
@@ -432,6 +498,7 @@ IFACEMETHODIMP MediaSource::SetDefaultAllocator(DWORD outputStreamId, IUnknown* 
 
     ComPtr<IMFVideoSampleAllocator> provided;
     HRESULT hr = allocator->QueryInterface(IID_PPV_ARGS(provided.GetAddressOf()));
+    TraceHr(L"MediaSource::SetDefaultAllocator: QueryInterface(IMFVideoSampleAllocator)", hr);
     if (FAILED(hr)) return hr;
 
     m_sampleAllocator = provided;
@@ -441,6 +508,7 @@ IFACEMETHODIMP MediaSource::SetDefaultAllocator(DWORD outputStreamId, IUnknown* 
 
 IFACEMETHODIMP MediaSource::GetAllocatorUsage(DWORD outputStreamId, DWORD* inputStreamId,
                                               MFSampleAllocatorUsage* usage) {
+    TraceLine(L"MediaSource::GetAllocatorUsage entered");
     if (!inputStreamId || !usage) return E_POINTER;
     // Defined outputs even on the failure paths, so a caller that ignores the
     // result cannot read an uninitialised enum. UsesProvidedAllocator is not just

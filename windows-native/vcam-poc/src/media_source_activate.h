@@ -21,6 +21,10 @@
 #include <wrl/client.h>
 #include <wrl/implements.h>
 
+//: QueryInterface tracing for the objects this DLL owns. Compiles to nothing
+//: when PB_TRACE_QUERY_INTERFACE is 0.
+#include "query_trace.h"
+
 namespace phonebridge {
 
 //: The CLSID of the custom media source, defined here exactly once: the class
@@ -42,12 +46,20 @@ inline constexpr wchar_t kSourceClsidString[] = L"{7F1B3C1E-9D62-4C2B-9E7A-5B4C0
 //: refuse to unload a DLL the frame server may still call into.
 inline std::atomic<long> g_serverLocks{0};
 
-class MediaSourceActivate
-    : public Microsoft::WRL::RuntimeClass<
-          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
-          IMFActivate> {
+//: The WRL base, named so the diagnostic QueryInterface override can forward to
+//: WRL's implementation rather than reimplementing interface dispatch.
+using MediaSourceActivateRuntime = Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IMFActivate>;
+
+class MediaSourceActivate : public MediaSourceActivateRuntime {
 public:
     MediaSourceActivate();
+
+#if PB_TRACE_QUERY_INTERFACE
+    //: Diagnostic only: logs the requested IID and the HRESULT, then returns
+    //: WRL's own answer unchanged.
+    STDMETHOD(QueryInterface)(REFIID riid, void** object) noexcept override;
+#endif
 
     // IMFActivate
     IFACEMETHODIMP ActivateObject(REFIID iid, void** object) override;
@@ -86,8 +98,7 @@ public:
     IFACEMETHODIMP LockStore() override;
     IFACEMETHODIMP UnlockStore() override;
     IFACEMETHODIMP GetCount(UINT32* count) override;
-    IFACEMETHODIMP GetAllItems(REFGUID* keys, PROPVARIANT* values, UINT32 size, UINT32* count)
-        override;
+    IFACEMETHODIMP GetItemByIndex(UINT32 index, GUID* key, PROPVARIANT* value) override;
     IFACEMETHODIMP CopyAllItems(IMFAttributes* destination) override;
 
 private:
@@ -102,11 +113,14 @@ private:
 };
 
 //: The class factory `DllGetClassObject` returns.
-class ClassFactory
-    : public Microsoft::WRL::RuntimeClass<
-          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
-          IClassFactory> {
+using ClassFactoryRuntime = Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IClassFactory>;
+
+class ClassFactory : public ClassFactoryRuntime {
 public:
+#if PB_TRACE_QUERY_INTERFACE
+    STDMETHOD(QueryInterface)(REFIID riid, void** object) noexcept override;
+#endif
     IFACEMETHODIMP CreateInstance(IUnknown* outer, REFIID iid, void** object) override;
     IFACEMETHODIMP LockServer(BOOL lock) override;
 };

@@ -55,7 +55,7 @@ Last verified: 2026-11-08.
 | Item | Evidence |
 | --- | --- |
 | ✅ Manifest surface | one exported component (the launcher activity); service `exported="false"`; `allowBackup="false"`; no storage, camera or media permissions declared |
-| ✅ Foreground service correctness | `foregroundServiceType="connectedDevice"` + the two permissions Android 14 requires for it |
+| ✅ Foreground service correctness | `foregroundServiceType="connectedDevice|camera|microphone|mediaPlayback"` + the four `FOREGROUND_SERVICE*` permissions Android 14 requires; the camera/microphone types are claimed only while the matching runtime permission is held, with a connection-only fallback |
 | ✅ Permissions UX | `PermissionsCard` distinguishes granted / denied / **permanently denied** (offers system settings, not a dead-end dialog) / not applicable, re-reads state on a timer, and logs revocations into the bridge log |
 | ✅ Onboarding | new dismissal-persisted **Start here** card on a fresh install (bridge off, no peers, no pairing) with the three steps that actually matter |
 | ✅ Destructive action | "Forget all paired PCs" now asks for confirmation and explains the consequence (re-pairing required) |

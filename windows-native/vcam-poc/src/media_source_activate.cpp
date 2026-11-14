@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <stdio.h>
 
 namespace {
 
@@ -40,12 +41,57 @@ HRESULT EnsureMediaFoundation() {
     return hr;
 }
 
+// Temporary diagnostics for the in-process Media Foundation activation path.
+// Capture with DebugView (Capture Global Win32) and filter for [PhoneBridge].
+void TraceLine(const wchar_t* message) {
+    ::OutputDebugStringW(L"[PhoneBridge] ");
+    ::OutputDebugStringW(message);
+    ::OutputDebugStringW(L"\n");
+}
+
+void TraceGuid(const wchar_t* label, REFGUID value) {
+    wchar_t guid[40] = {};
+    if (StringFromGUID2(value, guid, 40) > 0) {
+        ::OutputDebugStringW(L"[PhoneBridge] ");
+        ::OutputDebugStringW(label);
+        ::OutputDebugStringW(L": ");
+        ::OutputDebugStringW(guid);
+        ::OutputDebugStringW(L"\n");
+    } else {
+        TraceLine(L"GUID formatting failed");
+    }
+}
+
+void TraceHr(const wchar_t* label, HRESULT hr) {
+    wchar_t line[160] = {};
+    swprintf_s(line, L"%ls: hr=0x%08lX", label, static_cast<unsigned long>(hr));
+    TraceLine(line);
+}
+
 }  // namespace
 
 namespace phonebridge {
 
 // kSourceClsid / kSourceClsidString are defined once, in the header, so that the
 // host executable and this DLL cannot disagree about the CLSID.
+
+#if PB_TRACE_QUERY_INTERFACE
+// Diagnostic: record every QueryInterface that reaches one of our two entry-point
+// objects, then return WRL's answer unchanged. A "QI MISS" line here is the exact
+// interface a caller wanted and did not get - which is the information
+// IMFVirtualCamera::Start refuses to give us.
+STDMETHODIMP MediaSourceActivate::QueryInterface(REFIID riid, void** object) noexcept {
+    const HRESULT hr = MediaSourceActivateRuntime::QueryInterface(riid, object);
+    trace::Query(L"MediaSourceActivate", riid, hr);
+    return hr;
+}
+
+STDMETHODIMP ClassFactory::QueryInterface(REFIID riid, void** object) noexcept {
+    const HRESULT hr = ClassFactoryRuntime::QueryInterface(riid, object);
+    trace::Query(L"ClassFactory", riid, hr);
+    return hr;
+}
+#endif
 
 MediaSourceActivate::MediaSourceActivate() {
     // Checked, not dropped: this is the store the frame server writes its
@@ -54,23 +100,38 @@ MediaSourceActivate::MediaSourceActivate() {
 }
 
 IFACEMETHODIMP MediaSourceActivate::ActivateObject(REFIID iid, void** object) {
+    TraceLine(L"ActivateObject: entered");
+    TraceGuid(L"ActivateObject: requested IID", iid);
     if (!object) return E_POINTER;
     *object = nullptr;
     if (FAILED(m_attributeInitHr) || !m_attributes) {
-        // Better a clear failure here than a source that starts and then cannot be
-        // configured, which would look like a pipeline fault.
-        return FAILED(m_attributeInitHr) ? m_attributeInitHr : E_UNEXPECTED;
+        const HRESULT failure = FAILED(m_attributeInitHr) ? m_attributeInitHr : E_UNEXPECTED;
+        TraceHr(L"ActivateObject: attribute store unavailable", failure);
+        return failure;
     }
     if (m_activated) {
         // Activated twice with a different interface: hand back the same object,
         // which is what a real device enumerator expects.
-        return m_activated->QueryInterface(iid, object);
+        const HRESULT hr = m_activated->QueryInterface(iid, object);
+        TraceHr(L"ActivateObject: existing object QueryInterface", hr);
+        return hr;
     }
     auto source = Microsoft::WRL::Make<MediaSource>();
+    TraceHr(L"ActivateObject: source creation", source ? S_OK : E_OUTOFMEMORY);
     if (!source) return E_OUTOFMEMORY;
     HRESULT hr = source->QueryInterface(iid, object);
+    TraceHr(L"ActivateObject: requested-interface QueryInterface", hr);
     if (FAILED(hr)) return hr;
-    m_activated = source;
+    hr = source.As(&m_activated);
+    TraceHr(L"ActivateObject: retain source as IUnknown", hr);
+    if (FAILED(hr)) {
+        if (*object) {
+            reinterpret_cast<IUnknown*>(*object)->Release();
+            *object = nullptr;
+        }
+        return hr;
+    }
+    TraceLine(L"ActivateObject: succeeded");
     return S_OK;
 }
 
@@ -181,9 +242,8 @@ IFACEMETHODIMP MediaSourceActivate::UnlockStore() {
 IFACEMETHODIMP MediaSourceActivate::GetCount(UINT32* count) {
     PB_FORWARD_WITH(MF_E_ATTRIBUTENOTFOUND, GetCount(count));
 }
-IFACEMETHODIMP MediaSourceActivate::GetAllItems(REFGUID* keys, PROPVARIANT* values, UINT32 size,
-                                                UINT32* count) {
-    PB_FORWARD_WITH(MF_E_ATTRIBUTENOTFOUND, GetAllItems(keys, values, size, count));
+IFACEMETHODIMP MediaSourceActivate::GetItemByIndex(UINT32 index, GUID* key, PROPVARIANT* value) {
+    PB_FORWARD_WITH(MF_E_ATTRIBUTENOTFOUND, GetItemByIndex(index, key, value));
 }
 IFACEMETHODIMP MediaSourceActivate::CopyAllItems(IMFAttributes* destination) {
     PB_FORWARD_WITH(MF_E_ATTRIBUTENOTFOUND, CopyAllItems(destination));
@@ -195,12 +255,16 @@ IFACEMETHODIMP MediaSourceActivate::CopyAllItems(IMFAttributes* destination) {
 // IClassFactory
 // ---------------------------------------------------------------------------
 IFACEMETHODIMP ClassFactory::CreateInstance(IUnknown* outer, REFIID iid, void** object) {
+    TraceLine(L"ClassFactory::CreateInstance: entered");
+    TraceGuid(L"ClassFactory::CreateInstance: requested IID", iid);
     if (!object) return E_POINTER;
     *object = nullptr;
     if (outer) return CLASS_E_NOAGGREGATION;
     auto activate = Microsoft::WRL::Make<MediaSourceActivate>();
     if (!activate) return E_OUTOFMEMORY;
-    return activate->QueryInterface(iid, object);
+    const HRESULT hr = activate->QueryInterface(iid, object);
+    TraceHr(L"ClassFactory::CreateInstance: result", hr);
+    return hr;
 }
 
 IFACEMETHODIMP ClassFactory::LockServer(BOOL lock) {
@@ -218,14 +282,23 @@ IFACEMETHODIMP ClassFactory::LockServer(BOOL lock) {
 // DLL exports — the frame server loads this DLL by CLSID and calls these.
 // ---------------------------------------------------------------------------
 STDAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void** object) {
+    TraceGuid(L"DllGetClassObject: CLSID", clsid);
+    TraceGuid(L"DllGetClassObject: requested IID", iid);
     if (!object) return E_POINTER;
     *object = nullptr;
-    if (!IsEqualGUID(clsid, phonebridge::kSourceClsid)) return CLASS_E_CLASSNOTAVAILABLE;
+    if (!IsEqualGUID(clsid, phonebridge::kSourceClsid)) {
+        TraceLine(L"DllGetClassObject: CLSID mismatch");
+        return CLASS_E_CLASSNOTAVAILABLE;
+    }
+    TraceLine(L"DllGetClassObject: CLSID matched");
     const HRESULT mf = EnsureMediaFoundation();
+    TraceHr(L"DllGetClassObject: EnsureMediaFoundation", mf);
     if (FAILED(mf)) return mf;  // the frame server gets a real error, not a dead source
     auto factory = Microsoft::WRL::Make<phonebridge::ClassFactory>();
     if (!factory) return E_OUTOFMEMORY;
-    return factory->QueryInterface(iid, object);
+    const HRESULT hr = factory->QueryInterface(iid, object);
+    TraceHr(L"DllGetClassObject: result", hr);
+    return hr;
 }
 
 STDAPI DllCanUnloadNow() {

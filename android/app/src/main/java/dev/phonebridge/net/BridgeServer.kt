@@ -2,11 +2,13 @@ package dev.phonebridge.net
 
 import android.content.Context
 import android.util.Log
+import dev.phonebridge.BuildInfo
 import dev.phonebridge.Permissions
 import dev.phonebridge.protocol.Crypto
 import dev.phonebridge.protocol.Framing
 import dev.phonebridge.protocol.Json
 import dev.phonebridge.protocol.Messages
+import dev.phonebridge.protocol.SerialSender
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -21,6 +23,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
@@ -201,6 +204,20 @@ class BridgeServer(
         { runnable -> Thread(runnable, "phonebridge-phase5").apply { isDaemon = true } },
     )
 
+    /**
+     * Camera RPCs get their own thread.
+     *
+     * `camera.start` has to hand work to the main thread and wait for it, and the
+     * RPC handler runs while holding the peer session's lock. Waiting there would
+     * make the main thread wait for that lock in turn (its own stop path sends a
+     * frame), which is a ten-second stall and a failed request. Answering from
+     * another thread releases the lock first, and keeps the camera out of the
+     * Phase 5 queue where a busy Bluetooth read could delay it.
+     */
+    private val cameraExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "phonebridge-camera-rpc").apply { isDaemon = true }
+    }
+
     /** The PC that started the sensor stream, so its frames go to *that* session. */
     @Volatile
     private var sensorPeer: PeerSession? = null
@@ -274,16 +291,23 @@ class BridgeServer(
      * loop: heartbeats would starve and the very link the answer travels on would
      * drop. The reply goes through the normal send path, which is thread-safe.
      */
-    private fun answerLater(peer: PeerSession, id: Any?, block: () -> Map<String, Any?>) {
+    private fun answerLater(
+        peer: PeerSession,
+        id: Any?,
+        method: String = "",
+        executor: ExecutorService = phase5Executor,
+        block: () -> Map<String, Any?>,
+    ) {
+        val label = if (method.isEmpty()) "RPC" else "RPC $method"
         try {
-            phase5Executor.execute {
+            executor.execute {
                 val payload = try {
                     Messages.responseOk(id, block())
                 } catch (e: RpcFailure) {
-                    addLog("INFO", "RPC refused off-thread: ${e.code} - ${e.message}")
+                    addLog("INFO", "$label refused off-thread: ${e.code} - ${e.message}")
                     Messages.responseErr(id, e.code, e.message ?: e.code)
                 } catch (e: Exception) {
-                    addLog("ERROR", "RPC failed off-thread: ${e.message}")
+                    addLog("ERROR", "$label failed off-thread: ${e.javaClass.simpleName}: ${e.message}")
                     Messages.responseErr(id, "internal", "${e.javaClass.simpleName}: ${e.message}")
                 }
                 runCatching { peer.sendControl(payload) }
@@ -292,12 +316,12 @@ class BridgeServer(
         } catch (e: RejectedExecutionException) {
             // Better a sentence than a request that waits for a queue that never
             // drains: the PC can retry, and its own timeout stays meaningful.
-            addLog("WARN", "refusing an off-thread RPC: the Phase 5 queue is full")
+            addLog("WARN", "refusing an off-thread $label: the worker queue is full")
             peer.sendControl(
                 Messages.responseErr(
                     id,
                     "busy",
-                    "the phone is still busy with other Bluetooth or file work; retry shortly",
+                    "the phone is still busy with other work; retry shortly",
                 ),
             )
         }
@@ -520,6 +544,10 @@ class BridgeServer(
         files.release()
         bluetooth.release()
         phase5Executor.shutdownNow()
+        // The camera's own thread goes last: a queued camera.stop must be able to
+        // release the lens before the thread that would run it disappears.
+        camera.release()
+        cameraExecutor.shutdownNow()
         _running.value = false
         _peers.value = emptyList()
         addLog("INFO", "server stopped")
@@ -627,6 +655,29 @@ class BridgeServer(
         publishPeers()
         // The last PC leaving must not leave a microphone or an AudioTrack open.
         releaseAudioIfIdle()
+    }
+
+    /**
+     * Called whenever a session leaves the ready set.
+     *
+     * Nothing may stay open for a PC that is gone: this used to live inside
+     * `PeerSession`, where `unregisterSession` could not see it, so the whole
+     * file did not compile.
+     */
+    private fun releaseAudioIfIdle() {
+        if (sessions.none { it.isReady }) {
+            audio.release()
+            camera.release()
+            // A camera held open for a session that has gone is a privacy bug,
+            // so it is closed on the same edge as the microphone.
+            camera.onSessionClosed("last session ended")
+            // Phase 5: a sensor listener, a GATT link or a half-written file held
+            // open for a PC that is gone is a privacy and battery bug, so all three
+            // are released on the same edge as the microphone and the lens.
+            sensors.onSessionClosed("last session ended")
+            files.onSessionClosed("last session ended")
+            bluetooth.onSessionClosed("last session ended")
+        }
     }
 
     private fun publishPeers() {
@@ -804,6 +855,10 @@ class BridgeServer(
 
                 "audio.status" -> {
                     val s = audio.status()
+                    // The playback block is what tells the PC "the phone is
+                    // playing" from "the phone accepted a stream": the route it
+                    // chose, the AudioTrack's own state, the audio waiting in
+                    // front of it, and how many times the device ran dry.
                     Messages.responseOk(
                         id,
                         mapOf(
@@ -818,35 +873,46 @@ class BridgeServer(
                             "frames_out" to s["frames_out"],
                             "dropped" to s["dropped"],
                             "last_error" to s["last_error"],
+                            "route" to s["route"],
+                            "device_name" to s["device_name"],
+                            "track_state" to s["track_state"],
+                            "buffered_ms" to s["buffered_ms"],
+                            "buffer_ms" to s["buffer_ms"],
+                            "underruns" to s["underruns"],
+                            "played_ms" to s["played_ms"],
+                            "frames_written" to s["frames_written"],
                         ),
                     )
                 }
 
                 // --- Phase 4 camera ------------------------------------ //
+                // These three answer off the peer's thread: CameraX's lifecycle
+                // lives on the main thread, and waiting for it while holding the
+                // session lock would stall the phone (see [cameraExecutor]).
                 "camera.start" -> {
                     val requested = try {
                         VideoFrames.Config.fromParams(params)
                     } catch (e: IllegalArgumentException) {
                         throw RpcFailure("bad_config", e.message ?: "unsupported camera config")
                     }
-                    // Result maps are built here, not in CameraEngine, so the wire
-                    // contract sits next to the method name (docs/03 §6).
-                    val started = camera.start(requested)
-                    Messages.responseOk(
-                        id,
+                    answerLater(peer, id, "camera.start", cameraExecutor) {
+                        // Result maps are built here, not in CameraEngine, so the
+                        // wire contract sits next to the method name (docs/03 §6).
+                        val started = camera.start(requested)
                         mapOf(
                             "ok" to (started["ok"] as? Boolean ?: false),
                             "config" to started["config"],
-                        ),
-                    )
+                        )
+                    }
+                    null
                 }
 
                 "camera.stop" -> {
-                    camera.stop()
-                    Messages.responseOk(
-                        id,
-                        mapOf("ok" to true, "streaming" to false),
-                    )
+                    answerLater(peer, id, "camera.stop", cameraExecutor) {
+                        camera.stop()
+                        mapOf("ok" to true, "streaming" to false)
+                    }
+                    null
                 }
 
                 "camera.switch" -> {
@@ -854,18 +920,18 @@ class BridgeServer(
                     if (facing != "back" && facing != "front") {
                         throw RpcFailure("bad_config", "facing must be 'back' or 'front'")
                     }
-                    val next = VideoFrames.Config(
-                        width = camera.status()["width"] as? Int ?: 1280,
-                        height = camera.status()["height"] as? Int ?: 720,
-                        fps = camera.status()["fps"] as? Int ?: 15,
-                        facing = facing,
-                    )
-                    val streaming = camera.status()["streaming"] as? Boolean ?: false
-                    if (streaming) camera.start(next) else camera.stop()
-                    Messages.responseOk(
-                        id,
-                        mapOf("ok" to true, "facing" to facing, "streaming" to streaming),
-                    )
+                    answerLater(peer, id, "camera.switch", cameraExecutor) {
+                        val next = VideoFrames.Config(
+                            width = camera.status()["width"] as? Int ?: 1280,
+                            height = camera.status()["height"] as? Int ?: 720,
+                            fps = camera.status()["fps"] as? Int ?: 15,
+                            facing = facing,
+                        )
+                        val streaming = camera.status()["streaming"] as? Boolean ?: false
+                        if (streaming) camera.start(next) else camera.stop()
+                        mapOf("ok" to true, "facing" to facing, "streaming" to streaming)
+                    }
+                    null
                 }
 
                 "camera.status" -> {
@@ -1196,7 +1262,10 @@ class BridgeServer(
             // The six digits are for the screen the human compares, not for a
             // log file that outlives the pairing.
             addLog("INFO", "handshake with '$peerName' (${r.peerDeviceId}) known=$known")
-            sendRaw(ack)
+            if (!sendHandshake(ack)) {
+                close("send failed")
+                return
+            }
             stage = Stage.AWAIT_AUTH
         }
 
@@ -1241,6 +1310,11 @@ class BridgeServer(
                         "id" to identity.deviceId,
                         "name" to identity.name,
                         "capabilities" to capabilities(),
+                        // The PC prints this at connect. It is the only way to tell
+                        // "the APK has no latency probe" from "the phone is ignoring
+                        // the request", which cost an evening of guessing once.
+                        "build" to BuildInfo.id,
+                        "features" to BuildInfo.features,
                     )
                 )
                 return
@@ -1255,6 +1329,8 @@ class BridgeServer(
                     "name" to identity.name,
                     "sas" to Crypto.formatSas(sas),
                     "capabilities" to capabilities(),
+                    "build" to BuildInfo.id,
+                    "features" to BuildInfo.features,
                 )
             )
             stage = Stage.AWAIT_PAIR_CONFIRM
@@ -1338,24 +1414,6 @@ class BridgeServer(
 
         private fun responseSasNormalised(formatted: String) = formatted.replace(" ", "")
 
-        /** @return true when this session was admitted; false means it was closed. */
-        /** Called whenever a session leaves the ready set. */
-    private fun releaseAudioIfIdle() {
-        if (sessions.none { it.isReady }) {
-            audio.release()
-            camera.release()
-            // A camera held open for a session that has gone is a privacy bug,
-            // so it is closed on the same edge as the microphone.
-            camera.onSessionClosed("last session ended")
-            // Phase 5: a sensor listener, a GATT link or a half-written file held
-            // open for a PC that is gone is a privacy and battery bug, so all three
-            // are released on the same edge as the microphone and the lens.
-            sensors.onSessionClosed("last session ended")
-            files.onSessionClosed("last session ended")
-            bluetooth.onSessionClosed("last session ended")
-        }
-    }
-
     private fun markReady(): Boolean {
             cancelSetupTimeout()
             val refusal = admitSession(this, peerDeviceId)
@@ -1430,6 +1488,23 @@ class BridgeServer(
         fun sendControl(payload: ByteArray) =
             sendSecure(Messages.MSG_CONTROL, Messages.STREAM_CONTROL, payload)
 
+        /**
+         * Seal-then-write, one frame at a time.
+         *
+         * The counter is assigned inside `SecureCodec.seal` and the PC rejects a
+         * counter that is not strictly increasing, so a seal that is not
+         * serialised with the write turns two senders into a replay error: that
+         * is how a camera session died 27 seconds in. [SerialSender] owns that
+         * lock (and its JUnit test sends from many threads to pin it).
+         */
+        private val sender = SerialSender(
+            seal = { type, stream, payload -> requireKeys().seal(type, stream, payload) },
+            write = { bytes -> sendRaw(bytes) },
+        )
+
+        private fun requireKeys(): Crypto.SecureCodec =
+            codec ?: throw IllegalStateException("no session keys yet")
+
         fun sendSecure(msgType: Int, streamId: Int, payload: ByteArray) {
             val c = codec
             if (c == null) {
@@ -1439,25 +1514,37 @@ class BridgeServer(
                 addLog("WARN", "dropping msg 0x%02x: no session keys yet".format(msgType))
                 return
             }
-            try {
-                val env = c.seal(msgType, streamId, payload)
-                sendRaw(env)
+            // The session is closed *after* the send lock is released: `close`
+            // takes the stage lock, and the reader thread takes that lock before
+            // it sends, so closing inside the lock would invert the order and
+            // deadlock the first time a send failed.
+            val failure = try {
+                sender.send(msgType, streamId, payload)
+                null
             } catch (e: Exception) {
-                addLog("ERROR", "send failed: ${e.message}")
+                e
+            }
+            if (failure != null) {
+                addLog("ERROR", "send failed: ${failure.message}")
                 close("send failed")
             }
         }
 
+        /** One socket write. Throws on failure; the caller closes the session. */
         private fun sendRaw(bytes: ByteArray) {
-            try {
-                conn.send(bytes)
-                bumpOut(bytes.size)
-            } catch (e: Exception) {
-                // A failed send means the socket is gone; keeping the session
-                // "open" would keep answering RPCs that can never be delivered.
-                addLog("ERROR", "send failed: ${e.javaClass.simpleName}: ${e.message}")
-                close("send failed")
-            }
+            conn.send(bytes)
+            bumpOut(bytes.size)
+        }
+
+        /** The handshake's own frame, which is not sealed and takes no counter. */
+        private fun sendHandshake(bytes: ByteArray): Boolean = try {
+            sender.serialised { sendRaw(bytes) }
+            true
+        } catch (e: Exception) {
+            // A failed send means the socket is gone; keeping the session
+            // "open" would keep answering RPCs that can never be delivered.
+            addLog("ERROR", "send failed: ${e.javaClass.simpleName}: ${e.message}")
+            false
         }
 
         /**
@@ -1476,10 +1563,12 @@ class BridgeServer(
                 stage = Stage.DEAD
             }
             if (bye) {
-                // Best effort: the socket may already be gone.
+                // Best effort: the socket may already be gone. Sealed and written
+                // under the same lock as every other frame, so BYE carries the
+                // next counter rather than racing for it.
                 runCatching {
-                    codec?.let { c ->
-                        sendRaw(c.seal(Messages.MSG_BYE, Messages.STREAM_CONTROL, reason.toByteArray()))
+                    if (codec != null) {
+                        sender.send(Messages.MSG_BYE, Messages.STREAM_CONTROL, reason.toByteArray())
                     }
                 }.onFailure { addLog("WARN", "could not send BYE: ${it.message}") }
             }

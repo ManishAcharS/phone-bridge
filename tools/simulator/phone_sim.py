@@ -1034,7 +1034,14 @@ class SimulatedPhone:
             if not 320 <= width <= 3840 or not 240 <= height <= 2160 or not 1 <= fps <= 60:
                 raise RpcError("bad_params", f"unsupported camera configuration {width}x{height}@{fps}")
             self.camera.update(
-                {"streaming": True, "facing": facing, "width": width, "height": height, "fps": fps}
+                {
+                    "streaming": True,
+                    "facing": facing,
+                    "width": width,
+                    "height": height,
+                    "fps": fps,
+                    "quality": int(cfg.get("quality", self.camera.get("quality", 70))),
+                }
             )
             self.camera_seq = 0
             return {
@@ -1069,10 +1076,36 @@ class SimulatedPhone:
                 "fps": self.camera["fps"],
                 "frames_sent": self.camera_frames_sent,
                 "permitted": self.camera_permission,
+                # The phone's own measurement block, same keys as CameraEngine:
+                # `path` is the encoder actually in use, `capture_*` is the size
+                # CameraX really delivered. A simulator that omits them lets the
+                # PC's stats line look right while the phone's is broken.
+                "stats": {
+                    "fps": float(self.camera["fps"]),
+                    "encode_ms": 0.0,
+                    "send_ms": 0.0,
+                    "bytes_per_frame": 0,
+                    "quality": self.camera.get("quality", 70),
+                    "width": self.camera["width"],
+                    "height": self.camera["height"],
+                    "encoded": self.camera_frames_sent,
+                    "sent": self.camera_frames_sent,
+                    "dropped": 0,
+                    "path": "rgba",
+                    "path_reason": "the simulator draws RGB frames",
+                    "capture_width": self.camera["width"],
+                    "capture_height": self.camera["height"],
+                    "capture_layout": "simulated",
+                },
             }
 
         @r.register("audio.status")
         def _audio_status(_params: dict[str, Any]) -> dict[str, Any]:
+            # The playback block mirrors what AudioEngine reads off its
+            # AudioTrack. Simulated values, but the same shape and the same
+            # meaning: a PC that renders these against a fake phone renders them
+            # against the real one too.
+            playing = self.audio["playback"] == "active"
             return {
                 "playback": self.audio["playback"],
                 "mic": self.audio["mic"],
@@ -1082,6 +1115,14 @@ class SimulatedPhone:
                 "frames_in": self.audio_frames_in,
                 "frames_out": self.audio_frames_out,
                 "permitted": self.mic_permission,
+                "route": "speaker" if playing else "none",
+                "device_name": "simulated speaker" if playing else "",
+                "track_state": "playing" if playing else "no_track",
+                "buffered_ms": 0,
+                "buffer_ms": 80 if playing else 0,
+                "underruns": 0,
+                "played_ms": 0,
+                "frames_written": self.audio_frames_in if playing else 0,
             }
 
         @r.register("audio.capabilities.last")
@@ -1569,11 +1610,15 @@ class SimulatedPhone:
             elif msg_type == MSG_PING:
                 await self._send_frame(ws, _seal(codec, pong_payload(parse_ping(payload)), MSG_PONG))
             elif msg_type == MSG_AUDIO:
+                # MIC_STREAM is a *stream id*, so it lives with the link, not with
+                # the frame codec. Importing it from `.frames` raised ImportError on
+                # the first audio frame, which closed the whole session — the audio
+                # path was therefore never exercised end to end here.
                 from phonebridge.audio.frames import (  # noqa: PLC0415
-                    MIC_STREAM,
                     AudioFrameError,
                     decode_frame,
                 )
+                from phonebridge.audio.link import MIC_STREAM  # noqa: PLC0415
 
                 try:
                     frame = decode_frame(payload)

@@ -131,6 +131,17 @@ class PhoneInfo:
     sas_digits: str
     protocol_version: int = 1
     capabilities: dict[str, Any] = field(default_factory=dict)
+    #: The phone app's own build, e.g. ``1.0.0 (1) e807c93a``. Empty when the APK
+    #: predates the field — which is itself the answer to "why did that feature do
+    #: nothing": an old APK cannot tell you it is old, so the PC says "no build".
+    build: str = ""
+    #: Build-level features (``latency_probe``, ``fps_range``, ``adaptive_queue``).
+    #: A missing key means "this APK was built before that feature existed".
+    features: dict[str, Any] = field(default_factory=dict)
+
+    def has(self, feature: str) -> bool:
+        """Whether this APK advertises ``feature``. Unknown builds answer False."""
+        return bool(self.features.get(feature))
 
 
 PairingConfirm = Callable[[str], Awaitable[bool] | bool]
@@ -357,6 +368,8 @@ class BridgeSession:
                 paired=True,
                 sas_digits=keys.sas_digits,
                 capabilities=reply.get("capabilities") or {},
+                build=str(reply.get("build") or ""),
+                features=dict(reply.get("features") or {}),
             )
             # auth_ok means the phone has *us* pinned. If our own pin list does
             # not know it (fresh profile, restored backup, deleted peers.json),
@@ -385,6 +398,8 @@ class BridgeSession:
             paired=False,
             sas_digits=keys.sas_digits,
             capabilities=reply.get("capabilities") or {},
+            build=str(reply.get("build") or ""),
+            features=dict(reply.get("features") or {}),
         )
         confirmed = False
         if self.confirm_pairing is not None:

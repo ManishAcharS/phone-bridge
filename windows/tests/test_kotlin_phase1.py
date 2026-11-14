@@ -151,12 +151,30 @@ def test_graceful_stop_sends_bye_first() -> None:
 
 def test_send_failures_close_the_session_instead_of_being_swallowed() -> None:
     text = read(SERVER)
+    # The write itself no longer closes the session: the send lock is held around
+    # seal+write, and closing a session takes the stage lock, so a `close` inside
+    # the write would invert the lock order. `sendRaw` throws and `sendSecure`
+    # closes *after* the lock is released - the failure is still never swallowed.
     send_raw = body_after(text, "private fun sendRaw(")
-    catch = send_raw[send_raw.index("catch") :]
-    assert 'close("send failed")' in catch, "a dead socket must not stay 'open'"
-    assert 'addLog("ERROR"' in catch, "the failure must be visible in the log"
+    assert "catch" not in send_raw, "the write must report failure, not hide it"
+    assert "throw" in send_raw or "conn.send(bytes)" in send_raw
+
     send_secure = body_after(text, "fun sendSecure(")
     assert "no session keys yet" in send_secure, "a dropped frame must be logged"
+    assert 'close("send failed")' in send_secure, "a dead socket must not stay 'open'"
+    assert 'addLog("ERROR", "send failed' in send_secure, (
+        "the failure must be visible in the log"
+    )
+    # …and it happens outside the critical section.
+    lock_start = send_secure.index("sender.send(")
+    assert send_secure.index('close("send failed")') > lock_start
+
+    # The handshake's own frame has its own helper: it carries no counter but it
+    # is written under the same lock.
+    at = text.index("private fun sendHandshake(")
+    handshake = text[at : at + 700]
+    assert "sender.serialised {" in handshake
+    assert "false" in handshake, "the caller must learn that the reply did not go out"
 
 
 def test_malformed_hello_is_refused_before_pairing() -> None:
@@ -259,5 +277,5 @@ def test_beacon_restart_cannot_leak_the_previous_worker() -> None:
 
 def test_manifest_still_declares_the_connected_device_service() -> None:
     manifest = read(MANIFEST)
-    assert 'android:foregroundServiceType="connectedDevice"' in manifest
+    assert 'android:foregroundServiceType="connectedDevice|camera|microphone|mediaPlayback"' in manifest
     assert "FOREGROUND_SERVICE_CONNECTED_DEVICE" in manifest

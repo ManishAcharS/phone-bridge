@@ -109,6 +109,33 @@ def test_status_lists_both_directions_and_the_permission_flag(phone) -> None:
     assert isinstance(result["muted"], bool)
 
 
+def test_status_carries_the_playback_block_the_pc_prints(phone) -> None:
+    """The PC's speaker line is built from these keys, so the fake phone has them too.
+
+    They are simulated (there is no `AudioTrack` in the simulator), but the shape
+    is the phone's real one: a PC that renders them against the simulator renders
+    them against the Redmi as well.
+    """
+    ask(phone, "audio.playback.start", {})
+    result = ask(phone, "audio.status")["result"]
+
+    assert result["route"] in ("speaker", "bluetooth_a2dp", "bluetooth_sco", "none")
+    assert isinstance(result["track_state"], str)
+    assert isinstance(result["underruns"], int)
+    assert isinstance(result["buffered_ms"], int)
+    assert isinstance(result["buffer_ms"], int)
+    assert isinstance(result["played_ms"], int)
+    assert isinstance(result["frames_written"], int)
+
+
+def test_an_idle_phone_reports_no_route(phone) -> None:
+    result = ask(phone, "audio.status")["result"]
+
+    assert result["playback"] == "idle"
+    assert result["route"] == "none"
+    assert result["track_state"] == "no_track"
+
+
 def test_the_phone_declares_audio_implemented_rather_than_leaving_it_to_inference(phone) -> None:
     """`implemented.*` is what lets the PC separate "no hardware" from "not built"."""
     caps = phone.capabilities()

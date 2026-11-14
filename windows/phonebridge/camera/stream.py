@@ -192,6 +192,25 @@ class CameraStream:
         self._set(ACTIVE)
         return True
 
+    def adopt(self, session: Any) -> None:
+        """Point the stream at a new session after a reconnect.
+
+        The phone closes its camera when the session that asked for it goes away
+        (``CameraEngine.onSessionClosed``), so a reconnected link is a link with
+        no picture. This puts the stream back to IDLE - the receive task and the
+        old queue belonged to the dead session - so :meth:`start` issues a fresh
+        ``camera.start`` instead of returning "already active".
+        """
+        task = self._task
+        self._task = None
+        if task is not None and not task.done():
+            task.cancel()
+        self._session = session
+        self._queue = None
+        self._state = IDLE
+        self._detail = ""
+        self._frame = None
+
     async def stop(self, reason: str = "stopped") -> None:
         """Stop the phone's camera and drop every buffered frame."""
         if self._state == IDLE:
@@ -214,6 +233,7 @@ class CameraStream:
             fps=self._config.fps,
             quality=self._config.quality,
             facing=facing,
+            fixed_fps=self._config.fixed_fps,
         )
         if not self.active:
             # Not streaming yet: just record the choice.
@@ -330,5 +350,20 @@ def _granted_config(reply: Any, fallback: VideoConfig) -> VideoConfig:
 
 
 def _explain(prefix: str, exc: Exception) -> str:
+    """Turn a refusal into one sentence that keeps the phone's code verbatim.
+
+    An RPC refusal arrives as ``SessionError("camera_busy: the camera could not
+    be opened (...)")`` — the code *and* the phone's own words, which is exactly
+    what the user needs to paste into a bug report. Splitting them out makes the
+    sentence readable without rewriting a single character of the message.
+    """
     text = str(exc).strip() or type(exc).__name__
+    code = str(getattr(exc, "code", "") or "")
+    detail = text
+    if not code:
+        head, sep, rest = text.partition(": ")
+        if sep and head.isidentifier() and head.islower() and rest:
+            code, detail = head, rest
+    if code:
+        return f"{prefix} ({code}): {detail}"
     return f"{prefix}: {text}"

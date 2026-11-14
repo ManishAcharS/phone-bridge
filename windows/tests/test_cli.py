@@ -728,14 +728,14 @@ def test_documented_methods_are_the_ones_the_reference_phone_implements(running_
 
 
 @pytest.mark.parametrize(
-    "verb", ["telepathy", "hologram", "camera", "hologram-export", "sensors-old"]
+    "verb", ["telepathy", "hologram", "hologram-export", "sensors-old"]
 )
 def test_there_is_no_command_for_a_protocol_v1_gap(pc_config, verb, capsys):
-    """No fake verbs: anything the protocol does not define stays absent.
+    """No fake verbs: anything nobody implements stays absent.
 
-    Phase 5 gave `files`, `sensors` and `bluetooth` real subcommands, so they are
-    no longer examples of a gap; `camera` (a *media kind*, never an RPC verb)
-    still is, and so is any name nobody defined.
+    Phase 5 gave `files`, `sensors` and `bluetooth` real subcommands, and the live
+    delivery work gave `camera`, `mic`, `speaker` and `start` theirs, so none of
+    those is an example of a gap any more. A name nobody defined still is.
     """
     with pytest.raises(SystemExit) as exit_info:
         main(cli(pc_config, verb))

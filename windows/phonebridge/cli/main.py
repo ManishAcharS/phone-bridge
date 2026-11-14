@@ -9,6 +9,11 @@ Inspect and drive a phone link from the PC:
     phonebridge discover [--json]        listen for phone beacons
     phonebridge info                     device information (JSON by default)
     phonebridge capabilities             capability table, honest about today
+    phonebridge camera --virtual         phone camera -> Windows webcam device
+    phonebridge mic --to-cable           phone mic -> VB-CABLE ("CABLE Output")
+    phonebridge speaker                  PC audio -> phone -> Bluetooth headphones
+    phonebridge start --camera --mic --speaker
+                                         all three on one session, one status line
     phonebridge audio status|last        headset state and the last audio probe
     phonebridge bluetooth scan|gatt      BLE scan, services, read/write/watch
     phonebridge sensors list|stream      sensor discovery and live readings
@@ -1212,9 +1217,10 @@ def build_parser() -> argparse.ArgumentParser:
     csub.add_parser("show", help="print stored records with their findings")
     csub.add_parser("compare", help="print the comparison table only")
 
-    from . import planes
+    from . import live, planes
 
     planes.add_parsers(sub)
+    live.add_parsers(sub)
 
     crep = csub.add_parser("report", help="write the Markdown compatibility report")
     crep.add_argument("--out", default=str(Path("docs") / "09-compat-report.md"),
@@ -1258,6 +1264,10 @@ def _dispatch(args: argparse.Namespace) -> int:
         if args.compat_command == "report":
             return _compat_report(args)
         raise CliError(f"unknown compat command {args.compat_command!r}")
+    if args.command in ("camera", "mic", "speaker", "start"):
+        from . import live
+
+        return live.run(args)
     if args.command in ("bluetooth", "sensors", "files"):
         from . import planes
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +27,7 @@ from ..core.session import (
     SessionError,
     TerminalSessionError,
 )
+from ..live.usb import ensure_forward, is_loopback
 from ..transport.link import DEFAULT_PORT, LinkError, WebSocketLink, websocket_uri
 
 # Exit codes, part of the CLI contract (documented in docs/11-pc-client.md).
@@ -223,6 +225,53 @@ def connect_hint(target: Target) -> str:
     )
 
 
+def reconnect_factory(
+    args: Any,
+    store: DeviceStore,
+    target: Target,
+) -> Callable[[], Any]:
+    """A callable that opens a fresh authenticated session to ``target``.
+
+    Used by the live commands: when the link drops mid-stream the runner calls
+    this, swaps the new session in, and asks the phone for every stream again.
+    Pairing is not repeated - an established peer authenticates with its pinned
+    key - so the only prompt that can still appear is the one for a phone that
+    has lost its pairing, which is a decision, not a retry.
+    """
+
+    auto_pair = bool(getattr(args, "auto_pair", False))
+    confirm = (lambda _sas: True) if auto_pair else pairing_prompt
+    request_timeout = float(getattr(args, "request_timeout", 15.0) or 15.0)
+    connect_timeout = float(getattr(args, "connect_timeout", 6.0) or 6.0)
+
+    async def connect() -> Any:
+        # Everything is read here, not when the factory is built: this callable
+        # is created for every live run, and building it must not touch the
+        # keystore (or a caller that never loses the link never needs it).
+        if is_loopback(target.host):
+            # `adb forward` is removed when the cable comes out, so a re-plug
+            # leaves every retry dialling a local port nothing is listening on.
+            # Re-create it first, every attempt: it is idempotent, and a failure
+            # here must not replace the connection error the user needs to see.
+            forwarded, why = ensure_forward(target.port)
+            if not forwarded:
+                note(f"  adb forward: {why}")
+        identity = store.load_or_create_identity()
+        uri = websocket_uri(target.host, target.port)
+        session = BridgeSession(
+            uri,
+            identity,
+            store,
+            confirm_pairing=confirm,
+            request_timeout=request_timeout,
+            link=WebSocketLink(uri, connect_timeout=connect_timeout),
+        )
+        await session.open()
+        return session
+
+    return connect
+
+
 async def open_session(
     args: Any,
     store: DeviceStore,
@@ -289,7 +338,12 @@ async def open_session(
     )
     if not quiet and session.phone is not None:
         state = "paired" if session.phone.paired else "newly paired"
-        note(f"connected to {session.phone.name} ({state}) over {uri}")
+        # The build goes on this line because it is the line people read when
+        # something later behaves like an older version: an APK built before a
+        # feature reports no build at all, and "no build" is a diagnosis.
+        build = session.phone.build
+        suffix = f" - app {build}" if build else " - app build not reported (APK older than this field)"
+        note(f"connected to {session.phone.name} ({state}) over {uri}{suffix}")
     return session, target
 
 

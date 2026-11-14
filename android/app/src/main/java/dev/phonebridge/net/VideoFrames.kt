@@ -40,6 +40,17 @@ object VideoFrames {
         val fps: Int = 15,
         val quality: Int = 70,
         val facing: String = "back",
+        /**
+         * Pin the exposure's frame-rate range to exactly [fps] instead of letting
+         * the device pick a slower one in low light.
+         *
+         * A camera in a dim room trades frame rate for exposure: it drops to
+         * 20-24 fps (as this Xiaomi did at 640x480) or all the way to 15, and the
+         * picture is *brighter* for it. Pinning the range to (fps, fps) makes the
+         * capture rate predictable and the picture darker, which is why it is a
+         * choice the PC makes rather than a default nobody can undo.
+         */
+        val fixedFps: Boolean = true,
     ) {
         fun asMap(): Map<String, Any> = linkedMapOf(
             "width" to width,
@@ -47,6 +58,7 @@ object VideoFrames {
             "fps" to fps,
             "quality" to quality,
             "facing" to facing,
+            "fixed_fps" to fixedFps,
         )
 
         companion object {
@@ -59,13 +71,17 @@ object VideoFrames {
                 val fps = (map["fps"] as? Number)?.toInt() ?: 15
                 val quality = (map["quality"] as? Number)?.toInt() ?: 70
                 val facing = (map["facing"] as? String) ?: "back"
+                // Absent means the modern behaviour (fixed range); an older PC
+                // sends nothing and gets the frame rate it asked for.
+                val fixedFps = (map["fixed_fps"] as? Boolean)
+                    ?: ((map["fixed_fps"] as? Number)?.toInt()?.let { it != 0 } ?: true)
                 require(width in 320..3840 && height in 240..2160) {
                     "unsupported resolution ${width}x$height"
                 }
                 require(fps in 1..60) { "unsupported frame rate $fps" }
                 require(quality in 20..95) { "unsupported JPEG quality $quality" }
                 require(facing == "back" || facing == "front") { "unknown camera $facing" }
-                return Config(width, height, fps, quality, facing)
+                return Config(width, height, fps, quality, facing, fixedFps)
             }
         }
     }

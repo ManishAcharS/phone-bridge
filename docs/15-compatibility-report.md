@@ -49,15 +49,22 @@ loopback; that number describes the crypto path, not real Wi-Fi.
 | --- | --- | --- |
 | 8.0 – 11 (API 26–30) | *unverified* | Permissions model is pre-`BLUETOOTH_CONNECT`; the app branches on `Build.VERSION` for it and the branches are source-audited (`tests/test_android_completion.py`), but no such device ran it. |
 | 12 – 13 (API 31–33) | *unverified* | `BLUETOOTH_CONNECT`, notification permission. |
-| 14 (API 34) | **target** · *unverified on hardware* | `foregroundServiceType="connectedDevice"` + `FOREGROUND_SERVICE_CONNECTED_DEVICE`, `POST_NOTIFICATIONS`. |
+| 14 (API 34) | **target** · *unverified on hardware* | `foregroundServiceType="connectedDevice|camera|microphone|mediaPlayback"` + the four `FOREGROUND_SERVICE*` permissions, `POST_NOTIFICATIONS`. The camera/microphone types are only claimed while their runtime permission is held, so a fresh install still starts the service. |
 | 15 (API 35) | *expected* | Edge-to-edge is now opt-in-by-API but the app calls `enableEdgeToEdge()` and consumes the insets itself, so the layout does not change. |
 | 16 (API 36) | *expected* | No removed API used; predictive back opted in; no native libraries, so the 16 KB page-size requirement does not apply. |
 
-Compilation evidence: `kotlinc 1.9.24` (JRE 17.0.9) parses every Kotlin source in
-`android/`. Because the Android SDK is not present, all Android/Compose symbols
-are unresolved — 1,263 diagnostics that are *all* missing-SDK cascades. The
-differential against the pre-release baseline shows no new class of diagnostic,
-which is the strongest statement possible without a real build (blocker B6).
+Compilation evidence: a **real build**, not a parse. `.github/workflows/android-debug-apk.yml`
+runs `./gradlew assembleDebug` on a Windows-free Ubuntu runner with JDK 17 and the
+Android SDK, and uploads the APK as `phonebridge-debug-apk`.
+
+That replaced the older evidence here — a `kotlinc` pass with no Android SDK on the
+classpath — which could not work: with every Android symbol unresolved, a genuine
+error inside PhoneBridge's own code is indistinguishable from a missing-SDK
+cascade. The first real build of this branch failed with eight such errors (a
+final `RpcFailure` with five subclasses, two missing imports, and a package-private
+function pasted into the wrong class); all were compile-level, none behavioural,
+and are fixed. Blocker B6 ("no Android build anywhere") is closed by the workflow;
+what is still unverified is runtime behaviour on a device.
 
 | App configuration | Value |
 | --- | --- |

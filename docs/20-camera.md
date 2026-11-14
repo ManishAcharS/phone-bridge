@@ -109,12 +109,80 @@ Rules the PC enforces (`decode_frame`, all covered by tests):
 | `camera.start` | `config` object (optional) | `{ok, config}` |
 | `camera.stop` | — | `{ok, streaming:false}` |
 | `camera.switch` | `facing` (`back`/`front`) | `{ok, facing, streaming}` |
-| `camera.status` | — | `{streaming, facing, width, height, fps, frames_sent, dropped, permitted, hardware, last_error}` |
+| `camera.status` | — | `{streaming, facing, width, height, fps, frames_sent, dropped, permitted, hardware, last_error, stats}` |
+
+`stats` carries the phone's own measurements: `fps`, `encode_ms`, `send_ms`,
+`bytes_per_frame`, `quality`, `width`, `height`, `encoded`, `sent`, `dropped`, plus
+`path` (`yuv` or `rgba` — the encoder actually in use), `path_reason`,
+`capture_width`/`capture_height` (what CameraX really delivered) and
+`capture_layout` (format, rotation, crop and per-plane strides of the first
+frame). `width`/`height` are the *request*; `capture_*` are the answer, and the two
+disagreeing is the explanation for frames that are far bigger than asked for.
 
 **Error codes** (docs/03 §7): `camera_denied` (permission not granted — the lens is
 never opened to find out), `no_camera` (this phone has no such lens), `camera_busy`
 (another app holds it, or CameraX refused to bind), `bad_config` (outside the
 documented ranges), plus the existing `bad_request`/`internal`.
+
+**Encoding.** Two paths, and the fast one is the default.
+
+*The YUV path.* The analysis use case asks for `YUV_420_888` and a resolution via
+`ResolutionSelector` + `ResolutionStrategy(CLOSEST_LOWER_THEN_HIGHER)` — `setTargetResolution`
+is deprecated and treats the size as an aspect-ratio hint, which lets a 640×480
+request come back as 1920×1440 (that is how a stream reaches 400–590 KB per
+picture). Frames are packed into NV21 by `Nv21` (honouring every plane's
+`rowStride` **and** `pixelStride`, plus the crop rectangle) and handed to
+`YuvImage.compressToJpeg`: no `Bitmap`, no RGBA conversion.
+
+*The RGBA fallback.* Asking for `RGBA_8888` costs a native YUV→RGB pass, a
+`Bitmap` allocation, a stride crop and an RGB→YCbCr conversion inside the
+encoder, so it is the fallback rather than the default — but it is also the path
+that predates the YUV one, and a device where the YUV path produces nothing must
+not leave the user with a dead camera. The switch happens automatically, and is
+logged:
+
+* **the 2 s watchdog** — nothing encoded within 2 s of the bind
+  (`FALLBACK_AFTER_MS`) switches paths and rebinds the same camera;
+* **any encoder failure** — an exception from the packing or from
+  `compressToJpeg` (which used to return `false` and drop the frame silently);
+* **a capture much larger than the request** (more than 5/4 in either axis) —
+  the RGBA path scales the frame down to the size that was asked for.
+
+`camera.status.stats.path` says which path is live and `path_reason` says why it
+changed; both are sticky, so a reconnect does not rediscover a broken encoder.
+The self-view thumbnail is refreshed 4 times a second (`PREVIEW_INTERVAL_MS`),
+not once per frame: decoding every frame the phone just encoded was measurable
+heat for a preview nobody watches at 30 fps.
+
+**Where did it stop?** Five `Log.i` lines under one tag answer that, in order:
+`camera.start received`, `camera bound`, `first analyzer frame` (with the real
+size, format, rotation, crop and per-plane strides), `first JPEG encoded`,
+`first frame sent`. Every frame also logs its own size and encode time at `Log.d`,
+and every second the engine prints its averages — `adb logcat -s CameraEngine`:
+
+    D CameraEngine: capture 29.8 fps  yuv->jpeg 12.4 ms  q70  94 KB  send 1.9 ms  target 1280x720@30  capture 1280x720
+
+The same values are returned by `camera.status` under `stats`, which is what
+`phonebridge camera --stats` prints beside the PC's side (docs/26 §6).
+
+**Threading.** CameraX binds a `LifecycleRegistry`, and `setCurrentState` is
+main-thread-only — `bindToLifecycle`, `unbindAll` and our own owner all reach it.
+`camera.start` arrives on a WebSocket thread, so every lifecycle call now hops to
+the main thread and waits (`CameraEngine.onMainThread`), bounded at 10 s so a
+stuck main thread becomes a `camera_busy`/`internal` sentence rather than a hung
+request. The three camera RPCs also answer from their own thread
+(`cameraExecutor`), so the phone never waits for the main thread while holding the
+peer session's lock. Skipping either half produces the failure seen on the
+M2010J19SI: `Method setCurrentState must be called on the main thread`, answered
+as `internal`, with a PC that showed "camera error" and no reason.
+
+**When it fails, the phone says where.** Failures are logged as
+`E CameraEngine: camera <where>: <detail>`, so on a connected phone:
+
+    adb logcat -s CameraEngine
+
+is the one command that shows why the lens did not open. The PC prints the same
+text, once, as `camera stopped: <detail>`.
 
 ---
 
@@ -173,11 +241,21 @@ practice:
 | Hotspot | the phone is usually the AP, so expect ~5–10 Mbps unless the PC is the AP; start at 640×480 |
 
 If the link dips, the bounded queues mean the preview *skips* rather than lags;
-`stats.dropped` and `stats.received` in the GUI tell you which. The connection
-manager's existing reconnect ladder still applies: a dropped session brings the
-camera down (`camera.streaming` false) and the camera is not restarted
-automatically — after reconnecting, press start again. That is intentional: a
-camera that comes back on its own is a camera the user did not ask for.
+`stats.dropped` and `stats.received` in the GUI tell you which.
+
+A dropped session always brings the camera down (`camera.streaming` false) —
+the phone closes the lens when the session that asked for it goes away, so a
+reconnected link is a link with no picture. What happens next depends on who is
+driving:
+
+* **`phonebridge camera` (and `start`)** reconnects on its own: the runner opens
+  a new authenticated session, swaps it in, re-issues `camera.start` and rebuilds
+  any audio paths. The status line says `camera reconnecting …` with the reason
+  and the attempt number while it works, instead of `camera idle` until the user
+  notices.
+* **The GUI** does not: `camera.streaming` goes false and the user presses start
+  again. That is intentional there — a window that reopens the camera by itself
+  is a window the user did not ask for.
 
 ---
 
@@ -206,6 +284,21 @@ camera that comes back on its own is a camera the user did not ask for.
   preview label says "frames are arriving, but this PC cannot draw them:
   pip install pillow" — it does not fake a picture and it does not pretend the
   stream failed.
+
+### 7.1 Delivering the stream as a Windows webcam
+
+`phonebridge camera --virtual` feeds the same decoded frames into **pyvirtualcam**
+(OBS Studio's "OBS Virtual Camera", Unity Capture as the fallback) so that Zoom,
+Teams, Meet or OBS can select the phone as a camera. It lives in
+`phonebridge/live/` and consumes `CameraStream`; nothing in the protocol, the
+Android app or the frame path changed.
+
+Two details are deliberate: frames are letterboxed rather than stretched when the
+requested camera resolution and the phone's aspect ratio differ, and the
+*unmirrored* frame is delivered (applications mirror their own previews). A stall
+shows the last frame and then black; the stream resumes on its own.
+
+Full setup, options and the hardware checklist: `docs/26-windows-live-delivery.md`.
 
 ---
 
@@ -277,6 +370,100 @@ looks right on a real display (no Tk in this environment), and that the picture
 is upright in an external webcam application (there is none yet).
 
 ---
+
+## 8.2 Frame rate: asking for 30, and getting it
+
+Measured on a Xiaomi 24115RA8EI: a 640x480 stream at a 30 fps request arrived at
+**20-24 fps**, while the yuv→jpeg encode took **7 ms** — the encoder was not the
+limit. The limit was auto-exposure: a camera in ordinary indoor light is allowed to
+stretch the exposure beyond one frame period, and it does, because a brighter
+picture beats a faster one by default.
+
+CameraX has no public "frame rate" switch. The control is a Camera2 capture
+request option, applied through **Camera2Interop** on the `ImageAnalysis` use case:
+
+```kotlin
+Camera2Interop.Extender(builder)
+    .setCaptureRequestOption(
+        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps)
+    )
+```
+
+The range is chosen against `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES`, read from
+`Camera2CameraInfo` **before** the bind (the characteristics are available from
+`availableCameraInfos`, so nobody has to guess):
+
+| Request | Range used | Effect |
+| --- | --- | --- |
+| `--fps-mode fixed` (default) | exact `(fps, fps)` if listed, else the narrowest range whose upper bound is `fps` | the rate holds; a dim room looks **darker** |
+| `--fps-mode variable` | the widest range whose upper bound is `fps` (e.g. `15-30`) | the device may drop to 15 fps for a brighter picture |
+
+Both the request and the device's list are reported, so a refusal is a number
+rather than a mystery:
+
+```
+  phone 29.6 fps  encode   7.0 ms     34 KB/frame  q70  send  1.2 ms  640x480  yuv
+  ae    AE target 30-30  device 30-30,15-30,7-30  warm-up 2400 ms, first frame 5200 B
+```
+
+If a vendor ROM refuses the interop, the option is dropped (logged, `fps_range`
+empty) and the camera keeps streaming at whatever rate the HAL picks: a refused
+frame-rate hint must never cost the picture.
+
+## 8.3 The first six seconds were near-blank
+
+The same device produced **5 KB** (near-blank) JPEGs for about six seconds after
+`camera.start`, then normal ones. That is auto-exposure and auto-white-balance
+converging: the sensor starts delivering before 3A has a result, so the first
+frames are black, and a black 640x480 JPEG is 3-6 KB.
+
+Nothing in CameraX lets an app skip the warm-up, so it is **measured** instead:
+every encoded frame is compared against the largest one seen so far, and the phone
+records when a frame first reaches a normal size (`warmup_ms`, with
+`first_frame_bytes` and `peak_frame_bytes` next to it). A fixed AE range shortens
+it, because exposure may not be stretched past one frame period, and the log line
+says when the picture became usable:
+
+```
+I/CameraEngine: camera warm-up: 2400 ms (first frame 5200 B, now 34000 B)
+```
+
+`warmup_ms` is `-1` until it converges, which is the honest answer while the
+camera is still warming up. It is reported in `camera.status.stats` and printed by
+`--stats`.
+
+## 8.4 Decode spikes: 40-50 ms on a 3 ms path
+
+At 640x480 q70 the report was decode spiking to **40-50 ms** while the mean sat
+near 3 ms, with dropped frames climbing. Measuring the pieces separately ruled
+out the obvious suspects — `Image.draft("RGB", ...)` was already called before
+`convert`, the letterbox canvas is only allocated when the aspect ratio differs,
+and a 148 KB 640x480 q70 JPEG decodes and converts in **3.05 ms** with
+`rotate(-90, expand=True)` adding **0.26 ms**. The JPEG path was not it.
+
+What was left was the shape of the worker, and two things change:
+
+* **the device send moved to its own thread.** `pyvirtualcam.send()` blocks until
+  the consumer collects the frame, and with one thread a slow consumer held the
+  *decoder*: incoming frames piled up in the single slot and were counted as
+  drops. Now a stalled send costs the one frame in flight, and the decoder keeps
+  consuming at the source's rate. `stale` counts frames that were decoded and
+  replaced before the device took them — the number that separates "the phone
+  stopped sending" from "this PC could not take what it sent";
+* **each stage reports its worst sample, not only its mean.** A 45 ms frame among
+  fifty 3 ms ones is a 3.8 ms mean and one dropped frame, which is why the report
+  said "decode spikes" but the status line said 3 ms. `--stats` now prints the
+  stage that spiked:
+
+```
+  pc   19.4 fps  rx 20  57 KB/frame  decode   3.1 ms  convert  1.2 ms  send 0.9 ms  queue 0  dropped 0
+  peak decode 45.2 ms   (worst in the last second)
+```
+
+A peak is named only above 25 ms, because two milliseconds is a measurement, not a
+spike. Which stage appears there is the diagnosis: `decode` means allocation or
+GC pressure on this PC, `send` means the virtual-camera consumer (OBS or the app
+reading it) is slow, `convert` means the numpy copy.
 
 ## 9. Manual hardware checklist (not yet done)
 

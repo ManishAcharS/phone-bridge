@@ -19,8 +19,10 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
+import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
+import dev.phonebridge.Permissions
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -928,7 +930,7 @@ class BleEngine(
         val bytes = value.copyOf()
         val payload = linkedMapOf<String, Any?>(
             "address" to link.address,
-            "service" to (findServiceUuid(link, characteristic.uuid) ?: ""),
+            "service" to (findServiceUuid(link, characteristic.uuid.toString()) ?: ""),
             "characteristic" to characteristic.uuid.toString(),
             "value_b64" to if (bytes.size <= MAX_VALUE_BYTES) {
                 Base64.encodeToString(bytes, Base64.NO_WRAP)

@@ -254,6 +254,11 @@ def capability_report(info: dict[str, Any]) -> dict[str, Any]:
         "android_version": info.get("android_version"),
         "sdk_int": info.get("sdk_int"),
         "app_version": info.get("app_version"),
+        # The APK's own build: version, version code and commit. ``app_version``
+        # alone cannot tell two builds of the same release apart, and "is this the
+        # APK with the latency probe?" is a question people ask.
+        "build_id": info.get("build_id"),
+        "git_sha": info.get("git_sha"),
         "protocol_version": info.get("protocol_version"),
         "simulated": is_simulated(info),
         "capabilities": [row.to_dict() for row in capability_rows(info)],
@@ -286,6 +291,8 @@ INFO_FIELDS: tuple[tuple[str, str], ...] = (
     ("sdk_int", "sdk"),
     ("target_sdk", "target sdk"),
     ("app_version", "app version"),
+    ("build_id", "build"),
+    ("git_sha", "commit"),
     ("protocol_version", "protocol"),
     ("rom", "rom"),
     ("rom_version", "rom build"),
