@@ -371,6 +371,67 @@ is upright in an external webcam application (there is none yet).
 
 ---
 
+## 8.2 Frame rate: asking for 30, and getting it
+
+Measured on a Xiaomi 24115RA8EI: a 640x480 stream at a 30 fps request arrived at
+**20-24 fps**, while the yuv→jpeg encode took **7 ms** — the encoder was not the
+limit. The limit was auto-exposure: a camera in ordinary indoor light is allowed to
+stretch the exposure beyond one frame period, and it does, because a brighter
+picture beats a faster one by default.
+
+CameraX has no public "frame rate" switch. The control is a Camera2 capture
+request option, applied through **Camera2Interop** on the `ImageAnalysis` use case:
+
+```kotlin
+Camera2Interop.Extender(builder)
+    .setCaptureRequestOption(
+        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps)
+    )
+```
+
+The range is chosen against `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES`, read from
+`Camera2CameraInfo` **before** the bind (the characteristics are available from
+`availableCameraInfos`, so nobody has to guess):
+
+| Request | Range used | Effect |
+| --- | --- | --- |
+| `--fps-mode fixed` (default) | exact `(fps, fps)` if listed, else the narrowest range whose upper bound is `fps` | the rate holds; a dim room looks **darker** |
+| `--fps-mode variable` | the widest range whose upper bound is `fps` (e.g. `15-30`) | the device may drop to 15 fps for a brighter picture |
+
+Both the request and the device's list are reported, so a refusal is a number
+rather than a mystery:
+
+```
+  phone 29.6 fps  encode   7.0 ms     34 KB/frame  q70  send  1.2 ms  640x480  yuv
+  ae    AE target 30-30  device 30-30,15-30,7-30  warm-up 2400 ms, first frame 5200 B
+```
+
+If a vendor ROM refuses the interop, the option is dropped (logged, `fps_range`
+empty) and the camera keeps streaming at whatever rate the HAL picks: a refused
+frame-rate hint must never cost the picture.
+
+## 8.3 The first six seconds were near-blank
+
+The same device produced **5 KB** (near-blank) JPEGs for about six seconds after
+`camera.start`, then normal ones. That is auto-exposure and auto-white-balance
+converging: the sensor starts delivering before 3A has a result, so the first
+frames are black, and a black 640x480 JPEG is 3-6 KB.
+
+Nothing in CameraX lets an app skip the warm-up, so it is **measured** instead:
+every encoded frame is compared against the largest one seen so far, and the phone
+records when a frame first reaches a normal size (`warmup_ms`, with
+`first_frame_bytes` and `peak_frame_bytes` next to it). A fixed AE range shortens
+it, because exposure may not be stretched past one frame period, and the log line
+says when the picture became usable:
+
+```
+I/CameraEngine: camera warm-up: 2400 ms (first frame 5200 B, now 34000 B)
+```
+
+`warmup_ms` is `-1` until it converges, which is the honest answer while the
+camera is still warming up. It is reported in `camera.status.stats` and printed by
+`--stats`.
+
 ## 9. Manual hardware checklist (not yet done)
 
 Nothing below has been run: this development environment has no phone, no JDK, no

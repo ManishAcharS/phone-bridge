@@ -190,6 +190,48 @@ Every command supports `--json`, and `capabilities --require <key>` turns the
 capability report into a gate (exit 4) for scripting. Full reference, exit codes
 and examples: [`docs/11-pc-client.md`](docs/11-pc-client.md).
 
+### Daily use: one launcher
+
+Everything below is what `scripts\start-live.bat` does for you. Double-click it
+(or run it from a terminal) and the whole bridge comes up:
+
+```powershell
+scripts\start-live.bat                       # USB: adb forward + camera + mic + speaker
+scripts\start-live.bat -Profile 720p         # USB, bigger picture
+scripts\start-live.bat -HostName 192.168.43.1   # Wi-Fi or hotspot: the phone's own address
+```
+
+It re-runs `adb forward tcp:8765 tcp:8765` (a forward does not survive an unplug),
+checks that OBS Studio, VB-CABLE, the three Python packages and the phone itself
+are there, then starts `phonebridge start --camera --mic --speaker`. What it does
+**not** do: install anything, change a Windows setting, or need administrator
+rights. A missing piece is printed as the one-line instruction that fixes it.
+
+In the other application, pick:
+
+* camera → **OBS Virtual Camera** (open OBS once per boot so the device exists);
+* microphone → **CABLE Output** (that is VB-CABLE's *recording* side).
+
+A dropped link is not the end of the run: the launcher's bridge rebuilds the
+session and asks the phone for the camera, microphone and speaker again, so
+pulling the USB cable out and putting it back keeps working. Screen off and the
+app in the background are fine too — the phone does all of this in a foreground
+service with `connectedDevice|camera|microphone|mediaPlayback` types and a
+partial wake lock (see [`docs/26-windows-live-delivery.md`](docs/26-windows-live-delivery.md)).
+
+The same command line without the launcher:
+
+```powershell
+adb forward tcp:8765 tcp:8765
+phonebridge start --camera --mic --speaker --profile low --fps-mode fixed
+```
+
+`--fps-mode fixed` (the default) pins the phone's auto-exposure to the requested
+frame rate: 30 fps means 30 fps, and a dim room looks darker. `--fps-mode variable`
+lets the device drop to ~15 fps for a brighter picture. `--keep-alive` keeps
+sending silence from a silent PC so the phone's audio track and the Bluetooth link
+stay warm.
+
 ---
 
 ## Supported capabilities

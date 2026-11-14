@@ -68,10 +68,13 @@ def test_microphone_plan_validates_buffer_and_gain() -> None:
             MicPlan(**kwargs)  # type: ignore[arg-type]
 
 
-def test_speaker_plan_defaults_to_a_200_ms_buffer() -> None:
+def test_speaker_plan_defaults_to_a_shallow_queue() -> None:
+    """60 ms: three 20 ms frames. 200 was a fifth of a second of pure delay."""
     plan = SpeakerPlan()
-    assert plan.latency_ms == 200
+    assert plan.latency_ms == 60
     assert plan.lipsync_ms == 0
+    assert plan.keep_alive is False
+    assert plan.latency_test is False
     assert plan.as_dict()["device"] == "default output (loopback)"
 
 

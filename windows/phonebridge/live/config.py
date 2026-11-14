@@ -40,7 +40,15 @@ CAMERA_PROFILES: dict[str, tuple[int, int, int]] = {
 
 DEFAULT_CAMERA_PROFILE = "720p"
 DEFAULT_MIC_LATENCY_MS = 120
-DEFAULT_SPEAKER_LATENCY_MS = 200
+
+#: The queue target the PC asks the phone to hold for playback, in ms.
+#:
+#: It used to be 200 and it was never sent: the phone kept a fixed eight-frame
+#: (160 ms) queue and this number only decorated the status line. Now it is the
+#: target the phone actually sizes its queue from — three 20 ms frames — and the
+#: phone grows it on its own when the device underruns. Anything above ~120 here
+#: is latency nobody asked for.
+DEFAULT_SPEAKER_LATENCY_MS = 60
 
 
 def profile_size(profile: str) -> tuple[int, int, int]:
@@ -76,6 +84,11 @@ class CameraPlan:
     quality: int = 70
     facing: str = "back"
     backend: str = VIRTUAL_CAMERA_AUTO
+    #: Pin the phone's auto-exposure to exactly :attr:`fps` (the default) instead
+    #: of letting it slow down in low light. A camera in a dim room trades frame
+    #: rate for exposure — that is why a 30 fps request arrived as 20-24 fps —
+    #: and pinning the range makes the rate predictable and the picture darker.
+    fixed_fps: bool = True
 
     def __post_init__(self) -> None:
         _check_int("camera width", self.width, 320, 3840)
@@ -103,6 +116,7 @@ class CameraPlan:
             "quality": self.quality,
             "facing": self.facing,
             "backend": self.backend,
+            "fixed_fps": self.fixed_fps,
         }
 
     @property
@@ -145,6 +159,14 @@ class SpeakerPlan:
     than about the PC's sound card. ``muted`` starts the stream muted, which is
     the link's conservative default and never what the command wants — it is
     offered so a user can prove the route without making noise.
+
+    ``keep_alive`` sends silence while this PC is not playing anything. WASAPI
+    loopback delivers no packets at all from an idle endpoint, so without it the
+    phone's track runs dry every time the PC goes quiet; with it the Bluetooth
+    link stays warm at the cost of ~24 KB/s of silence.
+
+    ``latency_test`` turns the command into a measurement: it plays a click and
+    prints the delay per stage instead of streaming until Ctrl+C.
     """
 
     latency_ms: int = DEFAULT_SPEAKER_LATENCY_MS
@@ -154,6 +176,8 @@ class SpeakerPlan:
     tone_hz: float = DEFAULT_TONE_HZ
     tone_seconds: float = DEFAULT_TONE_SECONDS
     muted: bool = False
+    keep_alive: bool = False
+    latency_test: bool = False
 
     def __post_init__(self) -> None:
         _check_int("speaker buffer", self.latency_ms, 20, 2000)
@@ -168,9 +192,12 @@ class SpeakerPlan:
             "latency_ms": self.latency_ms,
             "lipsync_ms": self.lipsync_ms,
             "device": self.device or "default output (loopback)",
+            "keep_alive": self.keep_alive,
         }
         if self.test_tone:
             payload["test_tone"] = f"{self.tone_hz:.0f} Hz for {self.tone_seconds:.1f} s"
+        if self.latency_test:
+            payload["latency_test"] = True
         return payload
 
 

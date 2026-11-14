@@ -233,6 +233,7 @@ class CameraStream:
             fps=self._config.fps,
             quality=self._config.quality,
             facing=facing,
+            fixed_fps=self._config.fixed_fps,
         )
         if not self.active:
             # Not streaming yet: just record the choice.

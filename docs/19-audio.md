@@ -209,6 +209,90 @@ Record for each transport: latency you perceive, dropouts (Diagnostics shows
 are the only thing that can turn any row above from "tested in software" into
 "verified on hardware".
 
+## 7a. Speaker latency, measured per stage
+
+"About half a second to Bluetooth headphones" is five stages added together, and
+only some of them are ours:
+
+| Stage | Before | Now | Where |
+| --- | --- | --- | --- |
+| PC loopback capture block | 20 ms | 20 ms (one frame; the read returns whole frames) | `PyAudioLoopbackSource.read` |
+| PC → phone queue | 200 ms configured, not applied | **60 ms**, sent as `target_ms` | `AudioLink.start_playback` |
+| Phone playback queue | 8 frames = **160 ms**, fixed | **3 frames = 60 ms**, adaptive 1-8 | `AudioEngine.startPlayback` |
+| `AudioTrack` buffer | 4 frames = 80 ms | 2-5 frames, `PERFORMANCE_MODE_LOW_LATENCY` | `AudioEngine.startPlayback` |
+| Bluetooth A2DP | ~100-250 ms | unchanged — this is the floor | Android, not us |
+
+Two things decide the phone's queue, and they are deliberately different:
+
+* the **target** (60 ms) is what the PC asks for and what the queue is sized to;
+* the **adaptation** moves that target one frame at a time, and only on evidence:
+  up when the device's own underrun counter rises (or the writer found the queue
+  empty while audio was flowing), down when a whole 500 ms window had neither. A
+  silent PC teaches it nothing — an empty queue during silence is not pressure.
+
+The writer drops the **oldest** frame when the queue is full, so a slow link costs
+a click instead of permanent delay. `PERFORMANCE_MODE_LOW_LATENCY` asks for the
+fast mixer path, which removes one mixer period on the built-in speaker and on
+wired output; on A2DP it changes nothing and is guarded so a refusal cannot cost
+the audio.
+
+### Measuring it: `phonebridge speaker --latency-test`
+
+```powershell
+phonebridge speaker --latency-test
+phonebridge speaker --latency-test --format json   # the same numbers, machine readable
+```
+
+It starts playback with the latency probe armed, sends one click, and prints:
+
+```
+  speaker latency, measured per stage
+  --------------------------------------------------------------
+  PC capture block             20 ms   one 20 ms frame: the read returns whole frames
+  PC -> phone                   0 ms   no jitter buffer on this path: one frame per pull
+  phone queue target           60 ms   1 frames in the queue right now
+  arrival -> AudioTrack        74 ms   the phone's own probe, on the phone's clock
+  (track buffer reported       40 ms   inside the number above, not on top of it)
+  --------------------------------------------------------------
+  to the phone's mixer         94 ms
+  Bluetooth A2DP           +100-250 ms   not measurable from an app: codec + headphone buffer
+  to the ear                ~194-344 ms
+  note: Android does not expose the A2DP codec or its buffer to an app, so the
+        Bluetooth stage is a range, not a measurement
+```
+
+**The Bluetooth floor is real and it is not ours.** `to the ear` is a range because
+`BluetoothA2dp.getCodecStatus()` is a system API: an ordinary app is refused the
+codec name *and* the codec's buffer, so any single number there would be invented.
+100-250 ms covers SBC/AAC as Android usually negotiates them; aptX Low Latency
+(~40 ms) needs both ends to support it and is not something PhoneBridge can select.
+So "≤300 ms to a Bluetooth headset" is a **wired or built-in-speaker** target.
+Over A2DP, 300 ms is the best case of the sum above and depends on the headset.
+
+The probe itself is exact where it applies: the phone records when the marked
+frame arrived from the socket, then when `playbackHeadPosition` passed the frame it
+wrote. That is arrival → the mixer consuming it. The `AudioTrack` buffer is
+*inside* that number, not additional, which is why the table says so.
+
+### `rx 0 f/s` is usually not a fault
+
+WASAPI loopback captures what the *endpoint* renders. When nothing on the PC is
+playing, the endpoint is idle and the loopback stream delivers **no packets at
+all**: `read()` blocks, no frames are sent, and the phone reports `rx 0 f/s` while
+every component is working correctly.
+
+The PC now says so, in the status line, next to the number that looked like a
+fault:
+
+```
+link up | speaker active pc-buf 60 ms -> bluetooth_a2dp pc silent rx 0 f/s ...
+```
+
+`--keep-alive` goes one step further and sends silence at the frame cadence while
+the PC is silent, so the phone's `AudioTrack` and the Bluetooth link stay warm and
+playback does not re-buffer the moment something does start playing. It costs
+about 24 KB/s and changes nothing else.
+
 ## 8. Known limitations
 
 | Limitation | Reason |

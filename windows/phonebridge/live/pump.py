@@ -385,4 +385,32 @@ def stats_lines(pc: Any = None, phone: Any = None) -> list[str]:
             f"{float(phone.get('bytes_per_frame', 0)) / 1024:5.0f} KB/frame  "
             f"{q_text}send {float(phone.get('send_ms', 0.0)):4.1f} ms{size_text}{enc_text}{capture_text}"
         )
+        # The frame-rate control, on its own line because it is the answer to
+        # "why 22 fps when I asked for 30": what was asked of auto-exposure, what
+        # the device lists, and how long the picture was near-blank at start.
+        fps_line = _fps_line(phone)
+        if fps_line:
+            lines.append(fps_line)
     return lines
+
+
+def _fps_line(phone: dict[str, Any]) -> str:
+    """``AE target 30-30 (device 15-30,30-30)`` plus the measured warm-up."""
+    parts: list[str] = []
+    target = phone.get("fps_range")
+    if isinstance(target, str) and target:
+        parts.append(f"AE target {target}")
+    supported = phone.get("fps_ranges_supported")
+    if isinstance(supported, str) and supported:
+        parts.append(f"device {supported}")
+    if phone.get("fps_fixed") is False:
+        parts.append("variable")
+    warmup = phone.get("warmup_ms")
+    if isinstance(warmup, (int, float)):
+        if warmup < 0:
+            parts.append("warm-up not converged yet")
+        elif warmup:
+            first = phone.get("first_frame_bytes")
+            first_text = f", first frame {int(first)} B" if isinstance(first, (int, float)) and first else ""
+            parts.append(f"warm-up {int(warmup)} ms{first_text}")
+    return f"  ae    {'  '.join(parts)}" if parts else ""

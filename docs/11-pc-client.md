@@ -428,21 +428,41 @@ Options worth knowing:
 
 ```powershell
 phonebridge camera --virtual --width 1920 --height 1080 --fps 30 --facing front
+phonebridge camera --virtual --fps-mode variable     # brighter picture, variable rate
 phonebridge mic --to-cable --latency 80 --gain 1.5
-phonebridge speaker --latency 200 --lipsync 120 --loopback "Speakers"
-phonebridge speaker --test-tone                     # 440 Hz for 3 s: tests the phone alone
-phonebridge start --camera --mic --speaker --format json --duration 30
+phonebridge speaker --latency 60 --lipsync 120 --loopback "Speakers"
+phonebridge speaker --latency-test                   # one click, per-stage numbers
+phonebridge speaker --keep-alive                     # silence while the PC is silent
+phonebridge speaker --test-tone                      # 440 Hz for 3 s: tests the phone alone
+phonebridge start --camera --mic --speaker --fps-mode fixed --keep-alive --format json
 ```
 
-`--latency` on `mic` is the jitter buffer depth: smaller is snappier, larger
-survives a worse network. `--lipsync` on `speaker` delays *video* so the picture
-matches audio that Bluetooth has already put 100-200 ms behind.
+`--latency` on `mic` is the *receive* jitter buffer depth: smaller is snappier,
+larger survives a worse network. `--latency` on `speaker` is different and is now
+the queue target the phone is told to hold (**60 ms** by default, three 20 ms
+frames); the phone grows it on its own if the device underruns, so a number here
+is a floor, not a promise. `--lipsync` delays *video* so the picture matches audio
+that Bluetooth has already put 100-250 ms behind. `--keep-alive` sends silence
+while the PC is not playing anything, which keeps the phone's track and the
+Bluetooth link warm. `--latency-test` prints the delay per stage, including the
+stages nobody can measure (see `docs/19-audio.md` §7a).
+
+`--fps-mode fixed` (the default) pins the phone's auto-exposure to the requested
+frame rate through `CONTROL_AE_TARGET_FPS_RANGE`: 30 fps means 30 fps, and a dim
+room is darker. `--fps-mode variable` lets the device drop to ~15 fps for a
+brighter picture. `--stats` prints the AE range, the ranges the device lists, and
+the measured warm-up (see `docs/20-camera.md` §8.2).
 
 Status is printed once a second and looks like this:
 
 ```
-link up | camera active 29.8 fps | mic active -21 dBFS buf 120 ms | speaker active pc-buf 200 ms -> bluetooth_a2dp rx 50 f/s wrote 50 f/s played 41.2 s
+link up | camera active 29.8 fps | mic active -21 dBFS buf 120 ms | speaker active pc-buf 60 ms -> bluetooth_a2dp rx 50 f/s wrote 50 f/s played 41.2 s buf 40 ms target 60 ms
 ```
+
+`pc silent` appears in place of those numbers when the PC is not playing anything:
+WASAPI loopback delivers no packets from an idle endpoint, so `rx 0 f/s` is
+silence, not a broken link. Use `--keep-alive` if you would rather the phone's
+track stayed fed.
 
 `pc-buf` is the buffer *this PC* was asked to send; everything after the arrow
 comes from the phone's own `AudioTrack` — which device Android routed it to, how

@@ -22,7 +22,9 @@ def _parse(*argv: str):
 def test_the_four_commands_exist_and_parse() -> None:
     assert _parse("camera", "--virtual").virtual is True
     assert _parse("mic", "--to-cable").to_cable is True
-    assert _parse("speaker").latency_ms == 200
+    # 60, not 200: this is now the queue target the phone is told to hold, and
+    # 200 ms was a third of the half-second delay the command used to add.
+    assert _parse("speaker").latency_ms == 60
     assert _parse("start", "--camera", "--mic", "--speaker").speaker is True
 
 

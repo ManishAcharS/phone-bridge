@@ -102,6 +102,9 @@ class LiveStatus:
     #: underruns) plus the frame rates derived from two answers. Empty until the
     #: phone has answered once.
     speaker_stats: dict[str, Any] = field(default_factory=dict)
+    #: Playback is running and this PC has produced no audio for a while, because
+    #: WASAPI loopback hands over nothing from an idle endpoint. Not an error.
+    pc_silent: bool = False
 
     def line(self) -> str:
         parts: list[str] = [f"link {'up' if self.connected else 'down'}"]
@@ -133,8 +136,14 @@ class LiveStatus:
         """
         text = f"speaker {self.speaker_state}"
         if self.latency_ms:
-            # Labelled as the PC's, because that is all it ever was.
+            # The queue target the PC asked the phone for; the phone's own answer
+            # is printed next to it as `buf`, so the two can be compared.
             text += f" pc-buf {self.latency_ms} ms"
+        if self.pc_silent and self.speaker_state == "active":
+            # `rx 0 f/s` on its own reads as a broken link. This is the actual
+            # cause nine times out of ten: the PC is not playing anything, and
+            # WASAPI loopback delivers no packets from an idle endpoint.
+            text += " pc silent"
         stats = self.speaker_stats
         if not stats:
             return text
@@ -153,6 +162,11 @@ class LiveStatus:
         buffered = stats.get("buffered_ms")
         if isinstance(buffered, int) and buffered:
             text += f" buf {buffered} ms"
+        target = stats.get("queue_target_ms")
+        if isinstance(target, int) and target:
+            # The depth the phone settled on, which is the number that decides
+            # latency; `buf` above is where it is right now.
+            text += f" target {target} ms"
         underruns = stats.get("underruns")
         if isinstance(underruns, int) and underruns:
             text += f" underruns {underruns}"
@@ -182,6 +196,7 @@ class LiveStatus:
                 "state": self.speaker_state,
                 "detail": self.speaker_detail,
                 "latency_ms": self.latency_ms,
+                "pc_silent": self.pc_silent,
             },
         }
         if self.camera_stats:
@@ -342,6 +357,7 @@ class LiveRunner:
                     fps=self._plan.camera.fps,
                     quality=self._plan.camera.quality,
                     facing=self._plan.camera.facing,
+                    fixed_fps=self._plan.camera.fixed_fps,
                 ),
                 # Frames reach the pump the moment they arrive, not on a timer:
                 # polling once per 1/fps was the largest single cost of the old
@@ -409,6 +425,11 @@ class LiveRunner:
             source_factory=(
                 (lambda fmt: self._open_speaker_source(fmt)) if self._plan.speaker else None
             ),
+            # The one latency knob the user owns is the phone's queue target; the
+            # phone adapts it upwards on its own and asks Android for the
+            # low-latency mixer path. See docs/19 for what each stage costs.
+            target_ms=(self._plan.speaker.latency_ms if self._plan.speaker else 60),
+            keep_alive=bool(self._plan.speaker and self._plan.speaker.keep_alive),
         )
         if self._plan.mic is not None:
             await self._link.start_mic()
@@ -739,6 +760,7 @@ class LiveRunner:
             status.speaker_state = audio.playback
             status.speaker_detail = audio.detail
             status.speaker_stats = dict(audio.phone)
+            status.pc_silent = bool(getattr(audio, "pc_silent", False))
             status.extra = {
                 key: value for key, value in audio.stats.items() if isinstance(value, int)
             }

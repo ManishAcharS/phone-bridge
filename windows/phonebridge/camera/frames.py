@@ -56,6 +56,17 @@ class VideoFrameError(Exception):
     """A camera frame that cannot be trusted."""
 
 
+def _as_bool(value: Any, fallback: bool) -> bool:
+    """A JSON boolean, or the same thing a phone might send instead of one."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return fallback
+
+
 @dataclass(frozen=True)
 class VideoConfig:
     """The negotiated shape of a stream.
@@ -70,6 +81,11 @@ class VideoConfig:
     fps: int = 15
     quality: int = 70
     facing: str = "back"
+    #: Ask the phone to pin auto-exposure to exactly :attr:`fps`
+    #: (``CONTROL_AE_TARGET_FPS_RANGE`` = (fps, fps)) instead of letting it slow
+    #: down in low light. The frame rate becomes predictable and the picture
+    #: darker; `--fps-mode variable` is the other way round.
+    fixed_fps: bool = True
 
     def __post_init__(self) -> None:
         if not 320 <= self.width <= 3840 or not 240 <= self.height <= 2160:
@@ -80,6 +96,8 @@ class VideoConfig:
             raise ValueError(f"JPEG quality out of range: {self.quality}")
         if self.facing not in ("back", "front"):
             raise ValueError(f"unknown camera facing: {self.facing}")
+        if not isinstance(self.fixed_fps, bool):
+            raise ValueError(f"fixed_fps must be a boolean, got {self.fixed_fps!r}")
 
     @property
     def label(self) -> str:
@@ -93,6 +111,7 @@ class VideoConfig:
             "fps": self.fps,
             "quality": self.quality,
             "facing": self.facing,
+            "fixed_fps": self.fixed_fps,
         }
 
     @classmethod
@@ -110,6 +129,7 @@ class VideoConfig:
                 fps=int(cast(Any, data.get("fps", base.fps))),
                 quality=int(cast(Any, data.get("quality", base.quality))),
                 facing=str(data.get("facing", base.facing)),
+                fixed_fps=_as_bool(data.get("fixed_fps"), base.fixed_fps),
             )
         except (TypeError, ValueError) as exc:
             raise VideoFrameError(f"bad camera config: {exc}") from exc

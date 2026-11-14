@@ -12,6 +12,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -310,11 +311,32 @@ class BridgeService : Service() {
             // working day; the service is restarted long before that in practice.
             acquire(12L * 60 * 60 * 1000)
         }
+        // A partial wake lock keeps the *CPU* awake; it does not stop the Wi-Fi
+        // radio from going into power save, which over a hotspot shows up as a
+        // burst of late frames every few seconds and, worse, as a link that
+        // times out while the screen is off. HIGH_PERF asks for the radio to stay
+        // on at full power for as long as the bridge is streaming. Guarded: a
+        // device without the permission (or with Wi-Fi off entirely) must still
+        // run over USB.
+        runCatching {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifiLock = wm.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                "PhoneBridge::wifi",
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.onFailure {
+            android.util.Log.w("BridgeService", "wifi lock unavailable: ${it.message}")
+        }
     }
 
     private fun releaseWakeLock() {
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
     }
 
     private fun createChannel() {

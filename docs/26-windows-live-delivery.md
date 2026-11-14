@@ -117,6 +117,54 @@ The phone's address is shown in the app; `phonebridge discover` also lists what
 is announcing itself. Pairing is per-phone and remembered, so these are one-time
 prompts.
 
+### 4a. One command for daily use
+
+```powershell
+scripts\start-live.bat                          # USB: forward + all three paths
+scripts\start-live.bat -Profile 720p            # bigger picture
+scripts\start-live.bat -HostName 192.168.43.1   # Wi-Fi / hotspot
+scripts\start-live.bat -SkipChecks              # I know, just run it
+```
+
+`start-live.ps1` (the `.bat` is a wrapper that passes arguments through) does what
+is easy to forget at 9 a.m.:
+
+1. finds this repo's `.venv\Scripts\python.exe` first, then `python` on PATH —
+   running a different interpreter than `setup-windows.ps1` installed into is the
+   classic "it says sounddevice is missing" morning;
+2. `adb forward tcp:8765 tcp:8765` (USB only) after checking `adb devices`;
+3. checks OBS Studio, VB-CABLE and the three Python packages — each missing piece
+   is one line of instruction, never an installer;
+4. asks the phone to answer (`phonebridge info`) before starting anything;
+5. runs `phonebridge start --camera --mic --speaker --profile … --fps-mode …`.
+
+Exit codes: `0` clean stop (Ctrl+C included), `1` a check failed, `2` Python or the
+package is unusable, `3` the phone did not answer. Nothing is installed, no
+Windows setting changes, and no administrator rights are needed.
+
+### 4b. USB re-plug, screen off, app in the background
+
+These were three separate assumptions; each is now something the code does.
+
+* **USB re-plug.** `adb forward` is bound to the USB *transport*, so pulling the
+  cable deletes it — a reconnect loop then dials a local port nothing is listening
+  on. The PC re-creates the forward before **every** reconnect attempt
+  (`phonebridge.live.usb.ensure_forward`), and the runner keeps retrying with
+  backoff capped at 5 s. Pull the cable out, plug it back, and the camera,
+  microphone and speaker are all asked for again on the new session. A machine
+  without `adb` on PATH still works over Wi-Fi: a loopback target is the only one
+  that gets a forward.
+* **Screen off.** The service holds a `PARTIAL_WAKE_LOCK` and declares the four
+  typed foreground services it actually uses
+  (`connectedDevice|camera|microphone|mediaPlayback`), computed from the runtime
+  permissions so a phone that refused the camera still starts the bridge.
+* **Wi-Fi power save.** A partial wake lock keeps the CPU awake and does *nothing*
+  about the radio; a `WIFI_MODE_FULL_HIGH_PERF` Wi-Fi lock is held while the
+  service runs, which is what stops the "late frame every few seconds" pattern
+  over a hotspot. It is guarded: a device without Wi-Fi (USB only) is unaffected.
+* **App in the background.** `START_STICKY` on both paths, and no `stopWithTask`,
+  so switching apps or swiping the task away does not take the bridge with it.
+
 ---
 
 ## 5. Verification checklist — one command at a time

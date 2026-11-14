@@ -8,14 +8,20 @@ import android.graphics.ImageFormat
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
 import android.hardware.display.DisplayManager
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.util.Range
 import android.util.Size
 import android.view.Display
 import android.view.Surface
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -79,6 +85,13 @@ class CameraEngine(
 ) {
 
     companion object {
+        /**
+         * A frame at least this big counts as a real picture rather than a
+         * near-blank one. A converged 640x480 JPEG at q70 of anything but a black
+         * wall is far above it; a black frame is 3-6 KB.
+         */
+        private const val WARMUP_BYTES = 12_000
+
         /** Two outbound frames of slack; the third arrival evicts the oldest. */
         const val QUEUE_FRAMES = 2
         const val MAX_FRAME_BYTES = VideoFrames.MAX_BODY
@@ -159,6 +172,24 @@ class CameraEngine(
 
     private val startedAt = SystemClock.elapsedRealtime()
     @Volatile private var config = VideoFrames.Config()
+
+    // --- frame rate -------------------------------------------------------- //
+    // CameraX has no public "give me 30 fps" switch: the rate a device picks is
+    // whatever its auto-exposure decides, which is why a dim room turns a 30 fps
+    // request into 20-24 fps. `CONTROL_AE_TARGET_FPS_RANGE` through
+    // Camera2Interop is the honest control, and the ranges the device actually
+    // supports are reported so a refusal is visible instead of mysterious.
+    @Volatile private var fpsRange: Range<Int>? = null
+    @Volatile private var fpsRangeText = ""
+    @Volatile private var fpsRangesSupported = ""
+
+    // Warm-up: the first frames after `camera.start` were near-blank (5 KB JPEGs)
+    // for about six seconds on the Xiaomi. Measured here, not guessed: how long
+    // until a frame is the size a converged auto-exposure produces.
+    @Volatile private var warmupMs = -1L
+    @Volatile private var firstFrameBytes = 0
+    @Volatile private var peakFrameBytes = 0
+    private var analysisStartedAtMs = 0L
     private var provider: ProcessCameraProvider? = null
     private var camera: Camera? = null
     private var analysis: ImageAnalysis? = null
@@ -276,6 +307,12 @@ class CameraEngine(
             fail("no_camera", "this phone has no ${requested.facing} camera")
         }
 
+        // The exposure range is a *capture request* option, so it has to be set
+        // when the use case is built. What the device supports is known before
+        // the bind (availableCameraInfos carries the Camera2 characteristics), so
+        // the range is chosen against the real list instead of a guess.
+        chooseFpsRange(camProvider, requested)
+
         // Building the use case does not touch a lifecycle, so it stays off the
         // main thread where this call already is.
         val analysisUseCase = buildAnalysis(requested)
@@ -288,6 +325,77 @@ class CameraEngine(
         return onMainThread("camera.start") {
             bindOnMainThread(camProvider, selector, analysisUseCase, requested, queue)
         }
+    }
+
+    /**
+     * Pick the `CONTROL_AE_TARGET_FPS_RANGE` this device will accept.
+     *
+     * Reads `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES` for the camera being opened
+     * and chooses against it:
+     *
+     * * `fixed_fps` (the default): the exact ``(fps, fps)`` range when the device
+     *   lists it, otherwise the narrowest supported range whose *upper* bound is
+     *   ``fps``. Auto-exposure may then not stretch the exposure past one frame
+     *   period, so the rate holds and the picture is darker in low light — the
+     *   trade the PC explicitly asked for.
+     * * otherwise: the widest supported range whose upper bound is ``fps``, which
+     *   lets the device drop to its slowest rate in a dim room and produce a
+     *   brighter picture at the cost of a variable frame rate.
+     *
+     * A device that lists nothing usable keeps ``null``: no option is set, the HAL
+     * does what it always did, and ``fps_ranges_supported`` says why in the stats.
+     */
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun chooseFpsRange(camProvider: ProcessCameraProvider, requested: VideoFrames.Config) {
+        val supported = availableFpsRanges(camProvider, requested)
+        fpsRangesSupported = supported.joinToString(",") { "${it.lower}-${it.upper}" }
+        if (supported.isEmpty()) {
+            fpsRange = null
+            fpsRangeText = ""
+            Log.i(TAG, "device reports no CONTROL_AE_TARGET_FPS_RANGES: frame rate is up to the HAL")
+            return
+        }
+        val target = requested.fps.coerceAtLeast(1)
+        val exact = supported.firstOrNull { it.lower == target && it.upper == target }
+        val candidates = supported.filter { it.upper == target }
+        val chosen = when {
+            requested.fixedFps && exact != null -> exact
+            requested.fixedFps -> candidates.minByOrNull { it.upper - it.lower }
+            else -> candidates.maxByOrNull { it.upper - it.lower }
+        } ?: supported.minByOrNull { kotlin.math.abs(it.upper - target) }
+        fpsRange = chosen
+        fpsRangeText = if (chosen == null) "" else "${chosen.lower}-${chosen.upper}"
+        Log.i(
+            TAG,
+            "AE target fps range ${fpsRangeText.ifEmpty { "unset" }} for ${target} fps " +
+                "(${if (requested.fixedFps) "fixed" else "variable"}, device supports " +
+                "$fpsRangesSupported)",
+        )
+    }
+
+    /** The frame-rate ranges the chosen camera lists, highest upper bound first. */
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun availableFpsRanges(
+        camProvider: ProcessCameraProvider,
+        requested: VideoFrames.Config,
+    ): List<Range<Int>> {
+        val wantedLens = if (requested.facing == "front") {
+            CameraCharacteristics.LENS_FACING_FRONT
+        } else {
+            CameraCharacteristics.LENS_FACING_BACK
+        }
+        val infos = runCatching { camProvider.availableCameraInfos }.getOrDefault(emptyList())
+        val info = infos.firstOrNull { candidate ->
+            runCatching {
+                Camera2CameraInfo.from(candidate)
+                    .getCameraCharacteristic(CameraCharacteristics.LENS_FACING)
+            }.getOrNull() == wantedLens
+        } ?: infos.firstOrNull() ?: return emptyList()
+        val ranges = runCatching {
+            Camera2CameraInfo.from(info)
+                .getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        }.getOrNull() ?: return emptyList()
+        return ranges.filter { it != null }.sortedByDescending { it.upper }
     }
 
     /**
@@ -340,7 +448,33 @@ class CameraEngine(
         // "turn the picture this far clockwise to be upright as the phone is
         // held now", which is exactly what the receiver does with it.
         body.targetRotation = displayRotation()
+        applyFpsRange(body)
         return body
+    }
+
+    /**
+     * Turn [fpsRange] into a capture request option on the analysis use case.
+     *
+     * This is the only lever CameraX gives an app over the capture rate: without
+     * it the request says "30 fps" and the HAL is free to deliver 20, because
+     * auto-exposure is allowed to hold the shutter open for a third of a second
+     * in a dim room. With it, the range is part of the request and the device
+     * either honours it or refuses loudly (in the stats).
+     */
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun applyFpsRange(builder: ImageAnalysis.Builder) {
+        val range = fpsRange ?: return
+        runCatching {
+            Camera2Interop.Extender(builder)
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+        }.onFailure {
+            // A vendor build that refuses the interop must not cost the picture:
+            // the camera keeps streaming at whatever rate the HAL picks.
+            fpsRange = null
+            fpsRangeText = ""
+            Log.w(TAG, "could not set CONTROL_AE_TARGET_FPS_RANGE: ${it.message}")
+            log("WARN", "the phone refused the fixed frame rate ($fpsRangesSupported): ${it.message}")
+        }
     }
 
     /**
@@ -390,6 +524,10 @@ class CameraEngine(
             firstAnalyzerFrame.set(false)
             firstJpeg.set(false)
             firstSend.set(false)
+            warmupMs = -1
+            firstFrameBytes = 0
+            peakFrameBytes = 0
+            analysisStartedAtMs = 0
             running.set(true)
             val bound = camProvider.bindToLifecycle(owner, selector, analysisUseCase)
             camera = bound
@@ -402,7 +540,8 @@ class CameraEngine(
                 TAG,
                 "camera bound: ${requested.facing} ${requested.width}x${requested.height}" +
                     " @ ${requested.fps} fps q${requested.quality}, encoder ${activePath.code}" +
-                    " (${pathReason})",
+                    " (${pathReason}), AE target fps ${fpsRangeText.ifEmpty { "unset" }}" +
+                    " (device: ${fpsRangesSupported.ifEmpty { "unspecified" }})",
             )
             armWatchdog()
             _state.value = State(
@@ -532,6 +671,16 @@ class CameraEngine(
             "capture_width" to captureWidth,
             "capture_height" to captureHeight,
             "capture_layout" to lastCaptureLayout,
+            // The frame-rate control, and whether the device said yes: `fps_range`
+            // is what was asked of auto-exposure, `fps_ranges_supported` is what
+            // this camera lists, so a refusal is visible rather than mysterious.
+            "fps_range" to fpsRangeText,
+            "fps_ranges_supported" to fpsRangesSupported,
+            "fps_fixed" to config.fixedFps,
+            // The near-blank warm-up, measured: -1 means it has not converged yet.
+            "warmup_ms" to warmupMs,
+            "first_frame_bytes" to firstFrameBytes,
+            "peak_frame_bytes" to peakFrameBytes,
         ),
     )
 
@@ -691,6 +840,7 @@ class CameraEngine(
             encoded.incrementAndGet()
             lastEncodeMs = encodeMs
             lastFrameBytes = frame.jpeg.size
+            trackWarmup(frame.jpeg.size)
             lastSentAtMs = now
             if (firstJpeg.compareAndSet(false, true)) {
                 Log.i(
@@ -748,6 +898,45 @@ class CameraEngine(
             fallBack("the ${activePath.code} encoder failed: ${e.javaClass.simpleName}: ${e.message}")
         } finally {
             proxy.close()
+        }
+    }
+
+    /**
+     * How long until the camera produced a *normal* picture.
+     *
+     * The Xiaomi's first ~6 s at 640x480 were 5 KB JPEGs: near-blank images.
+     * That is auto-exposure and auto-white-balance converging — the sensor starts
+     * delivering before 3A has a result, so the first frames are whatever the
+     * pipeline had (black), and a black 640x480 JPEG is tiny. Nothing in CameraX
+     * lets an app skip that warm-up; what this does is measure it, so "the first
+     * few seconds look wrong" becomes a number in the stats and a line in logcat.
+     */
+    private fun trackWarmup(bytes: Int) {
+        if (bytes <= 0) return
+        val now = SystemClock.elapsedRealtime()
+        if (firstFrameBytes == 0) {
+            firstFrameBytes = bytes
+            analysisStartedAtMs = now
+            peakFrameBytes = bytes
+            if (bytes >= WARMUP_BYTES) {
+                warmupMs = 0
+                log("INFO", "camera warm-up: the first frame is already $bytes B")
+            }
+            return
+        }
+        if (bytes > peakFrameBytes) peakFrameBytes = bytes
+        if (warmupMs >= 0) return
+        // "Normal" is a frame within reach of the biggest one seen so far: 5 KB
+        // against a 60 KB peak is a different picture, 45 KB against 60 KB is the
+        // same one and the camera has converged.
+        val normal = maxOf(WARMUP_BYTES, peakFrameBytes * 3 / 5)
+        if (bytes >= normal) {
+            warmupMs = now - analysisStartedAtMs
+            log(
+                "INFO",
+                "camera warm-up: ${warmupMs} ms (first frame $firstFrameBytes B, now $bytes B); " +
+                    "until then the frames are near-blank while auto-exposure converges",
+            )
         }
     }
 

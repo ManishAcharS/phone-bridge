@@ -27,6 +27,7 @@ from ..core.session import (
     SessionError,
     TerminalSessionError,
 )
+from ..live.usb import ensure_forward, is_loopback
 from ..transport.link import DEFAULT_PORT, LinkError, WebSocketLink, websocket_uri
 
 # Exit codes, part of the CLI contract (documented in docs/11-pc-client.md).
@@ -247,6 +248,14 @@ def reconnect_factory(
         # Everything is read here, not when the factory is built: this callable
         # is created for every live run, and building it must not touch the
         # keystore (or a caller that never loses the link never needs it).
+        if is_loopback(target.host):
+            # `adb forward` is removed when the cable comes out, so a re-plug
+            # leaves every retry dialling a local port nothing is listening on.
+            # Re-create it first, every attempt: it is idempotent, and a failure
+            # here must not replace the connection error the user needs to see.
+            forwarded, why = ensure_forward(target.port)
+            if not forwarded:
+                note(f"  adb forward: {why}")
         identity = store.load_or_create_identity()
         uri = websocket_uri(target.host, target.port)
         session = BridgeSession(

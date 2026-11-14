@@ -1,6 +1,7 @@
 package dev.phonebridge.net
 
 import android.Manifest
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
@@ -25,9 +26,11 @@ import java.util.concurrent.atomic.AtomicInteger
  *    is authenticated; the microphone starts only when the PC asks *and* the user
  *    has already granted `RECORD_AUDIO` in this app. A refused permission is an
  *    error the PC shows verbatim — never a silent no-op.
- * 2. **Bounded everywhere.** Playback holds at most [QUEUE_FRAMES] frames and drops
- *    the *oldest* when the PC is late; latency therefore stays under ~200 ms
- *    instead of growing. The microphone sends one frame per read with no queue.
+ * 2. **Bounded everywhere, and shallow.** Playback holds at most [QUEUE_FRAMES]
+ *    frames and drops the *oldest* when the PC is late. It aims for a third of
+ *    that and grows only when the device reports underruns, because every frame
+ *    of queue is 20 ms of delay the user hears. The microphone sends one frame
+ *    per read with no queue at all.
  * 3. **Everything is released.** [release] stops both directions and frees the
  *    hardware; it is called when the last session ends, so a closed window cannot
  *    leave a hot microphone behind.
@@ -39,8 +42,27 @@ class AudioEngine(
 ) {
 
     companion object {
-        /** 8 frames of 20 ms: 160 ms of slack, then the oldest frame goes. */
+        /**
+         * Deepest the playback queue may grow: 8 frames of 20 ms = 160 ms.
+         *
+         * That is the *ceiling*, not the default. The queue used to be a fixed
+         * eight frames, which is 160 ms of delay before a single Bluetooth
+         * packet is involved; the adaptive controller below only climbs here
+         * when the device proves it cannot keep up.
+         */
         const val QUEUE_FRAMES = 8
+
+        /** Shallowest the queue may get. One frame of slack, never zero. */
+        const val MIN_QUEUE_FRAMES = 1
+
+        /** What the phone aims for when the PC does not say: 3 x 20 ms. */
+        const val DEFAULT_TARGET_MS = 60
+
+        /** How often the controller looks at the device's underrun counter. */
+        private const val ADAPT_INTERVAL_MS = 500L
+
+        /** Sleep when the writer finds nothing: short enough to stay under a frame. */
+        private const val IDLE_SLEEP_MS = 2L
     }
 
     private val lock = Any()
@@ -55,6 +77,40 @@ class AudioEngine(
     private val running = AtomicBoolean(false)
     private val capturing = AtomicBoolean(false)
     private val seqOut = AtomicInteger(0)
+
+    // --- latency --------------------------------------------------------- //
+    // Every number here exists because "about half a second" is not a
+    // measurement. The queue target is adaptively sized, the player asks Android
+    // for the low-latency path, and the probe times one frame from arrival to the
+    // point the AudioTrack's play head passed it.
+
+    /** Frames of queue the phone is aiming for right now (1..[QUEUE_FRAMES]). */
+    private var targetFrames = 3
+    private var minFrames = MIN_QUEUE_FRAMES
+    private var maxFrames = QUEUE_FRAMES
+
+    /** Whether the target may move on its own (the PC can pin it). */
+    private var adaptive = true
+    /** Which performance mode the track was built with. */
+    private var lowLatency = true
+    /** Track buffer actually granted, in milliseconds (0 before a track exists). */
+    private var trackBufferMs = 0
+
+    private var lastUnderruns = -1
+    private var lastAdaptAtMs = 0L
+    private var emptyPollsInWindow = 0
+    private var writesInWindow = 0
+    private var grewCount = 0
+    private var shrankCount = 0
+
+    // Latency probe: one marked frame, timed from arrival to the play head.
+    private var probeArmed = false
+    private var probeArrivedAtMs = 0L
+    private var probeHeadTarget = 0L
+    private var probeLatencyMs = -1L
+    private var probeState = "idle"
+    /** Frames handed to the track since it started; the probe's head target. */
+    private var framesWrittenTotal = 0L
 
     private var format = AudioFrames.Format()
     private var volumePercent = 40
@@ -79,6 +135,13 @@ class AudioEngine(
         } catch (e: IllegalArgumentException) {
             throw RpcFailure("bad_params", e.message ?: "unusable audio format")
         }
+        // The PC states its own latency budget, and may arm the probe. Both are
+        // optional: an older PC sends neither and gets the same behaviour as
+        // before, with a queue that is now adaptive instead of fixed at 160 ms.
+        val requestedTargetMs = intParam(params, "target_ms", DEFAULT_TARGET_MS)
+        val wantAdaptive = boolParam(params, "adaptive", true)
+        val wantLowLatency = boolParam(params, "low_latency", true)
+        val wantProbe = boolParam(params, "probe", false)
         synchronized(lock) {
             if (playbackState == "active") return playbackResult("already active", fmt)
             playback?.let { runCatching { it.release() } }
@@ -93,27 +156,42 @@ class AudioEngine(
                 AndroidAudioFormat.ENCODING_PCM_16BIT,
             )
             val bytesPerFrame = fmt.bytesPerFrame
-            // Four frames of device buffer: enough that a late frame does not
-            // underrun, small enough that stopping is immediate.
-            val buffer = maxOf(minBuffer, bytesPerFrame * 4)
+            // The target the PC asked for, in frames, clamped to what the queue
+            // is allowed to be. The *track* then gets two frames of headroom: the
+            // queue is where latency is decided, and a track buffer smaller than
+            // the mixer period only produces underruns.
+            minFrames = MIN_QUEUE_FRAMES
+            maxFrames = QUEUE_FRAMES
+            targetFrames = (requestedTargetMs / fmt.frameMs).coerceIn(minFrames, maxFrames)
+            adaptive = wantAdaptive
+            lowLatency = wantLowLatency
+            val buffer = maxOf(minBuffer, bytesPerFrame * maxOf(2, minOf(targetFrames + 2, maxFrames)))
+            val builder = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAudioFormat(
+                    AndroidAudioFormat.Builder()
+                        .setEncoding(AndroidAudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(fmt.sampleRate)
+                        .setChannelMask(channelMask)
+                        .build()
+                )
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setBufferSizeInBytes(buffer)
+            if (lowLatency) {
+                // PERFOMANCE_MODE_LOW_LATENCY asks the platform for the fast
+                // mixer path: the same request a game makes. It does nothing for
+                // A2DP (the Bluetooth stack re-buffers anyway, see docs/19) and
+                // it removes one full mixer period on the built-in speaker and on
+                // wired output. Refused on some vendor ROMs, so it is guarded.
+                runCatching { builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY) }
+            }
             val track = try {
-                AudioTrack.Builder()
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .build()
-                    )
-                    .setAudioFormat(
-                        AndroidAudioFormat.Builder()
-                            .setEncoding(AndroidAudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(fmt.sampleRate)
-                            .setChannelMask(channelMask)
-                            .build()
-                    )
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .setBufferSizeInBytes(buffer)
-                    .build()
+                builder.build()
             } catch (e: Exception) {
                 throw RpcFailure("no_output", "the phone could not open an audio output: ${e.message}")
             }
@@ -130,9 +208,30 @@ class AudioEngine(
             writeQueue.clear()
             droppedFrames = 0
             framesWritten.set(0)
+            framesWrittenTotal = 0
+            trackBufferMs = if (fmt.sampleRate > 0) track.bufferSizeInFrames * 1000 / fmt.sampleRate else 0
+            // A fresh track resets the controller: lastUnderruns of -1 means
+            // "no snapshot yet", not "zero underruns".
+            lastUnderruns = -1
+            emptyPollsInWindow = 0
+            lastAdaptAtMs = SystemClock.elapsedRealtime()
+            grewCount = 0
+            shrankCount = 0
+            probeArmed = wantProbe
+            probeState = if (wantProbe) "armed" else "idle"
+            probeArrivedAtMs = 0
+            probeHeadTarget = 0
+            probeLatencyMs = -1
             running.set(true)
             writer = Thread({ writeLoop(track) }, "phonebridge-audio-write").also { it.isDaemon = true; it.start() }
-            log("INFO", "audio playback started at ${fmt.sampleRate} Hz, ${fmt.channels} ch, ${fmt.frameMs} ms frames")
+            log(
+                "INFO",
+                "audio playback started at ${fmt.sampleRate} Hz, ${fmt.channels} ch, " +
+                    "${fmt.frameMs} ms frames, queue target ${targetFrames} frames " +
+                    "(${targetFrames * fmt.frameMs} ms), track buffer ${trackBufferMs} ms" +
+                    (if (lowLatency) ", low latency" else "") +
+                    (if (wantProbe) ", probe armed" else ""),
+            )
             return playbackResult("playing", fmt)
         }
     }
@@ -150,6 +249,9 @@ class AudioEngine(
             }
             playback = null
             playbackState = "idle"
+            probeArmed = false
+            probeState = "idle"
+            writeQueue.clear()
             log("INFO", "audio playback stopped")
             return mapOf("ok" to true, "playback" to "idle")
         }
@@ -188,7 +290,18 @@ class AudioEngine(
         if (frame.isMuted || frame.payload.isEmpty()) return
         synchronized(lock) {
             if (playbackState != "active") return
-            if (writeQueue.size >= QUEUE_FRAMES) {
+            // The probe times the very first frame that arrives after the PC
+            // armed it: that is the click, and it is the only frame whose delay
+            // from arrival to the speaker can be attributed to this phone.
+            if (probeArmed && probeArrivedAtMs == 0L) {
+                probeArrivedAtMs = SystemClock.elapsedRealtime()
+                probeState = "arrived"
+            }
+            // Drop-oldest: when the producer outruns the writer, the *stale*
+            // frame is the one to lose. Dropping the newest instead would keep
+            // the audio a full queue behind forever, which is exactly the delay
+            // this queue is being shrunk to remove.
+            while (writeQueue.size >= targetFrames) {
                 writeQueue.removeFirst()
                 droppedFrames++
             }
@@ -200,17 +313,108 @@ class AudioEngine(
         while (running.get()) {
             val chunk = synchronized(lock) { writeQueue.removeFirstOrNull() }
             if (chunk == null) {
-                Thread.sleep(5)
+                // Nothing to play: note it for the controller, then wait a
+                // fraction of a frame instead of the old 5 ms so a frame that
+                // lands mid-sleep is written promptly.
+                emptyPollsInWindow++
+                synchronized(lock) { updateProbeLocked() }
+                adapt(track)
+                Thread.sleep(IDLE_SLEEP_MS)
                 continue
             }
             try {
                 val written = track.write(chunk, 0, chunk.size)
-                if (written > 0) framesWritten.incrementAndGet()
+                if (written > 0) {
+                    framesWritten.incrementAndGet()
+                    writesInWindow++
+                    synchronized(lock) {
+                        framesWrittenTotal += (written / format.bytesPerFrame).coerceAtLeast(1)
+                        if (probeArmed && probeArrivedAtMs > 0 && probeHeadTarget == 0L) {
+                            probeHeadTarget = framesWrittenTotal
+                            probeState = "written"
+                        }
+                        updateProbeLocked()
+                    }
+                }
+                adapt(track)
             } catch (e: Exception) {
                 lastError = "playback write failed: ${e.message}"
                 log("ERROR", "playback write failed: ${e.message}")
                 running.set(false)
             }
+        }
+    }
+
+    /**
+     * Shrink the queue while it is healthy, grow it the moment it is not.
+     *
+     * The only trustworthy signal that the queue is too shallow is the device's
+     * own underrun counter going up; the only trustworthy signal that it may be
+     * shrunk is that counter standing still *and* the writer never finding the
+     * queue empty during the window. Both are measured per window, so a device
+     * that underruns once a minute still gets a deeper queue eventually, and a
+     * stable one settles at one frame.
+     */
+    private fun adapt(track: AudioTrack) {
+        val now = SystemClock.elapsedRealtime()
+        val underruns = runCatching { track.underrunCount }.getOrDefault(0)
+        if (lastUnderruns < 0) {
+            lastUnderruns = underruns
+            lastAdaptAtMs = now
+            emptyPollsInWindow = 0
+            writesInWindow = 0
+            return
+        }
+        if (now - lastAdaptAtMs < ADAPT_INTERVAL_MS) return
+        val fresh = underruns - lastUnderruns
+        lastUnderruns = underruns
+        val wasEmpty = emptyPollsInWindow > 0
+        val writes = writesInWindow
+        emptyPollsInWindow = 0
+        writesInWindow = 0
+        lastAdaptAtMs = now
+        if (!adaptive) return
+        // Nothing was written and nothing underran: the PC is simply silent (its
+        // loopback device produces no packets when the endpoint is idle). An
+        // empty queue here is not pressure, it is silence, so learn nothing.
+        if (writes == 0 && fresh == 0) return
+        if (fresh > 0 || wasEmpty) {
+            if (targetFrames < maxFrames) {
+                targetFrames++
+                grewCount++
+                log(
+                    "INFO",
+                    "queue target grew to $targetFrames frames (${targetFrames * frameMs()} ms): " +
+                        "$fresh new underruns, queue was empty $wasEmpty",
+                )
+            }
+            return
+        }
+        if (targetFrames > minFrames) {
+            targetFrames--
+            shrankCount++
+            log("INFO", "queue target shrank to $targetFrames frames (${targetFrames * frameMs()} ms): no underruns for ${ADAPT_INTERVAL_MS} ms")
+        }
+    }
+
+    /** Frame length of the active format, for the log lines above. */
+    private fun frameMs(): Int = format.frameMs
+
+    /**
+     * Turn "arrival -> the play head passed that frame" into a number.
+     *
+     * `playbackHeadPosition` is the AudioTrack sink clock: it advances when the
+     * mixer consumes the samples, which is *before* the Bluetooth encoder and its
+     * buffer. That is why the probe result is reported as "to the mixer", never
+     * as "to the ear" — see docs/19 for the part Android does not tell us.
+     */
+    private fun updateProbeLocked() {
+        if (!probeArmed || probeHeadTarget <= 0 || probeLatencyMs >= 0) return
+        val played = runCatching { playback?.playbackHeadPosition?.toLong() }.getOrNull() ?: 0L
+        if (played >= probeHeadTarget) {
+            probeLatencyMs = (SystemClock.elapsedRealtime() - probeArrivedAtMs).coerceAtLeast(0L)
+            probeState = "done"
+            log("INFO", "latency probe: arrival -> mixer ${probeLatencyMs} ms (queue target $targetFrames frames, track buffer $trackBufferMs ms)")
         }
     }
 
@@ -370,6 +574,8 @@ class AudioEngine(
         val bufferMs = if (track == null) 0 else track.bufferSizeInFrames * 1000 / rate
         // Unsigned: the counter is a u32 that wraps after ~24 h at 48 kHz.
         val playedFrames = track?.playbackHeadPosition?.toLong()?.and(0xFFFFFFFFL) ?: 0L
+        updateProbeLocked()
+        val codec = a2dpCodec()
         return mapOf(
             "route" to routeName(track),
             "device_name" to routeProductName(track),
@@ -379,8 +585,71 @@ class AudioEngine(
             "underruns" to (track?.underrunCount ?: 0),
             "played_ms" to playedFrames * 1000L / rate,
             "frames_written" to framesWritten.get(),
+            // --- latency, per stage ------------------------------------- //
+            // These five fields are what makes a latency claim checkable: the
+            // queue target the phone settled on, how deep the queue actually is,
+            // the track buffer the device granted, whether the fast path was
+            // requested, and the one-way probe when the PC ran --latency-test.
+            "queue_target_frames" to targetFrames,
+            "queue_target_ms" to targetFrames * format.frameMs,
+            "queue_depth" to writeQueue.size,
+            "adaptive" to adaptive,
+            "adapt_grow" to grewCount,
+            "adapt_shrink" to shrankCount,
+            "low_latency" to lowLatency,
+            "track_buffer_ms" to trackBufferMs,
+            "probe_state" to probeState,
+            "probe_latency_ms" to probeLatencyMs,
+            // Android exposes the A2DP codec and its buffer to system apps only,
+            // so this is empty on a normal install and the reason says why. The
+            // PC prints the honest floor instead of inventing a codec name.
+            "a2dp_codec" to codec.first,
+            "a2dp_codec_note" to codec.second,
         )
     }
+
+    /**
+     * The Bluetooth codec in use, when Android will admit to it.
+     *
+     * It normally will not: `BluetoothA2dp.getCodecStatus()` is `@SystemApi` and
+     * needs BLUETOOTH_PRIVILEGED, so an ordinary app is refused. Rather than
+     * print a codec name nobody measured, the phone reports an empty codec plus
+     * the reason, and the PC prints the A2DP floor from docs/19 as a range. A
+     * blank field would read as "no Bluetooth", which is the wrong conclusion for
+     * the one route where the codec decides half the budget.
+     */
+    private fun a2dpCodec(): Pair<String, String> {
+        if (routedDevice(playback)?.type != AudioDeviceInfo.TYPE_BLUETOOTH_A2DP) {
+            return "" to "no bluetooth a2dp route (codec not applicable)"
+        }
+        val adapter = context.getSystemService(BluetoothManager::class.java)?.adapter
+        if (adapter?.isEnabled != true) return "" to "bluetooth is off"
+        // Attempted anyway: it is the only public-shaped path to the codec, and
+        // a refusal is the expected answer rather than a failure to report.
+        val attempt = runCatching {
+            val getter = adapter.javaClass.getMethod("getCodecStatus")
+            getter.isAccessible = true
+            getter.invoke(adapter)
+        }
+        return if (attempt.isSuccess) {
+            "" to "codec name not readable from the status object"
+        } else {
+            "" to "codec not exposed to apps on this Android version"
+        }
+    }
+
+    /** A numeric RPC parameter, tolerating the JSON numbers Gson hands us. */
+    private fun intParam(params: Map<*, *>?, key: String, fallback: Int): Int =
+        (params?.get(key) as? Number)?.toInt() ?: fallback
+
+    /** A boolean RPC parameter: JSON booleans arrive as Boolean or as 0/1. */
+    private fun boolParam(params: Map<*, *>?, key: String, fallback: Boolean): Boolean =
+        when (val raw = params?.get(key)) {
+            is Boolean -> raw
+            is Number -> raw.toInt() != 0
+            is String -> raw.equals("true", ignoreCase = true)
+            else -> fallback
+        }
 
     /** The Android output type the track is routed to, in the PC's words. */
     private fun routeName(track: AudioTrack?): String {

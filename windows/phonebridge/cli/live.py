@@ -23,6 +23,9 @@ import contextlib
 import json
 from typing import Any
 
+from ..audio.frames import AudioFormat
+from ..audio.link import AudioError, AudioLink
+from ..audio.tone import ToneSource
 from ..live.config import (
     CAMERA_PROFILES,
     DEFAULT_CAMERA_PROFILE,
@@ -74,6 +77,17 @@ def _add_camera_args(parser: argparse.ArgumentParser) -> None:
         help="JPEG quality the phone encodes at (default 70; 20-95)",
     )
     parser.add_argument("--facing", choices=("back", "front"), default="back")
+    parser.add_argument(
+        "--fps-mode",
+        dest="fps_mode",
+        choices=("fixed", "variable"),
+        default="fixed",
+        help=(
+            "fixed (default): pin the phone's auto-exposure to the requested frame "
+            "rate, so 30 fps means 30 fps and a dim room is darker; variable: let "
+            "the device drop to 15 fps for a brighter picture"
+        ),
+    )
     parser.add_argument(
         "--stats",
         action="store_true",
@@ -181,9 +195,32 @@ def add_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> Non
         "--latency",
         dest="latency_ms",
         type=int,
-        default=200,
+        default=60,
         metavar="MS",
-        help="buffer sent to the phone in ms (default 200)",
+        help=(
+            "playback queue target the phone holds, in ms (default 60); the phone "
+            "grows it on its own if the device underruns"
+        ),
+    )
+    speaker.add_argument(
+        "--latency-test",
+        dest="latency_test",
+        action="store_true",
+        help=(
+            "play a click and report the delay per stage (capture, network, phone "
+            "queue, AudioTrack, Bluetooth) instead of streaming; needs the phone "
+            "to be playing, so it starts and stops playback itself"
+        ),
+    )
+    speaker.add_argument(
+        "--keep-alive",
+        dest="keep_alive",
+        action="store_true",
+        help=(
+            "send silence while this PC is not playing anything, so the phone's "
+            "AudioTrack and the Bluetooth link stay warm (WASAPI loopback delivers "
+            "nothing at all from an idle endpoint)"
+        ),
     )
     speaker.add_argument(
         "--lipsync",
@@ -240,7 +277,18 @@ def add_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> Non
     start.add_argument("--cable", default="CABLE Input", metavar="NAME")
     start.add_argument("--mic-latency", dest="mic_latency_ms", type=int, default=120, metavar="MS")
     start.add_argument(
-        "--speaker-latency", dest="speaker_latency_ms", type=int, default=200, metavar="MS"
+        "--speaker-latency",
+        dest="speaker_latency_ms",
+        type=int,
+        default=60,
+        metavar="MS",
+        help="playback queue target the phone holds, in ms (default 60)",
+    )
+    start.add_argument(
+        "--keep-alive",
+        dest="keep_alive",
+        action="store_true",
+        help="send silence from an otherwise silent PC so the phone's AudioTrack stays warm",
     )
     start.add_argument("--lipsync", dest="lipsync_ms", type=int, default=0, metavar="MS")
     start.add_argument("--duration", type=float, default=None, metavar="SECONDS")
@@ -269,6 +317,7 @@ def plan_from_args(args: argparse.Namespace) -> LivePlan:
                     quality=args.quality,
                     facing=args.facing,
                     backend=args.backend,
+                    fixed_fps=getattr(args, "fps_mode", "fixed") != "variable",
                 )
             )
         if command == "mic":
@@ -290,6 +339,8 @@ def plan_from_args(args: argparse.Namespace) -> LivePlan:
                     device=args.loopback_device,
                     test_tone=bool(getattr(args, "test_tone", False)),
                     muted=bool(getattr(args, "muted", False)),
+                    keep_alive=bool(getattr(args, "keep_alive", False)),
+                    latency_test=bool(getattr(args, "latency_test", False)),
                 )
             )
         if command == "start":
@@ -308,13 +359,18 @@ def plan_from_args(args: argparse.Namespace) -> LivePlan:
                     quality=args.quality,
                     facing=args.facing,
                     backend=args.backend,
+                    fixed_fps=getattr(args, "fps_mode", "fixed") != "variable",
                 )
                 if args.camera
                 else None,
                 mic=MicPlan(device=args.cable, latency_ms=args.mic_latency_ms)
                 if args.mic
                 else None,
-                speaker=SpeakerPlan(latency_ms=args.speaker_latency_ms, lipsync_ms=args.lipsync_ms)
+                speaker=SpeakerPlan(
+                    latency_ms=args.speaker_latency_ms,
+                    lipsync_ms=args.lipsync_ms,
+                    keep_alive=bool(getattr(args, "keep_alive", False)),
+                )
                 if args.speaker
                 else None,
             )
@@ -390,8 +446,118 @@ async def _status_loop(
             await asyncio.wait_for(stop.wait(), timeout=STATUS_INTERVAL_S)
 
 
+def _print_latency_report(report: dict[str, Any]) -> None:
+    """Print the per-stage table, with the two stages nobody can measure marked."""
+    print("", flush=True)
+    print("  speaker latency, measured per stage", flush=True)
+    print("  " + "-" * 62, flush=True)
+    print(
+        f"  PC capture block          {report['capture_ms']:>5} ms"
+        f"   one {report['frame_ms']} ms frame: the read returns whole frames",
+        flush=True,
+    )
+    print(
+        f"  PC -> phone               {report['network_ms']:>5} ms"
+        "   no jitter buffer on this path: one frame per pull",
+        flush=True,
+    )
+    print(
+        f"  phone queue target        {report['queue_target_ms']:>5} ms"
+        f"   {report['queue_depth']} frames in the queue right now",
+        flush=True,
+    )
+    print(
+        f"  arrival -> AudioTrack     {report['arrival_to_mixer_ms']:>5} ms"
+        "   the phone's own probe, on the phone's clock",
+        flush=True,
+    )
+    print(
+        f"  (track buffer reported    {report['track_buffer_ms']:>5} ms"
+        "   inside the number above, not on top of it)",
+        flush=True,
+    )
+    print("  " + "-" * 62, flush=True)
+    print(
+        f"  to the phone's mixer      {report['to_mixer_ms']:>5} ms",
+        flush=True,
+    )
+    floor = report.get("bluetooth_floor_ms")
+    if floor:
+        print(
+            f"  Bluetooth A2DP          +{floor[0]:>2}-{floor[1]} ms"
+            "   not measurable from an app: codec + headphone buffer",
+            flush=True,
+        )
+        low, high = report["to_ear_ms"]
+        print(f"  to the ear             ~{low}-{high} ms", flush=True)
+    else:
+        print(
+            f"  route {report['route']!r} adds no Bluetooth stage",
+            flush=True,
+        )
+    print(
+        f"  queue {report['queue_target_ms']} ms, route {report['route']!r}"
+        + (f" ({report['device_name']})" if report.get("device_name") else "")
+        + (", low-latency mixer requested" if report.get("low_latency") else "")
+        + (", adaptive queue" if report.get("adaptive") else ", fixed queue"),
+        flush=True,
+    )
+    for line in report.get("notes", []):
+        print(f"  note: {line}", flush=True)
+    print("", flush=True)
+
+
+async def _run_latency_test(args: argparse.Namespace, plan: LivePlan) -> int:
+    """``phonebridge speaker --latency-test``: one click, five numbers, exit.
+
+    Deliberately not a mode of the streaming command: a measurement that also
+    streams is a measurement of whatever else was happening. Playback is started
+    with the probe armed, a click is sent, and the phone's own timing is printed
+    stage by stage with the two stages Android will not hand over (the Bluetooth
+    codec and its buffer) marked as the range they are.
+    """
+    assert plan.speaker is not None
+    store = _store(args)
+    session, target = await open_session(args, store)
+    link = AudioLink(
+        session,
+        fmt=AudioFormat(),
+        # A quiet tone keeps a frame in flight for the probe to time; the click
+        # measure_latency() sends on top of it is what the user listens for.
+        source_factory=lambda fmt: ToneSource(fmt, frequency=220.0, seconds=8.0, amplitude=0.05),
+        target_ms=plan.speaker.latency_ms,
+        probe=True,
+    )
+    report: dict[str, Any] | None = None
+    try:
+        note(f"measuring the speaker path to {target.describe()} ...")
+        if not await link.start_playback():
+            note(f"playback did not start: {link.snapshot().detail}")
+            return EXIT_ERROR
+        await link.set_mute(False)
+        note("listen for a click on the phone; the numbers below time it")
+        report = await link.measure_latency()
+    except AudioError as exc:
+        note(str(exc))
+        return EXIT_ERROR
+    finally:
+        with contextlib.suppress(Exception):
+            await link.stop_playback("latency test finished")
+        with contextlib.suppress(Exception):
+            await session.close()
+    if report is None:
+        return EXIT_ERROR
+    if getattr(args, "format", "text") == "json":
+        _print_json(report)
+    else:
+        _print_latency_report(report)
+    return 0
+
+
 async def _run(args: argparse.Namespace) -> int:
     plan = plan_from_args(args)
+    if plan.speaker is not None and plan.speaker.latency_test:
+        return await _run_latency_test(args, plan)
     store = _store(args)
     session, target = await open_session(args, store)
     runner = LiveRunner(
