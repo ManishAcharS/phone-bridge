@@ -116,6 +116,25 @@ never opened to find out), `no_camera` (this phone has no such lens), `camera_bu
 (another app holds it, or CameraX refused to bind), `bad_config` (outside the
 documented ranges), plus the existing `bad_request`/`internal`.
 
+**Threading.** CameraX binds a `LifecycleRegistry`, and `setCurrentState` is
+main-thread-only — `bindToLifecycle`, `unbindAll` and our own owner all reach it.
+`camera.start` arrives on a WebSocket thread, so every lifecycle call now hops to
+the main thread and waits (`CameraEngine.onMainThread`), bounded at 10 s so a
+stuck main thread becomes a `camera_busy`/`internal` sentence rather than a hung
+request. The three camera RPCs also answer from their own thread
+(`cameraExecutor`), so the phone never waits for the main thread while holding the
+peer session's lock. Skipping either half produces the failure seen on the
+M2010J19SI: `Method setCurrentState must be called on the main thread`, answered
+as `internal`, with a PC that showed "camera error" and no reason.
+
+**When it fails, the phone says where.** Failures are logged as
+`E CameraEngine: camera <where>: <detail>`, so on a connected phone:
+
+    adb logcat -s CameraEngine
+
+is the one command that shows why the lens did not open. The PC prints the same
+text, once, as `camera stopped: <detail>`.
+
 ---
 
 ## 4. Permissions

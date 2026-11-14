@@ -232,6 +232,11 @@ combination that matters, and the one no test here can stand in for.
 | --- | --- | --- |
 | `no virtual camera backend could be opened` | OBS not installed, or never run since install | install OBS, open it once, re-run |
 | camera opens but the app does not list it | the app caches its device list | restart the app; check Settings → Bluetooth & devices → Cameras |
+| `camera stopped: the phone refused the camera (camera_denied): …` | the phone has not granted Camera | open PhoneBridge on the phone and allow Camera |
+| `camera stopped: … (camera_busy): …` | another app holds the lens, or CameraX refused to bind | close the camera app on the phone; `adb logcat -s CameraEngine` shows the exact refusal |
+| `camera stopped: no camera frames from the phone within 5 s` | `camera.start` was accepted and then nothing arrived | the phone accepted but cannot deliver: check its camera banner and `adb logcat -s CameraEngine` |
+| `camera stopped: the virtual camera stopped accepting frames (…)` | OBS (or the app) closed the device mid-stream | restart OBS and re-run; the session and audio keep working |
+| `camera: a camera frame could not be decoded (…)` | one damaged JPEG | nothing — the next frame replaces it; a repeating message means the phone and PC disagree on the codec |
 | `no playback device matching 'CABLE Input'` | VB-CABLE not installed, or not rebooted | install it, reboot, re-run `setup-windows.ps1 -Check` |
 | mic runs but the other app is silent | the app is reading a different input | select `CABLE Output (VB-Audio Virtual Cable)` |
 | `capturing PC audio needs PyAudioWPatch` | the package is missing | `py -3 -m pip install PyAudioWPatch` |

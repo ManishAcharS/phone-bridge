@@ -330,5 +330,20 @@ def _granted_config(reply: Any, fallback: VideoConfig) -> VideoConfig:
 
 
 def _explain(prefix: str, exc: Exception) -> str:
+    """Turn a refusal into one sentence that keeps the phone's code verbatim.
+
+    An RPC refusal arrives as ``SessionError("camera_busy: the camera could not
+    be opened (...)")`` — the code *and* the phone's own words, which is exactly
+    what the user needs to paste into a bug report. Splitting them out makes the
+    sentence readable without rewriting a single character of the message.
+    """
     text = str(exc).strip() or type(exc).__name__
+    code = str(getattr(exc, "code", "") or "")
+    detail = text
+    if not code:
+        head, sep, rest = text.partition(": ")
+        if sep and head.isidentifier() and head.islower() and rest:
+            code, detail = head, rest
+    if code:
+        return f"{prefix} ({code}): {detail}"
     return f"{prefix}: {text}"

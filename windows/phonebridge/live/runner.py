@@ -48,6 +48,11 @@ log = logging.getLogger(__name__)
 #: How long a stalled camera keeps showing its last frame before going black.
 DEFAULT_STALL_S = 2.0
 
+#: How long the camera may accept `camera.start` and deliver nothing before the
+#: silence itself is reported. Five seconds is long enough for a slow phone to
+#: open a lens and short enough that nobody stares at an empty preview.
+DEFAULT_FIRST_FRAME_S = 5.0
+
 #: Status is refreshed on this cadence: fast enough to look live, slow enough
 #: that a one-line status does not cost more than the audio it describes.
 STATUS_INTERVAL_S = 1.0
@@ -162,6 +167,7 @@ class LiveRunner:
         loopback_factory: Callable[..., Any] = open_loopback_source,
         decode: Callable[[VideoFrame, int, int], Any] = default_decode,
         stall_s: float = DEFAULT_STALL_S,
+        first_frame_s: float = DEFAULT_FIRST_FRAME_S,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._session = session
@@ -171,6 +177,7 @@ class LiveRunner:
         self._loopback_factory = loopback_factory
         self._decode = decode
         self._stall_s = stall_s
+        self._first_frame_s = first_frame_s
         self._clock = clock
 
         self._camera: CameraStream | None = None
@@ -184,6 +191,16 @@ class LiveRunner:
         self._fps = 0.0
         self._detail = ""
         self._started_at = clock()
+
+        # Camera failures, each kept as the sentence the user reads. They are
+        # separate because each has a different fix, and because only the first
+        # two mean the path is dead.
+        self._camera_error = ""
+        self._camera_notice = ""
+        self._sink_error = ""
+        self._decode_failures = 0
+        self._decode_detail = ""
+        self._first_frame_deadline = clock()
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -210,7 +227,13 @@ class LiveRunner:
                     facing=self._plan.camera.facing,
                 ),
             )
-            await self._camera.start()
+            if not await self._camera.start():
+                # The phone said no (or never answered). That sentence is the
+                # whole reason this command exists; keep it, and do not start a
+                # pump that has nothing to send.
+                snapshot = self._camera.snapshot()
+                self._camera_error = snapshot.detail or "the phone refused the camera"
+                log.warning("camera did not start: %s", self._camera_error)
 
         if self._plan.mic is not None or self._plan.speaker is not None:
             self._link = AudioLink(
@@ -231,7 +254,8 @@ class LiveRunner:
             if self._plan.speaker is not None:
                 await self._link.start_playback()
 
-        if self._camera_sink is not None:
+        if self._camera_sink is not None and not self._camera_error:
+            self._first_frame_deadline = self._clock() + self._first_frame_s
             self._pump = asyncio.get_running_loop().create_task(
                 self._camera_loop(), name="phonebridge-vcam-pump"
             )
@@ -307,7 +331,16 @@ class LiveRunner:
                     )
                     rgb = _to_array(image)
                 except Exception as exc:  # noqa: BLE001 - one bad JPEG is one dropped frame
-                    self._detail = f"frame dropped: {exc}"
+                    self._decode_failures += 1
+                    self._decode_detail = f"{type(exc).__name__}: {exc}"
+                    if self._decode_failures == 1:
+                        # Said once, not once per frame: a wrong codec or a
+                        # truncated stream would otherwise print every 33 ms.
+                        self._camera_notice = (
+                            f"a camera frame could not be decoded ({self._decode_detail}); "
+                            f"further failures are counted, not printed"
+                        )
+                        log.warning("camera: %s", self._camera_notice)
                     continue
                 pending.append((now + delay_s, rgb))
                 last_sent = now
@@ -317,18 +350,75 @@ class LiveRunner:
             # that are due. A positive offset delays video, never audio.
             while pending and pending[0][0] <= now:
                 _, rgb = pending.popleft()
-                self._camera_sink.send(rgb)
+                if self._sink_error:
+                    continue
+                try:
+                    self._camera_sink.send(rgb)
+                except Exception as exc:  # noqa: BLE001 - the device is gone, the session is not
+                    self._sink_failed(exc)
+                    continue
                 self._sent += 1
                 self._sent_at.append((now, self._sent))
 
-            if not pending and last_sent and not blanked and now - last_sent > self._stall_s:
+            if self._watch_first_frame(now):
+                continue
+
+            if (
+                not pending
+                and last_sent
+                and not blanked
+                and not self._sink_error
+                and now - last_sent > self._stall_s
+            ):
                 # Nothing new arrived: keep the last picture, then go black so a
                 # call shows "no signal" rather than a frozen face.
-                with contextlib.suppress(Exception):
+                try:
                     self._camera_sink.send_black()
+                except Exception as exc:  # noqa: BLE001
+                    self._sink_failed(exc)
                 blanked = True
 
             self._refresh_fps(now)
+
+    def _watch_first_frame(self, now: float) -> bool:
+        """Report a camera that accepted `start` and then delivered nothing.
+
+        `camera.start` returning true only means the phone agreed to try: the
+        lens can still fail to open inside CameraX, the encoder can throw, and a
+        phone that is not sending cannot say so. Silence is therefore a symptom,
+        and it has to be described — otherwise the status line says "camera
+        error 0.0 fps" forever and the user has nothing to act on.
+        """
+        if self._camera_error or self._sent or self._sink_error:
+            return False
+        if now < self._first_frame_deadline:
+            return False
+        snapshot = self._camera.snapshot() if self._camera is not None else None
+        received = int(snapshot.stats.get("received", 0)) if snapshot is not None else 0
+        if received:
+            reason = (
+                f"the phone sent {received} camera frame(s) but none could be decoded "
+                f"({self._decode_detail or 'no error was recorded'})"
+            )
+        else:
+            reason = (
+                f"no camera frames from the phone within {self._first_frame_s:.0f} s: "
+                "the phone accepted camera.start, so it believes the camera is on. "
+                "Check the phone for a camera error banner, and run "
+                "'adb logcat -s CameraEngine' on the phone for the exact refusal"
+            )
+        self._camera_error = reason
+        log.warning("camera: %s", reason)
+        return True
+
+    def _sink_failed(self, exc: Exception) -> None:
+        """The virtual camera device failed: say so, stop sending, keep the session."""
+        self._sink_error = (
+            f"the virtual camera stopped accepting frames "
+            f"({type(exc).__name__}: {exc}); restart OBS (or whichever app owns the "
+            f"camera) and re-run this command"
+        )
+        log.warning("camera: %s", self._sink_error)
 
     def _refresh_fps(self, now: float) -> None:
         while self._sent_at and now - self._sent_at[0][0] > 2.0:
@@ -358,6 +448,16 @@ class LiveRunner:
             snapshot = self._camera.snapshot()
             status.camera_state = snapshot.state
             status.camera_detail = snapshot.detail
+        if self._camera_error:
+            # Sticky: the path is dead until the command is restarted, so the
+            # reason must not disappear the moment the phone sends a frame.
+            status.camera_state = "error"
+            status.camera_detail = self._camera_error
+        elif self._sink_error:
+            status.camera_state = "error"
+            status.camera_detail = self._sink_error
+        elif self._camera_notice and not status.camera_detail:
+            status.camera_detail = self._camera_notice
         if self._link is not None:
             audio = self._link.snapshot()
             status.mic_state = audio.mic

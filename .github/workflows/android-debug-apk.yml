@@ -106,6 +106,14 @@ jobs:
           fi
           ls -l app/build/outputs/apk/debug/
 
+      # Unit tests, as asked for alongside the build. There is no test source set
+      # yet, so this is currently a no-op that still proves the test task and its
+      # dependencies resolve; a future test drops straight in.
+      - name: Run the unit tests
+        working-directory: android
+        shell: bash
+        run: ./gradlew --no-daemon --console=plain testDebugUnitTest
+
       # The method names the PC client calls live in the dex string pool, so this
       # is a cheap way to show the APK being uploaded is not a stale one. It is a
       # warning, not a failure: the phone is the only real proof.

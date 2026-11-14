@@ -252,21 +252,60 @@ def plan_from_args(args: argparse.Namespace) -> LivePlan:
     raise CliError(f"unknown live command {command!r}", code=EXIT_USAGE)
 
 
+#: What to do about each path, once it has failed. The reason itself always comes
+#: from the component that failed, verbatim; this is only the advice.
+_ADVICE = {
+    "camera": (
+        "the session is still up; microphone and speaker are unaffected. On the phone, "
+        "allow Camera for PhoneBridge, close any app that holds the lens, then Ctrl+C "
+        "and restart this command. For the phone's own reason, run on the phone: "
+        "adb logcat -s CameraEngine"
+    ),
+    "mic": (
+        "the session is still up; camera and speaker are unaffected. "
+        "Fix the device, then Ctrl+C and restart this command."
+    ),
+    "speaker": (
+        "the session is still up; camera and microphone are unaffected. "
+        "Pick another playback device, then Ctrl+C and restart this command."
+    ),
+}
+
+
+def _report_failures(status: Any, reported: dict[str, str]) -> None:
+    """Print each failure once, with its own reason, and never repeat it.
+
+    The old loop only did this for the microphone, so a camera that never
+    delivered a frame printed "camera error 0.0 fps" every second and no reason
+    at all — the phone's `camera_busy`/`camera_denied` text was in the JSON and
+    nowhere the user would look. Every path now gets the same treatment, and the
+    camera's detail is printed whenever it changes even if it is not fatal
+    (a single undecodable frame still deserves one line).
+    """
+    failures = (
+        ("camera", status.camera_state, status.camera_detail, "camera"),
+        ("mic", status.mic_state, status.mic_detail, "microphone"),
+        ("speaker", status.speaker_state, status.speaker_detail, "speaker"),
+    )
+    for path, state, detail, label in failures:
+        if not detail or reported.get(path) == detail:
+            continue
+        reported[path] = detail
+        if state == "error":
+            print(f"  {label} stopped: {detail}", flush=True)
+            print(f"  {_ADVICE[path]}", flush=True)
+        else:
+            # A notice, not a dead path: the picture is still being delivered.
+            print(f"  {label}: {detail}", flush=True)
+
+
 async def _status_loop(runner: LiveRunner, stop: asyncio.Event, *, quiet: bool) -> None:
-    reported = ""
+    reported: dict[str, str] = {}
     while not stop.is_set():
         status = runner.status()
         if not quiet:
             print(f"  {status.line()}", flush=True)
-        # Once per distinct failure: a repeating line buries the message it repeats.
-        if status.mic_state == "error" and status.mic_detail and status.mic_detail != reported:
-            reported = status.mic_detail
-            print(f"  microphone stopped: {status.mic_detail}", flush=True)
-            print(
-                "  the session is still up; camera and speaker are unaffected. "
-                "Fix the device, then Ctrl+C and restart this command.",
-                flush=True,
-            )
+        _report_failures(status, reported)
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=STATUS_INTERVAL_S)
 
@@ -312,8 +351,11 @@ async def _run(args: argparse.Namespace) -> int:
         _print_json(status.to_dict())
     else:
         note(status.line())
-    # A microphone that died mid-run is a failure, not a clean stop.
-    return EXIT_ERROR if status.mic_state == "error" else 0
+    # A path that died mid-run is a failure, not a clean stop — including the
+    # camera, which used to exit 0 after delivering no picture at all.
+    if status.mic_state == "error" or status.camera_state == "error":
+        return EXIT_ERROR
+    return 0
 
 
 def _store(args: argparse.Namespace) -> Any:

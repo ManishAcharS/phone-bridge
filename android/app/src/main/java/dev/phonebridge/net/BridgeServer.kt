@@ -21,6 +21,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
@@ -201,6 +202,20 @@ class BridgeServer(
         { runnable -> Thread(runnable, "phonebridge-phase5").apply { isDaemon = true } },
     )
 
+    /**
+     * Camera RPCs get their own thread.
+     *
+     * `camera.start` has to hand work to the main thread and wait for it, and the
+     * RPC handler runs while holding the peer session's lock. Waiting there would
+     * make the main thread wait for that lock in turn (its own stop path sends a
+     * frame), which is a ten-second stall and a failed request. Answering from
+     * another thread releases the lock first, and keeps the camera out of the
+     * Phase 5 queue where a busy Bluetooth read could delay it.
+     */
+    private val cameraExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "phonebridge-camera-rpc").apply { isDaemon = true }
+    }
+
     /** The PC that started the sensor stream, so its frames go to *that* session. */
     @Volatile
     private var sensorPeer: PeerSession? = null
@@ -274,16 +289,23 @@ class BridgeServer(
      * loop: heartbeats would starve and the very link the answer travels on would
      * drop. The reply goes through the normal send path, which is thread-safe.
      */
-    private fun answerLater(peer: PeerSession, id: Any?, block: () -> Map<String, Any?>) {
+    private fun answerLater(
+        peer: PeerSession,
+        id: Any?,
+        method: String = "",
+        executor: ExecutorService = phase5Executor,
+        block: () -> Map<String, Any?>,
+    ) {
+        val label = if (method.isEmpty()) "RPC" else "RPC $method"
         try {
-            phase5Executor.execute {
+            executor.execute {
                 val payload = try {
                     Messages.responseOk(id, block())
                 } catch (e: RpcFailure) {
-                    addLog("INFO", "RPC refused off-thread: ${e.code} - ${e.message}")
+                    addLog("INFO", "$label refused off-thread: ${e.code} - ${e.message}")
                     Messages.responseErr(id, e.code, e.message ?: e.code)
                 } catch (e: Exception) {
-                    addLog("ERROR", "RPC failed off-thread: ${e.message}")
+                    addLog("ERROR", "$label failed off-thread: ${e.javaClass.simpleName}: ${e.message}")
                     Messages.responseErr(id, "internal", "${e.javaClass.simpleName}: ${e.message}")
                 }
                 runCatching { peer.sendControl(payload) }
@@ -292,12 +314,12 @@ class BridgeServer(
         } catch (e: RejectedExecutionException) {
             // Better a sentence than a request that waits for a queue that never
             // drains: the PC can retry, and its own timeout stays meaningful.
-            addLog("WARN", "refusing an off-thread RPC: the Phase 5 queue is full")
+            addLog("WARN", "refusing an off-thread $label: the worker queue is full")
             peer.sendControl(
                 Messages.responseErr(
                     id,
                     "busy",
-                    "the phone is still busy with other Bluetooth or file work; retry shortly",
+                    "the phone is still busy with other work; retry shortly",
                 ),
             )
         }
@@ -520,6 +542,10 @@ class BridgeServer(
         files.release()
         bluetooth.release()
         phase5Executor.shutdownNow()
+        // The camera's own thread goes last: a queued camera.stop must be able to
+        // release the lens before the thread that would run it disappears.
+        camera.release()
+        cameraExecutor.shutdownNow()
         _running.value = false
         _peers.value = emptyList()
         addLog("INFO", "server stopped")
@@ -846,30 +872,33 @@ class BridgeServer(
                 }
 
                 // --- Phase 4 camera ------------------------------------ //
+                // These three answer off the peer's thread: CameraX's lifecycle
+                // lives on the main thread, and waiting for it while holding the
+                // session lock would stall the phone (see [cameraExecutor]).
                 "camera.start" -> {
                     val requested = try {
                         VideoFrames.Config.fromParams(params)
                     } catch (e: IllegalArgumentException) {
                         throw RpcFailure("bad_config", e.message ?: "unsupported camera config")
                     }
-                    // Result maps are built here, not in CameraEngine, so the wire
-                    // contract sits next to the method name (docs/03 §6).
-                    val started = camera.start(requested)
-                    Messages.responseOk(
-                        id,
+                    answerLater(peer, id, "camera.start", cameraExecutor) {
+                        // Result maps are built here, not in CameraEngine, so the
+                        // wire contract sits next to the method name (docs/03 §6).
+                        val started = camera.start(requested)
                         mapOf(
                             "ok" to (started["ok"] as? Boolean ?: false),
                             "config" to started["config"],
-                        ),
-                    )
+                        )
+                    }
+                    null
                 }
 
                 "camera.stop" -> {
-                    camera.stop()
-                    Messages.responseOk(
-                        id,
-                        mapOf("ok" to true, "streaming" to false),
-                    )
+                    answerLater(peer, id, "camera.stop", cameraExecutor) {
+                        camera.stop()
+                        mapOf("ok" to true, "streaming" to false)
+                    }
+                    null
                 }
 
                 "camera.switch" -> {
@@ -877,18 +906,18 @@ class BridgeServer(
                     if (facing != "back" && facing != "front") {
                         throw RpcFailure("bad_config", "facing must be 'back' or 'front'")
                     }
-                    val next = VideoFrames.Config(
-                        width = camera.status()["width"] as? Int ?: 1280,
-                        height = camera.status()["height"] as? Int ?: 720,
-                        fps = camera.status()["fps"] as? Int ?: 15,
-                        facing = facing,
-                    )
-                    val streaming = camera.status()["streaming"] as? Boolean ?: false
-                    if (streaming) camera.start(next) else camera.stop()
-                    Messages.responseOk(
-                        id,
-                        mapOf("ok" to true, "facing" to facing, "streaming" to streaming),
-                    )
+                    answerLater(peer, id, "camera.switch", cameraExecutor) {
+                        val next = VideoFrames.Config(
+                            width = camera.status()["width"] as? Int ?: 1280,
+                            height = camera.status()["height"] as? Int ?: 720,
+                            fps = camera.status()["fps"] as? Int ?: 15,
+                            facing = facing,
+                        )
+                        val streaming = camera.status()["streaming"] as? Boolean ?: false
+                        if (streaming) camera.start(next) else camera.stop()
+                        mapOf("ok" to true, "facing" to facing, "streaming" to streaming)
+                    }
+                    null
                 }
 
                 "camera.status" -> {
