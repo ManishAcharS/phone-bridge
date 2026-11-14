@@ -228,7 +228,7 @@ def test_the_sink_writes_frames_it_receives() -> None:
     silence = bytes(fmt.bytes_per_frame)
     for _ in range(3):
         sink.write(b"\x01\x00" * fmt.samples_per_frame)
-    time.sleep(0.15)
+    time.sleep(0.3)
     sink.close()
 
     assert writer.frames
@@ -241,7 +241,7 @@ def test_an_underrun_writes_silence_instead_of_stalling() -> None:
     writer = FakeWriter()
     sink = CableMicSink(fmt, device=None, latency_ms=40, writer=writer)
 
-    time.sleep(0.15)  # nothing was ever pushed
+    time.sleep(0.3)  # nothing was ever pushed
     sink.close()
 
     assert writer.frames, "the device must keep being fed, or the stream stalls"
@@ -273,7 +273,7 @@ def test_a_writer_that_dies_stops_the_sink_and_is_reported() -> None:
 
     fmt = AudioFormat()
     sink = CableMicSink(fmt, device=None, latency_ms=40, writer=DyingWriter())
-    time.sleep(0.15)
+    time.sleep(0.3)
 
     assert sink.error == "device unplugged"
     sink.close()

@@ -48,7 +48,9 @@ jobs:
       # The live delivery paths are Python, not C++, but Windows is the only
       # place their device lookup and driver-missing messages run for real.
       - name: Install the PC client for the live-delivery tests
-        run: python -m pip install cryptography
+        # Same install a user performs; it pulls the two declared dependencies
+        # (websockets, cryptography) that the CLI's imports need.
+        run: python -m pip install -e windows
 
       - name: Run live-delivery tests (no hardware needed)
         shell: pwsh

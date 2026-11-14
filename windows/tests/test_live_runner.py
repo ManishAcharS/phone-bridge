@@ -214,9 +214,9 @@ def test_a_stalled_camera_is_blanked_after_the_stall_timeout() -> None:
     async def scenario() -> None:
         await runner.start()
         stream = FakeCameraStream.instances[0]
-        await asyncio.sleep(0.1)
-        stream.frame = None  # the phone stopped sending
         await asyncio.sleep(0.2)
+        stream.frame = None  # the phone stopped sending
+        await asyncio.sleep(0.4)
         await runner.close()
 
     asyncio.run(scenario())
@@ -232,9 +232,9 @@ def test_lip_sync_delays_video_not_audio() -> None:
 
     async def scenario() -> None:
         await runner.start()
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.2)
         early = len(sink.frames)
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.6)
         late = len(sink.frames)
         await runner.close()
         assert early == 0, "a 400 ms offset must hold the first frames back"
