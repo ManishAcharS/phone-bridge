@@ -1,0 +1,39 @@
+name: Windows native virtual camera
+
+on:
+  push:
+    branches: [main, "work/**"]
+    paths:
+      - "windows-native/vcam-poc/**"
+      - ".github/workflows/windows-native-vcam.yml"
+  pull_request:
+    paths:
+      - "windows-native/vcam-poc/**"
+      - ".github/workflows/windows-native-vcam.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure x64 native camera
+        run: cmake -S windows-native/vcam-poc -B build/vcam -A x64
+
+      - name: Build Release
+        run: cmake --build build/vcam --config Release --parallel
+
+      - name: Verify host command surface (read-only)
+        shell: pwsh
+        run: |
+          & .\build\vcam\Release\vcam_host.exe --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcam_host --help failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Run native host safety tests
+        shell: pwsh
+        run: |
+          python -m pytest windows/tests/test_vcam_host_safety.py -q
