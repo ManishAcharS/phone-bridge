@@ -68,6 +68,30 @@ ERROR = "error"
 #: Frame header is 8 bytes; a queue of 8 frames is 160 ms of audio at 20 ms.
 DEFAULT_QUEUE = 8
 
+#: How often the PC asks the phone what its `AudioTrack` is doing. One small RPC
+#: per second while a direction is running: `audio.playback.start` only says the
+#: phone agreed to play, and nothing else in the protocol reports whether the
+#: device ever consumed a sample. See :meth:`AudioLink.phone_status`.
+PHONE_STATUS_INTERVAL_S = 1.0
+
+#: Fields the PC keeps from `audio.status`. Anything else the phone sends is
+#: ignored, so a newer APK cannot break an older PC.
+_PHONE_AUDIO_KEYS = (
+    "playback",
+    "mic",
+    "route",
+    "device_name",
+    "track_state",
+    "buffered_ms",
+    "buffer_ms",
+    "underruns",
+    "played_ms",
+    "frames_in",
+    "frames_written",
+    "dropped",
+    "last_error",
+)
+
 
 class AudioError(RuntimeError):
     """An audio direction refused or failed, with a message meant for a user."""
@@ -98,6 +122,9 @@ class AudioSnapshot:
     muted: bool = True
     format: dict[str, int] = field(default_factory=dict)
     stats: dict[str, int | str] = field(default_factory=dict)
+    #: The phone's own answer to `audio.status`, plus the rates the PC derives
+    #: from two consecutive answers. Empty when the phone has not answered yet.
+    phone: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -109,6 +136,7 @@ class AudioSnapshot:
             "muted": self.muted,
             "format": dict(self.format),
             "stats": dict(self.stats),
+            "phone": dict(self.phone),
         }
 
 
@@ -124,6 +152,7 @@ class AudioLink:
         sink_factory: Callable[[AudioFormat], AudioSink] | None = None,
         on_change: Callable[[AudioSnapshot], None] | None = None,
         queue_size: int = DEFAULT_QUEUE,
+        status_interval: float = PHONE_STATUS_INTERVAL_S,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._session = session
@@ -150,6 +179,15 @@ class AudioLink:
         self._receiver: asyncio.Task[None] | None = None
         self._queue: asyncio.Queue[bytes | None] | None = None
 
+        # The phone's own view of its output, refreshed once a second (see
+        # `phone_status`). Rates are derived here because the phone sends
+        # cumulative counters.
+        self._status_interval = max(0.05, float(status_interval))
+        self._status_task: asyncio.Task[None] | None = None
+        self._phone: dict[str, Any] = {}
+        self._phone_at: float | None = None
+        self._phone_counters: dict[str, float] = {}
+
     # ------------------------------------------------------------------ #
     # observation
     # ------------------------------------------------------------------ #
@@ -175,7 +213,108 @@ class AudioLink:
             muted=self._muted,
             format=self._fmt.as_dict(),
             stats=self.stats.to_dict(),
+            phone=self.phone_status,
         )
+
+    @property
+    def phone_status(self) -> dict[str, Any]:
+        """What the *phone* reports about its own output.
+
+        `playback == "active"` means the phone accepted the stream. It does not
+        mean the phone played it: a muted stream, a route to a disconnected
+        headset, or an `AudioTrack` that stopped consuming all look identical
+        from here. This is the phone's answer to `audio.status` — its route, the
+        track's state, the audio waiting in front of it, its underrun count —
+        plus the two rates the PC can only compute from two answers:
+
+        ``rx_fps``
+            frames the phone received per second (what the link delivered).
+        ``written_fps``
+            frames it handed to `AudioTrack` per second. `rx_fps` above zero
+            with `written_fps` at zero is the signature of a phone that is
+            receiving a muted or unreachable stream.
+        """
+        return dict(self._phone)
+
+    # ------------------------------------------------------------------ #
+    # asking the phone what it is doing
+    # ------------------------------------------------------------------ #
+    def _ensure_status_poller(self) -> None:
+        """Start the once-a-second `audio.status` poll, if it is not running."""
+        if self._status_task is not None and not self._status_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no loop: nothing to poll on (plain construction)
+            return
+        self._status_task = loop.create_task(
+            self._poll_phone_status(), name="audio-phone-status"
+        )
+
+    def _stop_status_poller(self) -> None:
+        """Stop polling once neither direction can produce an answer."""
+        if self._playback.state in (ACTIVE, STARTING) or self._mic.state in (
+            ACTIVE,
+            STARTING,
+        ):
+            return
+        task, self._status_task = self._status_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _poll_phone_status(self) -> None:
+        """Ask the phone for its own numbers, once a second.
+
+        A debug aid must never break audio: every failure is swallowed and the
+        loop keeps its cadence, so a phone that answers nothing simply leaves the
+        PC's line showing what the PC knows.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._status_interval)
+                try:
+                    reply = await self._session.call("audio.status", {})
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - never fatal
+                    log.debug("audio.status failed: %s", exc)
+                    continue
+                self._absorb_phone_status(reply)
+        except asyncio.CancelledError:
+            raise
+
+    def _absorb_phone_status(self, reply: Any) -> None:
+        """Keep the phone's answer, and turn cumulative counters into rates."""
+        payload = reply.get("result", reply) if isinstance(reply, dict) else None
+        if not isinstance(payload, dict):
+            return
+        stats: dict[str, Any] = {
+            key: payload[key]
+            for key in _PHONE_AUDIO_KEYS
+            if isinstance(payload.get(key), (int, float, str))
+        }
+        now = self._clock()
+        elapsed = 0.0 if self._phone_at is None else now - self._phone_at
+        if elapsed > 0:
+            for name, key in (
+                ("rx_fps", "frames_in"),
+                ("written_fps", "frames_written"),
+            ):
+                value = payload.get(key)
+                before = self._phone_counters.get(key)
+                if not isinstance(value, (int, float)) or before is None:
+                    continue
+                delta = float(value) - before
+                if delta < 0:  # the phone restarted its track: no rate yet
+                    continue
+                stats[name] = round(delta / elapsed, 1)
+        for key in ("frames_in", "frames_written"):
+            value = payload.get(key)
+            if isinstance(value, (int, float)):
+                self._phone_counters[key] = float(value)
+        self._phone_at = now
+        self._phone = stats
+        self._notify()
 
     def _notify(self) -> None:
         if self._on_change is not None:
@@ -249,6 +388,7 @@ class AudioLink:
         self._capture = loop.create_task(self._capture_loop(), name="audio-capture")
         self._sender = loop.create_task(self._send_loop(), name="audio-send")
         self._set_playback(ACTIVE)
+        self._ensure_status_poller()
         return True
 
     async def _capture_loop(self) -> None:
@@ -342,6 +482,7 @@ class AudioLink:
         await self._quiet_rpc("audio.playback.stop")
         self._source = None
         self._set_playback(IDLE, reason)
+        self._stop_status_poller()
 
     # ------------------------------------------------------------------ #
     # phone microphone -> PC
@@ -386,6 +527,7 @@ class AudioLink:
             self._receive_loop(queue), name="audio-receive"
         )
         self._set_mic(ACTIVE)
+        self._ensure_status_poller()
         return True
 
     async def _receive_loop(self, queue: asyncio.Queue[bytes | None]) -> None:
@@ -442,6 +584,7 @@ class AudioLink:
                 self._sink.close()
             self._sink = None
         self._set_mic(IDLE, reason)
+        self._stop_status_poller()
 
     # ------------------------------------------------------------------ #
     # controls
@@ -482,6 +625,11 @@ class AudioLink:
             await self.stop_playback(reason)
         with contextlib.suppress(Exception):
             await self.stop_mic(reason)
+        task, self._status_task = self._status_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
 
 def _granted_format(reply: Any, fallback: AudioFormat) -> AudioFormat:
@@ -499,6 +647,16 @@ def _granted_format(reply: Any, fallback: AudioFormat) -> AudioFormat:
 
 
 def _explain(prefix: str, exc: Exception) -> str:
-    """Turn an RPC/transport failure into a sentence, keeping the code visible."""
+    """Turn an RPC/transport failure into a sentence, keeping the code visible.
+
+    A real session turns an error reply into ``SessionError("code: message")``, so
+    the code is usually already in the text. An in-process ``RpcError`` keeps it in
+    an attribute instead, and a user looking the failure up in the docs/03 table
+    needs it either way — so it is added when it is missing, not when it is
+    convenient.
+    """
     text = str(exc).strip() or type(exc).__name__
+    code = getattr(exc, "code", "")
+    if isinstance(code, str) and code and not text.startswith(f"{code}:"):
+        text = f"{code}: {text}"
     return f"{prefix}: {text}"

@@ -200,6 +200,24 @@ def add_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> Non
         metavar="NAME",
         help="loopback device name substring (default: the default output)",
     )
+    speaker.add_argument(
+        "--test-tone",
+        dest="test_tone",
+        action="store_true",
+        help=(
+            "send a 440 Hz sine for 3 s instead of capturing this PC's audio, then "
+            "stop: tests the phone's own output without a sound card, PyAudioWPatch "
+            "or anything playing on the PC"
+        ),
+    )
+    speaker.add_argument(
+        "--muted",
+        action="store_true",
+        help=(
+            "start muted (sends silence with the MUTED flag); the default is to send "
+            "audio, because that is what this command is for"
+        ),
+    )
     speaker.add_argument("--duration", type=float, default=None, metavar="SECONDS")
     speaker.add_argument("--no-status", action="store_true")
 
@@ -270,6 +288,8 @@ def plan_from_args(args: argparse.Namespace) -> LivePlan:
                     latency_ms=args.latency_ms,
                     lipsync_ms=args.lipsync_ms,
                     device=args.loopback_device,
+                    test_tone=bool(getattr(args, "test_tone", False)),
+                    muted=bool(getattr(args, "muted", False)),
                 )
             )
         if command == "start":
@@ -317,8 +337,10 @@ _ADVICE = {
         "Fix the device, then Ctrl+C and restart this command."
     ),
     "speaker": (
-        "the session is still up; camera and microphone are unaffected. "
-        "Pick another playback device, then Ctrl+C and restart this command."
+        "the session is still up; camera and microphone are unaffected. Check the "
+        "speaker line for the phone's own route and playback state, prove the phone "
+        "alone with `phonebridge speaker --test-tone`, and for the phone's reason run "
+        "on the phone: adb logcat -s BridgeServer"
     ),
 }
 
@@ -385,13 +407,27 @@ async def _run(args: argparse.Namespace) -> int:
                 f'microphone: writing into {plan.mic.device!r}; select "CABLE Output" '
                 f"as the microphone in the other app; VB-CABLE: {VB_CABLE_URL}"
             )
-        if plan.speaker is not None:
+        if plan.speaker is not None and plan.speaker.test_tone:
+            note(
+                f"test tone: {plan.speaker.tone_hz:.0f} Hz for "
+                f"{plan.speaker.tone_seconds:.1f} s, sent to the phone; nothing is "
+                f"captured from this PC, so a silent phone is a phone problem. Watch "
+                f"the speaker line: route, f/s and played all come from the phone"
+            )
+        elif plan.speaker is not None:
             note(
                 f"speaker: buffer {plan.speaker.latency_ms} ms, lip-sync "
                 f"{plan.speaker.lipsync_ms} ms; the phone plays it, Android routes it to "
                 f"Bluetooth headphones when they are connected"
             )
         await runner.start()
+        early = runner.status()
+        if plan.speaker is not None and plan.speaker.test_tone and early.speaker_state == "error":
+            # A test tone exists to prove one thing. If the phone refused playback
+            # there is nothing to listen for, so say why and exit instead of idling
+            # on silence with a dead path.
+            _report_failures(early, {})
+            return EXIT_ERROR
         printer = asyncio.get_running_loop().create_task(
             _status_loop(
                 runner,
@@ -415,8 +451,13 @@ async def _run(args: argparse.Namespace) -> int:
     else:
         note(status.line())
     # A path that died mid-run is a failure, not a clean stop — including the
-    # camera, which used to exit 0 after delivering no picture at all.
-    if status.mic_state == "error" or status.camera_state == "error":
+    # camera, which used to exit 0 after delivering no picture at all, and the
+    # speaker, which used to exit 0 after the phone refused to play anything.
+    if (
+        status.mic_state == "error"
+        or status.camera_state == "error"
+        or status.speaker_state == "error"
+    ):
         return EXIT_ERROR
     return 0
 

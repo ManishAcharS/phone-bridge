@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat as AndroidAudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
@@ -66,6 +67,9 @@ class AudioEngine(
     private var framesOut = 0
     private var lastError: String? = null
 
+    /** Chunks actually handed to `AudioTrack.write`, i.e. what the phone played. */
+    private val framesWritten = AtomicInteger(0)
+
     // ------------------------------------------------------------------ //
     // PC audio -> this phone's speaker
     // ------------------------------------------------------------------ //
@@ -125,6 +129,7 @@ class AudioEngine(
             playbackState = "active"
             writeQueue.clear()
             droppedFrames = 0
+            framesWritten.set(0)
             running.set(true)
             writer = Thread({ writeLoop(track) }, "phonebridge-audio-write").also { it.isDaemon = true; it.start() }
             log("INFO", "audio playback started at ${fmt.sampleRate} Hz, ${fmt.channels} ch, ${fmt.frameMs} ms frames")
@@ -199,7 +204,8 @@ class AudioEngine(
                 continue
             }
             try {
-                track.write(chunk, 0, chunk.size)
+                val written = track.write(chunk, 0, chunk.size)
+                if (written > 0) framesWritten.incrementAndGet()
             } catch (e: Exception) {
                 lastError = "playback write failed: ${e.message}"
                 log("ERROR", "playback write failed: ${e.message}")
@@ -326,22 +332,96 @@ class AudioEngine(
     // ------------------------------------------------------------------ //
     // status and teardown
     // ------------------------------------------------------------------ //
-    fun status(): Map<String, Any> = mapOf(
-        "playback" to playbackState,
-        "mic" to micState,
-        "volume" to volumePercent,
-        "muted" to muted,
-        "mic_muted" to micMuted,
-        "permitted" to (ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.RECORD_AUDIO,
-        ) == PackageManager.PERMISSION_GRANTED),
-        "format" to format.asMap(),
-        "frames_in" to framesIn,
-        "frames_out" to framesOut,
-        "dropped" to droppedFrames,
-        "last_error" to (lastError ?: ""),
-    )
+    fun status(): Map<String, Any> = synchronized(lock) {
+        mapOf(
+            "playback" to playbackState,
+            "mic" to micState,
+            "volume" to volumePercent,
+            "muted" to muted,
+            "mic_muted" to micMuted,
+            "permitted" to (ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO,
+            ) == PackageManager.PERMISSION_GRANTED),
+            "format" to format.asMap(),
+            "frames_in" to framesIn,
+            "frames_out" to framesOut,
+            "dropped" to droppedFrames,
+            "last_error" to (lastError ?: ""),
+        ) + playbackSnapshotLocked()
+    }
+
+    /**
+     * What the phone's own output is doing, for the PC's status line.
+     *
+     * `playback = active` above only means the RPC succeeded and an `AudioTrack`
+     * exists. These are the numbers that answer "is the user actually hearing
+     * it": which device Android routed the track to (a Bluetooth route and the
+     * built-in speaker are different answers to the same question), whether the
+     * track is still playing, how much audio is waiting in front of it, how many
+     * times the device ran dry, and how many milliseconds it has played. A
+     * `played_ms` that stops climbing while `frames_in` still climbs is a track
+     * that has stalled with a full queue — invisible without these.
+     */
+    private fun playbackSnapshotLocked(): Map<String, Any> {
+        val track = playback
+        val rate = maxOf(1, format.sampleRate)
+        val bufferedMs = writeQueue.size * format.frameMs
+        val bufferMs = if (track == null) 0 else track.bufferSizeInFrames * 1000 / rate
+        // Unsigned: the counter is a u32 that wraps after ~24 h at 48 kHz.
+        val playedFrames = track?.playbackHeadPosition?.toLong()?.and(0xFFFFFFFFL) ?: 0L
+        return mapOf(
+            "route" to routeName(track),
+            "device_name" to routeProductName(track),
+            "track_state" to trackStateName(track),
+            "buffered_ms" to bufferedMs,
+            "buffer_ms" to bufferMs,
+            "underruns" to (track?.underrunCount ?: 0),
+            "played_ms" to playedFrames * 1000L / rate,
+            "frames_written" to framesWritten.get(),
+        )
+    }
+
+    /** The Android output type the track is routed to, in the PC's words. */
+    private fun routeName(track: AudioTrack?): String {
+        val device = routedDevice(track) ?: return "none"
+        return when (device.type) {
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "speaker"
+            AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "earpiece"
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "bluetooth_a2dp"
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "bluetooth_sco"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET -> "wired_headset"
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "wired_headphones"
+            AudioDeviceInfo.TYPE_USB_DEVICE -> "usb_device"
+            AudioDeviceInfo.TYPE_USB_HEADSET -> "usb_headset"
+            AudioDeviceInfo.TYPE_DOCK -> "dock"
+            AudioDeviceInfo.TYPE_HDMI -> "hdmi"
+            else -> "other"
+        }
+    }
+
+    private fun routeProductName(track: AudioTrack?): String =
+        runCatching { routedDevice(track)?.productName?.toString() ?: "" }.getOrDefault("")
+
+    private fun routedDevice(track: AudioTrack?): AudioDeviceInfo? =
+        // Throws if the track was released between the two calls; a status read
+        // must never be the thing that throws.
+        try {
+            track?.routedDevice
+        } catch (e: Exception) {
+            null
+        }
+
+    private fun trackStateName(track: AudioTrack?): String {
+        if (track == null) return "no_track"
+        if (track.state != AudioTrack.STATE_INITIALIZED) return "uninitialised"
+        return when (track.playState) {
+            AudioTrack.PLAYSTATE_PLAYING -> "playing"
+            AudioTrack.PLAYSTATE_PAUSED -> "paused"
+            AudioTrack.PLAYSTATE_STOPPED -> "stopped"
+            else -> "unknown"
+        }
+    }
 
     fun activeDirections(): Set<String> {
         val active = mutableSetOf<String>()

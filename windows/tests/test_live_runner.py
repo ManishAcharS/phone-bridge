@@ -94,6 +94,9 @@ class FakeAudioLink:
         self.mic_started = False
         self.playback_started = False
         self.mic_stopped = ""
+        #: What the runner asked for after `start_playback` succeeded. `None`
+        #: means it never asked, which would leave the stream muted.
+        self.muted: bool | None = None
         self.closed = False
         FakeAudioLink.instances.append(self)
 
@@ -112,6 +115,10 @@ class FakeAudioLink:
         self.playback_started = True
         return True
 
+    async def set_mute(self, muted: bool) -> bool:
+        self.muted = muted
+        return muted
+
     def snapshot(self) -> Any:
         return SimpleNamespace(
             playback="active" if self.playback_started else "idle",
@@ -119,6 +126,7 @@ class FakeAudioLink:
             detail="",
             mic_detail="",
             stats={"received": 7},
+            phone={"route": "speaker", "track_state": "playing", "underruns": 0},
         )
 
     async def stop_mic(self, reason: str = "stopped") -> None:
@@ -307,7 +315,9 @@ def test_status_is_readable_as_a_line_and_as_json() -> None:
     assert line.startswith("link up")
     assert "camera active 29.7 fps" in line
     assert "mic active -22 dBFS buf 120 ms" in line
-    assert "speaker active 200 ms" in line
+    # The buffer the PC was configured with is labelled as the PC's; everything
+    # after it would come from the phone (this status has no phone answer yet).
+    assert "speaker active pc-buf 200 ms" in line
 
     payload = status.to_dict()
     assert payload["camera"]["fps"] == 29.7

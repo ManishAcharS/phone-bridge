@@ -144,6 +144,31 @@ def test_the_mic_device_flag_does_not_collide_with_the_phone_selector() -> None:
     assert args.device is None  # the phone selector, untouched
 
 
+def test_speaker_can_test_the_phone_without_the_pcs_sound_card() -> None:
+    """`--test-tone` replaces loopback capture with a 440 Hz sine."""
+    args = _parse("speaker", "--test-tone")
+    plan = live.plan_from_args(args)
+
+    assert args.test_tone is True
+    assert plan.speaker is not None
+    assert plan.speaker.test_tone is True
+    assert plan.speaker.tone_hz == 440.0
+    assert plan.speaker.tone_seconds == 3.0
+    assert plan.speaker.device == "", "nothing on the PC is captured, so no device is named"
+
+
+def test_the_speaker_command_sends_sound_by_default() -> None:
+    """A muted stream is silence the phone throws away; `--muted` is the opt-in."""
+    assert live.plan_from_args(_parse("speaker")).speaker.muted is False
+    assert live.plan_from_args(_parse("speaker", "--muted")).speaker.muted is True
+
+
+def test_the_test_tone_flags_are_not_on_start() -> None:
+    """`start` runs the real paths; a tone there would be a silent session."""
+    with pytest.raises(SystemExit):
+        _parse("start", "--camera", "--test-tone")
+
+
 def test_speaker_loopback_flag_is_separate_from_the_phone_selector() -> None:
     args = _parse("speaker", "--loopback", "Speakers")
 

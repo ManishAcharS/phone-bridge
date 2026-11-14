@@ -282,7 +282,7 @@ keys are additive and must be ignored by a client. Types are JSON types.
 | `audio.playback.volume` | `ok` bool, `percent` int (0-100, echoed after clamping) |
 | `audio.mic.start` | `ok` bool, `format` object with the same four keys — microphone frames follow on stream 2 |
 | `audio.mic.stop` | `ok` bool, `mic` str (`idle`) |
-| `audio.status` | `playback` str, `mic` str, `volume` int, `muted` bool, `permitted` bool |
+| `audio.status` | `playback` str, `mic` str, `volume` int, `muted` bool, `permitted` bool, plus the playback block: `route` str (`speaker`, `bluetooth_a2dp`, `bluetooth_sco`, `wired_headset`, `wired_headphones`, `usb_*`, `none`), `device_name` str, `track_state` str (`playing`/`paused`/`stopped`/`uninitialised`/`no_track`), `buffered_ms` int (audio waiting in front of `AudioTrack`), `buffer_ms` int (the track's own buffer), `underruns` int, `played_ms` int, `frames_in` int, `frames_written` int, `dropped` int |
 | `camera.start` | `ok` bool, `config` object (`width` int, `height` int, `fps` int, `quality` int, `facing` str) |
 | `camera.stop` | `ok` bool, `streaming` bool (always false) |
 | `camera.switch` | `ok` bool, `facing` str, `streaming` bool |

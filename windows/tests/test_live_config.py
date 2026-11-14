@@ -83,6 +83,38 @@ def test_speaker_lipsync_accepts_negative_offsets_and_rejects_nonsense() -> None
         SpeakerPlan(latency_ms=0)
 
 
+def test_a_speaker_plan_sends_audio_unless_it_is_told_to_be_muted() -> None:
+    """The link defaults to muted; the command that exists to play audio must not."""
+    assert SpeakerPlan().muted is False
+    assert SpeakerPlan(muted=True).muted is True
+
+
+def test_a_test_tone_plan_names_the_note_it_will_send() -> None:
+    plan = SpeakerPlan(test_tone=True)
+
+    assert plan.tone_hz == 440.0
+    assert plan.tone_seconds == 3.0
+    assert plan.as_dict()["test_tone"] == "440 Hz for 3.0 s"
+
+
+def test_a_plain_speaker_plan_says_nothing_about_a_tone() -> None:
+    assert "test_tone" not in SpeakerPlan().as_dict()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"tone_hz": 5.0},
+        {"tone_hz": 30_000.0},
+        {"tone_seconds": 0.0},
+        {"tone_seconds": 120.0},
+    ],
+)
+def test_an_impossible_tone_is_refused_before_anything_is_opened(kwargs) -> None:
+    with pytest.raises(ConfigError):
+        SpeakerPlan(**kwargs)
+
+
 def test_live_plan_reports_which_paths_are_active() -> None:
     plan = LivePlan(camera=CameraPlan(), mic=MicPlan(), speaker=SpeakerPlan())
 

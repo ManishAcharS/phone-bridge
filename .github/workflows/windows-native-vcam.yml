@@ -86,6 +86,9 @@ jobs:
           windows/tests/test_camera_decode.py
           windows/tests/test_android_camera_threading.py
           windows/tests/test_android_camera_throughput.py
+          windows/tests/test_audio_tone.py
+          windows/tests/test_live_speaker_stats.py
+          windows/tests/test_android_audio_stats.py
           windows/tests/test_setup_script.py
           -q
 

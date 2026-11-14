@@ -52,6 +52,11 @@ Reused unchanged: `phonebridge.camera.stream` (JPEG frames, newest-frame-wins),
 * the runner — devices open before the phone is asked to stream, a stalled
   camera blanks after the timeout instead of freezing, one dead path does not
   stop the others, lip-sync delays video only;
+* the speaker's feedback loop — the PC polls `audio.status` once a second, turns
+  the phone's cumulative counters into rates, prints the phone's route, track
+  state, buffer and underruns, and stops asking when the stream stops;
+* `--test-tone` — a 440 Hz sine of the right length and level, produced with no
+  capture device, stopping the run by itself when the note has drained;
 * the CLI surface and the setup script (including that it downloads nothing and
   needs no administrator rights).
 
@@ -60,7 +65,8 @@ Reused unchanged: `phonebridge.camera.stream` (JPEG frames, newest-frame-wins),
 * that OBS's virtual camera accepts these frames and Zoom/Meet/browsers list it;
 * that a call client can open `CABLE Output` and hears the phone;
 * that the phone's AudioTrack actually reaches the connected Bluetooth
-  headphones with the screen off;
+  headphones with the screen off — `--test-tone` is the shortest way to see
+  the phone's own numbers, but only your ears can confirm the note;
 * the real end-to-end latency, and whether 720p30 survives your network.
 
 ---
@@ -170,14 +176,34 @@ phone.
 
 ### Step 3 — audio to the Bluetooth headphones
 
+Prove the phone first, with nothing on the PC involved:
+
+```powershell
+phonebridge speaker --test-tone
+```
+
+A 440 Hz note for three seconds, then the command exits by itself. The status
+line says where the sound went and whether the phone's own track played it:
+
+```
+link up | speaker active pc-buf 200 ms -> speaker rx 50 f/s wrote 50 f/s played 2.6 s
+```
+
+`wrote 0 f/s` or a `played` that stays at `0.0 s` means the phone received audio
+and never played it — that is the case this command was added for, and the
+numbers come from the phone's `AudioTrack`, not from the PC.
+
+Then connect the headphones to the *phone* (normal Bluetooth pairing, done in
+Android — PhoneBridge does not pair anything) and run the whole path:
+
 ```powershell
 phonebridge speaker --latency 200
 ```
 
-Connect the headphones to the *phone* first (normal Bluetooth pairing, done in
-Android — PhoneBridge does not pair anything). Play something on the PC; it
-should come out of the headphones. Then turn the phone's screen off: playback
-must continue (the app runs in a foreground service).
+Play something on the PC; it should come out of the headphones, and the line
+should say `-> bluetooth_a2dp`. If it still says `-> speaker`, Android did not
+route to the headset — that is a phone setting, not this command. Then turn the
+phone's screen off: playback must continue (the app runs in a foreground service).
 
 If the picture and the sound disagree when you run the camera at the same time,
 add the offset to the camera side:
@@ -193,7 +219,7 @@ phonebridge start --camera --mic --speaker
 ```
 
 ```
-link up | camera active 29.9 fps | mic active -24 dBFS buf 120 ms | speaker active 200 ms
+link up | camera active 29.9 fps | mic active -24 dBFS buf 120 ms | speaker active pc-buf 200 ms -> bluetooth_a2dp rx 50 f/s wrote 50 f/s played 41.2 s
 ```
 
 Join a Meet call with the phone as the camera *and* the microphone. This is the
@@ -256,7 +282,38 @@ the self-view refreshed 4 times a second instead of 30.
 It is a quarter of the pixels and a quarter of the JPEG work on both ends, and
 the explicit `--width/--height/--fps` flags still override it.
 
-## 7. Known limits, stated plainly
+## 7. Measuring the speaker (`--test-tone`)
+
+`speaker active 200 ms` was the whole story the status line used to tell, and
+200 ms was the buffer this PC was *configured* to send. It reads identically
+whether the phone is playing, muted, routed to a headset nobody is wearing, or
+not playing at all, so it answered the one question nobody had.
+
+Two things changed. The phone now reports what its own `AudioTrack` is doing
+through `audio.status` (route, track state, buffer fill, underruns, played
+milliseconds), the PC polls that once a second, and the line prints it.
+`pc-buf` stays in the line, labelled as the PC's, because it is a real number —
+it is just not evidence that the phone played anything.
+
+| Flag | What it does |
+| --- | --- |
+| `--test-tone` | 440 Hz at -12 dBFS for 3 s instead of WASAPI loopback, then exits by itself |
+| `--muted` | start muted (silence with the `MUTED` flag); the default sends audio, because that is the command's job |
+| `--loopback NAME` | with a real run, pick the output device to capture |
+
+The two numbers to watch, both from the phone:
+
+* `wrote 0 f/s` while `rx` is above zero — frames arrive, nothing reaches the
+  device. Before this change the same situation printed `speaker active`.
+* `played` not climbing — the device is not consuming; check `track_state` in the
+  JSON (`--format json`), which says `playing`, `paused`, `stopped` or
+  `no_track`.
+
+The tone is an `AudioSource` like the loopback one, so its frames ride the same
+queue, the same encrypted session and the same protocol frames. Nothing about
+the wire format changes: this is a test of the phone, using the production path.
+
+## 8. Known limits, stated plainly
 
 * **Audio is 48 kHz PCM16, not Opus.** Protocol v1 carries PCM16 with a 20 ms
   frame; adding Opus would change the wire format on both ends and break older
@@ -265,9 +322,10 @@ the explicit `--width/--height/--fps` flags still override it.
 * **No Bluetooth work in the app.** Android routes `USAGE_MEDIA` output to
   connected A2DP headphones itself, which is why there is no pairing code here.
   A headset in *call* (HFP/SCO) mode adds its own 100-200 ms; use `--lipsync`.
-* **Latency is configured, not measured end to end.** The status line shows the
-  buffer you asked for; measuring true mouth-to-ear latency needs an acoustic
-  loopback, which is what `docs/09-compat-report.md` is for.
+* **End-to-end latency is configured, not measured.** The status line shows the
+  buffer you asked for (`pc-buf`) and what the phone's own track has buffered and
+  played, which is as far as either end can see. True mouth-to-ear latency needs
+  an acoustic loopback, which is what `docs/09-compat-report.md` is for.
 * **The webcam carries no mirroring.** Applications mirror their own previews;
   mirroring the device feed would mirror it twice.
 * **One phone at a time per command.** Multi-device is the controller's job
@@ -281,7 +339,7 @@ the explicit `--width/--height/--fps` flags still override it.
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause | What to do |
 | --- | --- | --- |
@@ -297,7 +355,13 @@ the explicit `--width/--height/--fps` flags still override it.
 | `--stats` shows `phone` line missing | the phone did not answer `camera.status` | the APK predates the `stats` field; nothing breaks, the PC's line still works |
 | `no playback device matching 'CABLE Input'` | VB-CABLE not installed, or not rebooted | install it, reboot, re-run `setup-windows.ps1 -Check` |
 | mic runs but the other app is silent | the app is reading a different input | select `CABLE Output (VB-Audio Virtual Cable)` |
-| `capturing PC audio needs PyAudioWPatch` | the package is missing | `py -3 -m pip install PyAudioWPatch` |
+| `capturing PC audio needs PyAudioWPatch` | the package is missing — or you do not actually want loopback | `py -3 -m pip install PyAudioWPatch`, or `phonebridge speaker --test-tone`, which needs no capture device at all |
+| `speaker stopped: the phone refused audio playback (no_output): …` | the phone could not open an `AudioTrack` | the phone's words are verbatim; check its media volume and `adb logcat -s BridgeServer` |
+| speaker line says `wrote 0 f/s` | frames arrive, the `AudioTrack` is not consuming | check `track_state` in `--format json`; a `paused`/`stopped` track is an Android-side stop, and `--muted` is the usual cause if you asked for it |
+| speaker line says `-> speaker` but you expected headphones | Android did not route to Bluetooth | pair the headset with the *phone* and check its media output; PhoneBridge never pairs anything |
+| `underruns` climbing | the phone's device buffer ran dry — usually a slow link or a stalled stream | check `dropped` in `--format json` and whether the link is on USB; a Bluetooth route adds its own buffering |
+| silence with `pc-buf 200 ms` and no phone numbers on the line | an APK older than this build, so `audio.status` has no playback block | no fix needed on the PC; the telephone-side numbers need the current APK |
+| `speaker` runs but nothing is audible anywhere | the PC is capturing the wrong output, or nothing is playing | `--loopback "Speakers"`, and remember WASAPI loopback captures the *device*, not the application |
 | `dtype mismatch: 'bytes…' vs 'int16'` | a sounddevice `OutputStream` (numpy arrays) was used for raw PCM — fixed; you are on an older build | `py -3 -m pip install -e .\windows` from the branch head |
 | `the output device accepts none of these formats` | the endpoint will not take 48 kHz mono or stereo | set the device to 48 kHz (Windows sound settings or the VB-CABLE control panel) |
 | phone microphone audible but fast/high-pitched | the capture rate was not the device's rate | fixed by negotiation; if you still hear it, note the device's rate in `sounddevice.query_devices()` |

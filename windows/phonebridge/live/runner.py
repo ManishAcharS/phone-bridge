@@ -31,6 +31,7 @@ from typing import Any
 
 from ..audio.frames import AudioFormat
 from ..audio.link import MIC_STREAM, PLAYBACK_STREAM, AudioLink  # noqa: F401 - re-exported
+from ..audio.tone import ToneSource
 from ..camera.frames import VideoConfig, VideoFrame
 from ..camera.stream import CameraStream
 from .config import LivePlan
@@ -56,6 +57,16 @@ DEFAULT_FIRST_FRAME_S = 5.0
 #: Status is refreshed on this cadence: fast enough to look live, slow enough
 #: that a one-line status does not cost more than the audio it describes.
 STATUS_INTERVAL_S = 1.0
+
+#: How long a finished test tone is left to drain out of the phone's `AudioTrack`
+#: before playback is stopped. The phone buffers four 20 ms frames and a Bluetooth
+#: encoder queues behind that, so cutting the stream the instant the last frame is
+#: sent would clip the very note the test exists to hear.
+TEST_TONE_DRAIN_S = 0.4
+
+#: Slack on top of the tone's own length before the command gives up on it. A path
+#: that dies mid-note must not leave a three-second test running forever.
+TEST_TONE_TIMEOUT_S = 5.0
 
 #: How often the camera supervisor looks at the pump. Only bookkeeping — the
 #: frames themselves reach the pump from :meth:`CameraStream`'s callback, so this
@@ -84,6 +95,10 @@ class LiveStatus:
     #: ``--stats`` numbers: the PC's pump and, when asked for, the phone's own
     #: counters from its ``camera.status``. Empty unless ``--stats`` is on.
     camera_stats: dict[str, Any] = field(default_factory=dict)
+    #: The phone's answer to ``audio.status`` (route, AudioTrack state, buffer,
+    #: underruns) plus the frame rates derived from two answers. Empty until the
+    #: phone has answered once.
+    speaker_stats: dict[str, Any] = field(default_factory=dict)
 
     def line(self) -> str:
         parts: list[str] = [f"link {'up' if self.connected else 'down'}"]
@@ -97,10 +112,51 @@ class LiveStatus:
             )
             parts.append(f"mic {self.mic_state} {level} buf {self.buffer_ms} ms")
         if self.speaker_state != "off":
-            parts.append(f"speaker {self.speaker_state} {self.latency_ms} ms")
+            parts.append(self._speaker_part())
         if self.detail:
             parts.append(self.detail)
         return " | ".join(parts)
+
+    def _speaker_part(self) -> str:
+        """``speaker`` in the phone's terms, not the PC's.
+
+        The old line was ``speaker active 200 ms``, where 200 ms was the buffer
+        the PC was *configured* to send — a number that is identical whether the
+        phone is playing, muted, routed to a headset nobody is wearing, or not
+        playing at all. It answered the one question nobody had. What follows is
+        the phone's own report: where Android routed the track, how many frames a
+        second reached it and how many were written into it, how long it has
+        played, how much audio is waiting, and how often the device ran dry.
+        """
+        text = f"speaker {self.speaker_state}"
+        if self.latency_ms:
+            # Labelled as the PC's, because that is all it ever was.
+            text += f" pc-buf {self.latency_ms} ms"
+        stats = self.speaker_stats
+        if not stats:
+            return text
+        route = str(stats.get("route") or "")
+        if route and route != "none":
+            text += f" -> {route}"
+        rx = stats.get("rx_fps")
+        if isinstance(rx, (int, float)):
+            text += f" rx {rx:.0f} f/s"
+        written = stats.get("written_fps")
+        if isinstance(written, (int, float)):
+            text += f" wrote {written:.0f} f/s"
+        played = stats.get("played_ms")
+        if isinstance(played, (int, float)) and played > 0:
+            text += f" played {played / 1000.0:.1f} s"
+        buffered = stats.get("buffered_ms")
+        if isinstance(buffered, int) and buffered:
+            text += f" buf {buffered} ms"
+        underruns = stats.get("underruns")
+        if isinstance(underruns, int) and underruns:
+            text += f" underruns {underruns}"
+        track = str(stats.get("track_state") or "")
+        if track and track not in ("playing", "no_track"):
+            text += f" track {track}"
+        return text
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -127,6 +183,8 @@ class LiveStatus:
         }
         if self.camera_stats:
             payload["camera"]["stats"] = dict(self.camera_stats)
+        if self.speaker_stats:
+            payload["speaker"]["stats"] = dict(self.speaker_stats)
         if self.extra:
             payload["stats"] = dict(self.extra)
         return payload
@@ -149,6 +207,31 @@ def default_decode(frame: VideoFrame, width: int, height: int) -> Any:
     return decode_into_box(frame, width, height)
 
 
+def _phone_summary(phone: dict[str, Any]) -> str:
+    """A one-line "where it went and whether it played", for the final status.
+
+    Deliberately terse: it ends a three-second test, not a session. Missing fields
+    are skipped rather than shown as zero, so an older APK leaves a shorter line
+    instead of a misleading one.
+    """
+    if not phone:
+        return ""
+    bits: list[str] = []
+    route = phone.get("route")
+    if isinstance(route, str) and route and route != "none":
+        bits.append(f"route {route}")
+    written = phone.get("written_fps")
+    if isinstance(written, (int, float)):
+        bits.append(f"wrote {written:.0f} f/s")
+    played = phone.get("played_ms")
+    if isinstance(played, (int, float)):
+        bits.append(f"played {played / 1000.0:.1f} s")
+    underruns = phone.get("underruns")
+    if isinstance(underruns, int) and underruns:
+        bits.append(f"{underruns} underrun(s)")
+    return f" ({', '.join(bits)})" if bits else ""
+
+
 def _to_array(image: Any) -> Any:
     import numpy  # noqa: PLC0415 - pyvirtualcam's dependency, only needed to send
 
@@ -166,6 +249,7 @@ class LiveRunner:
         camera_factory: Callable[..., Any] = open_virtual_camera,
         mic_factory: Callable[..., Any] = open_cable_sink,
         loopback_factory: Callable[..., Any] = open_loopback_source,
+        tone_factory: Callable[..., Any] = ToneSource,
         decode: Callable[[VideoFrame, int, int], Any] = default_decode,
         stall_s: float = DEFAULT_STALL_S,
         first_frame_s: float = DEFAULT_FIRST_FRAME_S,
@@ -177,6 +261,7 @@ class LiveRunner:
         self._camera_factory = camera_factory
         self._mic_factory = mic_factory
         self._loopback_factory = loopback_factory
+        self._tone_factory = tone_factory
         self._decode = decode
         self._stall_s = stall_s
         self._first_frame_s = first_frame_s
@@ -195,6 +280,10 @@ class LiveRunner:
         self._stats_at = 0.0
         self._link: AudioLink | None = None
         self._mic_sink: CableMicSink | None = None
+        #: The test tone, when ``--test-tone`` asked for one instead of loopback.
+        self._tone: ToneSource | None = None
+        #: When to stop waiting for that tone, whatever it is doing.
+        self._tone_deadline: float | None = None
 
         self._sent = 0
         self._fps = 0.0
@@ -206,6 +295,10 @@ class LiveRunner:
         # two mean the path is dead.
         self._camera_error = ""
         self._camera_notice = ""
+        #: The phone's refusal of ``audio.playback.start``, kept verbatim and kept
+        #: sticky: a status line that says ``speaker error`` without the reason is
+        #: exactly the situation this field exists to end.
+        self._speaker_error = ""
         self._sink_error = ""
         self._decode_failures = 0
         self._decode_detail = ""
@@ -263,15 +356,28 @@ class LiveRunner:
                 # *inside* the lambda body and the factory would never be None, so
                 # the link would open a capture device nobody asked for.
                 source_factory=(
-                    (lambda fmt: self._loopback_factory(fmt, self._plan.speaker))
-                    if self._plan.speaker
-                    else None
+                    (lambda fmt: self._open_speaker_source(fmt)) if self._plan.speaker else None
                 ),
             )
             if self._plan.mic is not None:
                 await self._link.start_mic()
             if self._plan.speaker is not None:
-                await self._link.start_playback()
+                # The phone's refusal is the whole message: keep it, and never
+                # report a speaker as running that never started.
+                if await self._link.start_playback():
+                    # The link is muted by default ("nothing is audible until
+                    # asked"), which is right for a library and useless for a
+                    # command whose only job is to make the phone play: a muted
+                    # stream is silence carrying FLAG_MUTED, and the phone drops
+                    # muted frames before they ever reach AudioTrack. The command
+                    # asks, once, and `--muted` is how a user says no.
+                    await self._link.set_mute(bool(self._plan.speaker.muted))
+                else:
+                    detail = self._link.snapshot().detail
+                    self._speaker_error = detail or (
+                        "the phone accepted audio.playback.start but never started playing"
+                    )
+                    log.warning("speaker did not start: %s", self._speaker_error)
 
         if self._camera_sink is not None and not self._camera_error:
             self._first_frame_deadline = self._clock() + self._first_frame_s
@@ -312,6 +418,25 @@ class LiveRunner:
             return
         self._last_frame_seen = frame
         pump.submit(frame)
+
+    def _open_speaker_source(self, fmt: AudioFormat) -> Any:
+        """WASAPI loopback of the PC's output — or a sine wave, with --test-tone.
+
+        The tone is not a second code path: it is an `AudioSource` like the
+        loopback one, so its frames take the same queue, the same encrypted
+        session and the same protocol frames. What it removes is the PC's sound
+        card, which is the part of "can the phone play audio?" that is not about
+        the phone.
+        """
+        assert self._plan.speaker is not None
+        plan = self._plan.speaker
+        if not plan.test_tone:
+            return self._loopback_factory(fmt, plan)
+        self._tone = self._tone_factory(
+            fmt, frequency=plan.tone_hz, seconds=plan.tone_seconds
+        )
+        self._tone_deadline = self._clock() + plan.tone_seconds + TEST_TONE_TIMEOUT_S
+        return self._tone
 
     def _open_mic(self, fmt: AudioFormat) -> Any:
         assert self._plan.mic is not None
@@ -501,9 +626,16 @@ class LiveRunner:
             status.mic_detail = audio.mic_detail
             status.speaker_state = audio.playback
             status.speaker_detail = audio.detail
+            status.speaker_stats = dict(audio.phone)
             status.extra = {
                 key: value for key, value in audio.stats.items() if isinstance(value, int)
             }
+        if self._speaker_error:
+            # Sticky, like the camera's: the run continues (the session, the camera
+            # and the microphone are unaffected) but the path is dead, and saying
+            # so once is the whole point.
+            status.speaker_state = "error"
+            status.speaker_detail = self._speaker_error
         if self._mic_sink is not None:
             status.mic_level_dbfs = self._mic_sink.level_dbfs
             status.buffer_ms = int(self._mic_sink.stats.get("depth_ms", 0))
@@ -517,13 +649,63 @@ class LiveRunner:
     ) -> LiveStatus:
         """Run until stopped, then return the last status."""
         deadline = None if duration is None else self._clock() + duration
+        tone_drained_at: float | None = None
         while True:
             if stop is not None and stop.is_set():
                 break
             if deadline is not None and self._clock() >= deadline:
                 break
             await asyncio.sleep(STATUS_INTERVAL_S)
+            # A test tone has a known end, so the command has one too: stop when
+            # the tone and its drain have played out instead of leaving a session
+            # open that is sending nothing. A user watching for the note sees the
+            # line go from "playing" to a sentence saying what was sent.
+            if self._tone is not None and self._tone_path_dead():
+                # The path died before the note finished; the status already carries
+                # the reason, and a test that can never finish must not keep running.
+                break
+            if (
+                self._tone is not None
+                and not self._tone.finished
+                and self._tone_deadline is not None
+                and self._clock() >= self._tone_deadline
+            ):
+                # A tone that never finished is a path that stopped mid-note; say
+                # which, instead of waiting forever for a note that cannot arrive.
+                self._speaker_error = (
+                    f"the test tone did not finish: the phone accepted "
+                    f"{self._tone.duration_ms / 1000.0:.1f} s of audio and the path "
+                    f"stopped before it was all sent"
+                )
+                log.warning("speaker: %s", self._speaker_error)
+                break
+            if self._tone is not None and self._tone.finished:
+                if tone_drained_at is None:
+                    tone_drained_at = self._clock() + TEST_TONE_DRAIN_S
+                elif self._clock() >= tone_drained_at:
+                    # Take the phone's last numbers *before* stopping: once the
+                    # stream is idle there is nothing left to report, and those
+                    # numbers are the whole evidence.
+                    phone = self._link.snapshot().phone if self._link is not None else {}
+                    if self._link is not None:
+                        # No reason string: `_detail` below is the sentence for the
+                        # user, and a second "speaker: test tone finished" notice
+                        # would only repeat it.
+                        await self._link.stop_playback("")
+                    self._detail = (
+                        f"test tone sent: {self._tone.frequency:.0f} Hz for "
+                        f"{self._tone.duration_ms / 1000.0:.1f} s{_phone_summary(phone)}"
+                        f" - if the phone was silent, the speaker path is the problem, "
+                        f"not the PC's audio"
+                    )
+                    break
         return self.status()
+
+    def _tone_path_dead(self) -> bool:
+        """True when the speaker path failed before the test tone finished."""
+        if self._speaker_error or self._link is None:
+            return True
+        return self._link.snapshot().playback == "error"
 
     # ------------------------------------------------------------------ #
     async def close(self, reason: str = "stopped") -> None:

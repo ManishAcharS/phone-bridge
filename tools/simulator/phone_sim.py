@@ -1073,6 +1073,11 @@ class SimulatedPhone:
 
         @r.register("audio.status")
         def _audio_status(_params: dict[str, Any]) -> dict[str, Any]:
+            # The playback block mirrors what AudioEngine reads off its
+            # AudioTrack. Simulated values, but the same shape and the same
+            # meaning: a PC that renders these against a fake phone renders them
+            # against the real one too.
+            playing = self.audio["playback"] == "active"
             return {
                 "playback": self.audio["playback"],
                 "mic": self.audio["mic"],
@@ -1082,6 +1087,14 @@ class SimulatedPhone:
                 "frames_in": self.audio_frames_in,
                 "frames_out": self.audio_frames_out,
                 "permitted": self.mic_permission,
+                "route": "speaker" if playing else "none",
+                "device_name": "simulated speaker" if playing else "",
+                "track_state": "playing" if playing else "no_track",
+                "buffered_ms": 0,
+                "buffer_ms": 80 if playing else 0,
+                "underruns": 0,
+                "played_ms": 0,
+                "frames_written": self.audio_frames_in if playing else 0,
             }
 
         @r.register("audio.capabilities.last")
@@ -1569,11 +1582,15 @@ class SimulatedPhone:
             elif msg_type == MSG_PING:
                 await self._send_frame(ws, _seal(codec, pong_payload(parse_ping(payload)), MSG_PONG))
             elif msg_type == MSG_AUDIO:
+                # MIC_STREAM is a *stream id*, so it lives with the link, not with
+                # the frame codec. Importing it from `.frames` raised ImportError on
+                # the first audio frame, which closed the whole session — the audio
+                # path was therefore never exercised end to end here.
                 from phonebridge.audio.frames import (  # noqa: PLC0415
-                    MIC_STREAM,
                     AudioFrameError,
                     decode_frame,
                 )
+                from phonebridge.audio.link import MIC_STREAM  # noqa: PLC0415
 
                 try:
                     frame = decode_frame(payload)

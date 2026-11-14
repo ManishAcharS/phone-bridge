@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..audio.tone import DEFAULT_TONE_HZ, DEFAULT_TONE_SECONDS
+
 #: pyvirtualcam backends this build knows how to ask for. "auto" tries them in
 #: order, which matters on a PC with Unity Capture but no OBS.
 VIRTUAL_CAMERA_BACKENDS = ("obs", "unitycapture")
@@ -137,22 +139,39 @@ class SpeakerPlan:
     ``lipsync_ms`` is applied to the *video* side when both are running: a positive
     value delays the camera feed so the picture matches audio that is already
     behind it (Bluetooth adds 100-200 ms of its own).
+
+    ``test_tone`` replaces WASAPI loopback with a sine wave: the phone is then the
+    only thing under test, and a silent phone is a fact about the phone rather
+    than about the PC's sound card. ``muted`` starts the stream muted, which is
+    the link's conservative default and never what the command wants — it is
+    offered so a user can prove the route without making noise.
     """
 
     latency_ms: int = DEFAULT_SPEAKER_LATENCY_MS
     lipsync_ms: int = 0
     device: str = ""
+    test_tone: bool = False
+    tone_hz: float = DEFAULT_TONE_HZ
+    tone_seconds: float = DEFAULT_TONE_SECONDS
+    muted: bool = False
 
     def __post_init__(self) -> None:
         _check_int("speaker buffer", self.latency_ms, 20, 2000)
         _check_int("lip-sync offset", self.lipsync_ms, -500, 500)
+        if not 20.0 <= float(self.tone_hz) <= 20_000.0:
+            raise ConfigError(f"tone frequency out of range: {self.tone_hz} Hz")
+        if not 0.1 <= float(self.tone_seconds) <= 60.0:
+            raise ConfigError(f"tone length out of range: {self.tone_seconds} s")
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "latency_ms": self.latency_ms,
             "lipsync_ms": self.lipsync_ms,
             "device": self.device or "default output (loopback)",
         }
+        if self.test_tone:
+            payload["test_tone"] = f"{self.tone_hz:.0f} Hz for {self.tone_seconds:.1f} s"
+        return payload
 
 
 @dataclass(frozen=True)

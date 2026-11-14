@@ -853,6 +853,10 @@ class BridgeServer(
 
                 "audio.status" -> {
                     val s = audio.status()
+                    // The playback block is what tells the PC "the phone is
+                    // playing" from "the phone accepted a stream": the route it
+                    // chose, the AudioTrack's own state, the audio waiting in
+                    // front of it, and how many times the device ran dry.
                     Messages.responseOk(
                         id,
                         mapOf(
@@ -867,6 +871,14 @@ class BridgeServer(
                             "frames_out" to s["frames_out"],
                             "dropped" to s["dropped"],
                             "last_error" to s["last_error"],
+                            "route" to s["route"],
+                            "device_name" to s["device_name"],
+                            "track_state" to s["track_state"],
+                            "buffered_ms" to s["buffered_ms"],
+                            "buffer_ms" to s["buffer_ms"],
+                            "underruns" to s["underruns"],
+                            "played_ms" to s["played_ms"],
+                            "frames_written" to s["frames_written"],
                         ),
                     )
                 }

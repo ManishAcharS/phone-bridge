@@ -415,7 +415,7 @@ What each one needs on the PC (once, by hand — PhoneBridge never installs thes
 | --- | --- | --- |
 | `camera --virtual` | pyvirtualcam + OBS Studio (its virtual camera device) | `scripts/setup-windows.ps1`, then <https://obsproject.com/download> |
 | `mic --to-cable` | sounddevice + VB-CABLE | `scripts/setup-windows.ps1`, then <https://vb-audio.com/Cable/> |
-| `speaker` | PyAudioWPatch (WASAPI loopback); `soundcard` works as a fallback | `scripts/setup-windows.ps1` |
+| `speaker` | PyAudioWPatch (WASAPI loopback); `soundcard` works as a fallback. `--test-tone` needs neither | `scripts/setup-windows.ps1` |
 
 Then pick the device in the *other* application:
 
@@ -430,6 +430,7 @@ Options worth knowing:
 phonebridge camera --virtual --width 1920 --height 1080 --fps 30 --facing front
 phonebridge mic --to-cable --latency 80 --gain 1.5
 phonebridge speaker --latency 200 --lipsync 120 --loopback "Speakers"
+phonebridge speaker --test-tone                     # 440 Hz for 3 s: tests the phone alone
 phonebridge start --camera --mic --speaker --format json --duration 30
 ```
 
@@ -440,8 +441,15 @@ matches audio that Bluetooth has already put 100-200 ms behind.
 Status is printed once a second and looks like this:
 
 ```
-link up | camera active 29.8 fps | mic active -21 dBFS buf 120 ms | speaker active 200 ms
+link up | camera active 29.8 fps | mic active -21 dBFS buf 120 ms | speaker active pc-buf 200 ms -> bluetooth_a2dp rx 50 f/s wrote 50 f/s played 41.2 s
 ```
+
+`pc-buf` is the buffer *this PC* was asked to send; everything after the arrow
+comes from the phone's own `AudioTrack` — which device Android routed it to, how
+many frames a second it received and wrote, how much it has played. A speaker
+that is `active` with `wrote 0 f/s` is receiving audio and not playing it, which
+is the difference the old line could not show. `phonebridge speaker --test-tone`
+exercises the phone with no capture device at all.
 
 **What is verified, and what is not.** The framing, the jitter buffer, the
 device lookup, the missing-driver errors and the CLI surface are covered by

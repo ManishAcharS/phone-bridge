@@ -31,6 +31,13 @@ ever starts by itself — `AudioLink` is only reachable through an explicit butt
 press, and the phone refuses the microphone unless `RECORD_AUDIO` is already
 granted in the PhoneBridge app.
 
+"Muted until asked" is a property of the *link*, so the thing that asks is the
+caller: the GUI has an unmute button, and `phonebridge speaker` asks once, on
+start. It has to — a muted stream is silence carrying `FLAG_MUTED`, and the phone
+discards muted frames before they reach `AudioTrack`, so a speaker command that
+forgot to ask would look exactly like a phone that cannot play. `--muted` is how
+a user says "route it, but keep quiet".
+
 ## 2. Wire format
 
 One frame per `MSG_AUDIO` (0x30), inside the encrypted envelope. The normative
@@ -92,7 +99,78 @@ monitor is what this release provides.
 | Protocol contract: docs/03 ⇄ Kotlin dispatch ⇄ simulator agree | **tested** — `tests/test_protocol_contract.py` |
 | GUI Audio section renders and its buttons call real methods | **not rendered here** — no tkinter in this environment; `app.py` parses and is covered by the `View` tests |
 | Android `AudioEngine` compiles and runs | **not compiled here** — no JDK/Android SDK in this environment |
-| Sound actually comes out of the Redmi's speaker | **not tested** — needs the hardware |
+| Phone's playback block (`route`, `track_state`, `underruns`, `played_ms`, ...) | **tested** — `tests/test_android_audio_stats.py` checks the Kotlin reads `AudioTrack` and that `BridgeServer` sends every key; `tests/test_live_speaker_stats.py` renders it |
+| The test tone (frequency, level, length, end-of-tone, stereo) | **tested** — 18 tests in `tests/test_audio_tone.py` |
+| Sound actually comes out of the Redmi's speaker | **not tested** — needs the hardware; `--test-tone` is the shortest way to check |
+
+## 6a. Is the phone actually playing? (`speaker` status and `--test-tone`)
+
+`audio.playback.start` returning `ok` means the phone opened an `AudioTrack`. It
+does not mean the device consumed a sample: a muted stream, a route to a headset
+that is not on anyone's head, and a track that stopped writing all report `ok`.
+So the phone reports what its own track is doing, `audio.status` carries it, and
+the PC prints it once a second.
+
+| Field | Where it comes from on the phone | What it tells you |
+| --- | --- | --- |
+| `route` | `AudioTrack.routedDevice.type` | `speaker`, `bluetooth_a2dp`, `bluetooth_sco`, `wired_headset`, `usb_headset`, `none` |
+| `device_name` | `productName` of that device | which headset, by the name Android has |
+| `track_state` | `state` + `playState` | `playing`, `paused`, `stopped`, `uninitialised`, `no_track` |
+| `buffered_ms` | queued frames x frame length | audio waiting in front of the device |
+| `buffer_ms` | `bufferSizeInFrames` | the device buffer's capacity |
+| `underruns` | `underrunCount` | how often the device ran dry — clicks you can hear |
+| `played_ms` | `playbackHeadPosition` | how much the device has actually played |
+| `frames_in` / `frames_written` | counters | received vs handed to `AudioTrack` |
+
+The PC turns those into one line, and derives the two rates that a cumulative
+counter cannot give:
+
+```
+link up | speaker active pc-buf 200 ms -> bluetooth_a2dp rx 50 f/s wrote 50 f/s played 12.4 s underruns 0
+```
+
+Read it as: the phone received 50 frames a second, wrote 50 frames a second into
+its track, has played 12.4 s, and Android routed it to A2DP headphones. The two
+failure signatures are visible in it:
+
+* **`rx 50 f/s wrote 0 f/s`** — frames arrive and nothing reaches the device. On
+  an older PC build this was a muted stream; on any build it is an `AudioTrack`
+  that has stopped consuming (check `track_state`).
+* **`-> speaker`** when you expected headphones — Android did not route to
+  Bluetooth. That is an Android/headset question, not a PhoneBridge one.
+
+### `phonebridge speaker --test-tone`
+
+The speaker path normally proves itself by playing something on the PC, which
+depends on a sound card, a loopback device, and the right loopback device. None
+of that is the phone. `--test-tone` replaces the capture side with a 440 Hz sine,
+at -12 dBFS, for 3 seconds:
+
+```powershell
+phonebridge speaker --test-tone
+```
+
+```
+delivering: speaker from Pixel 8 (usb)
+test tone: 440 Hz for 3.0 s, sent to the phone; nothing is captured from this PC, so a
+silent phone is a phone problem. Watch the speaker line: route, f/s and played all
+come from the phone
+link up | speaker active pc-buf 200 ms -> speaker rx 50 f/s wrote 50 f/s played 2.6 s
+test tone sent: 440 Hz for 3.0 s - if the phone was silent, the speaker path is the
+problem, not the PC's audio
+```
+
+The tone is an ordinary `AudioSource` (`phonebridge/audio/tone.py`): its frames go
+through the same queue, the same encrypted session and the same protocol frames as
+PC audio, so a tone that arrives proves the whole path. It is paced one frame per
+20 ms, because the phone's queue is eight frames deep and drops the oldest: a tone
+dumped in one burst would be heard as a click, not as a note. It needs no PyAudioWPatch
+and no `soundcard`, and it stops by itself when the note has drained instead of
+leaving a session open on silence. If you hear the tone but not PC audio, the
+phone is fine and the loopback device is the problem — pick it with `--loopback`.
+
+The phone's own log (`adb logcat -s BridgeServer`) has one line per start and stop;
+the numbers above are the ones to trust, because they come from the device.
 
 ## 7. Device test plan (Redmi Note 14 Pro+, all three transports)
 
@@ -118,6 +196,7 @@ Then, for each transport (USB first, then Wi-Fi, then hotspot):
 | 1 | Connect in the GUI | transport row names the path actually used |
 | 2 | Press **Diagnose USB** (USB case) | stage `ready`, not `no-device`/`no-adb-interface` |
 | 3 | Press **PC audio → phone: start** | phone plays the PC's sound; button reads *stop* |
+| 3a | `phonebridge speaker --test-tone` | a 440 Hz note for 3 s, then the command exits by itself; the line shows `-> speaker` (or `-> bluetooth_a2dp`) and `played` climbing |
 | 4 | Move the volume slider | phone output changes; Diagnostics shows no error |
 | 5 | Press **Mute outgoing** | phone goes silent, direction still `active` |
 | 6 | Press **Phone mic → PC: start** | speaking into the phone is audible on the PC |
