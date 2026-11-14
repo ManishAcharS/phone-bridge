@@ -192,6 +192,25 @@ class CameraStream:
         self._set(ACTIVE)
         return True
 
+    def adopt(self, session: Any) -> None:
+        """Point the stream at a new session after a reconnect.
+
+        The phone closes its camera when the session that asked for it goes away
+        (``CameraEngine.onSessionClosed``), so a reconnected link is a link with
+        no picture. This puts the stream back to IDLE - the receive task and the
+        old queue belonged to the dead session - so :meth:`start` issues a fresh
+        ``camera.start`` instead of returning "already active".
+        """
+        task = self._task
+        self._task = None
+        if task is not None and not task.done():
+            task.cancel()
+        self._session = session
+        self._queue = None
+        self._state = IDLE
+        self._detail = ""
+        self._frame = None
+
     async def stop(self, reason: str = "stopped") -> None:
         """Stop the phone's camera and drop every buffered frame."""
         if self._state == IDLE:

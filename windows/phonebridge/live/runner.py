@@ -68,6 +68,9 @@ TEST_TONE_DRAIN_S = 0.4
 #: that dies mid-note must not leave a three-second test running forever.
 TEST_TONE_TIMEOUT_S = 5.0
 
+#: A callable that opens (and authenticates) a new session to the same phone.
+ReconnectFactory = Callable[[], Any]
+
 #: How often the camera supervisor looks at the pump. Only bookkeeping — the
 #: frames themselves reach the pump from :meth:`CameraStream`'s callback, so this
 #: interval never limits the frame rate.
@@ -255,8 +258,16 @@ class LiveRunner:
         first_frame_s: float = DEFAULT_FIRST_FRAME_S,
         stats: bool = False,
         clock: Callable[[], float] = time.monotonic,
+        reconnect: ReconnectFactory | None = None,
     ) -> None:
         self._session = session
+        #: Opens a fresh authenticated session to the same phone. Without it a
+        #: dropped link is terminal for the command (the status line says
+        #: "camera idle" until the user notices), which is the behaviour this
+        #: parameter exists to end.
+        self._reconnect = reconnect
+        self._reconnecting: asyncio.Task[None] | None = None
+        self._reconnect_attempts = 0
         self._plan = plan
         self._camera_factory = camera_factory
         self._mic_factory = mic_factory
@@ -347,40 +358,15 @@ class LiveRunner:
                 self._pump.close()
                 self._pump = None
 
-        if self._plan.mic is not None or self._plan.speaker is not None:
-            self._link = AudioLink(
-                self._session,
-                fmt=AudioFormat(),
-                sink_factory=(lambda fmt: self._open_mic(fmt)) if self._plan.mic else None,
-                # The parentheses matter: without them the conditional would sit
-                # *inside* the lambda body and the factory would never be None, so
-                # the link would open a capture device nobody asked for.
-                source_factory=(
-                    (lambda fmt: self._open_speaker_source(fmt)) if self._plan.speaker else None
-                ),
-            )
-            if self._plan.mic is not None:
-                await self._link.start_mic()
-            if self._plan.speaker is not None:
-                # The phone's refusal is the whole message: keep it, and never
-                # report a speaker as running that never started.
-                if await self._link.start_playback():
-                    # The link is muted by default ("nothing is audible until
-                    # asked"), which is right for a library and useless for a
-                    # command whose only job is to make the phone play: a muted
-                    # stream is silence carrying FLAG_MUTED, and the phone drops
-                    # muted frames before they ever reach AudioTrack. The command
-                    # asks, once, and `--muted` is how a user says no.
-                    await self._link.set_mute(bool(self._plan.speaker.muted))
-                else:
-                    detail = self._link.snapshot().detail
-                    self._speaker_error = detail or (
-                        "the phone accepted audio.playback.start but never started playing"
-                    )
-                    log.warning("speaker did not start: %s", self._speaker_error)
+        await self._open_link()
 
-        if self._camera_sink is not None and not self._camera_error:
+        wants_camera_watch = self._camera_sink is not None and not self._camera_error
+        if wants_camera_watch:
             self._first_frame_deadline = self._clock() + self._first_frame_s
+        # The supervisor also watches the link, so it runs whenever a camera is
+        # being delivered *or* a reconnect is possible - a mic-only run loses its
+        # session to the same drop.
+        if wants_camera_watch or self._reconnect is not None:
             self._supervisor = asyncio.get_running_loop().create_task(
                 self._camera_loop(), name="phonebridge-camera-supervisor"
             )
@@ -402,6 +388,125 @@ class LiveRunner:
             else 0.0,
             clock=self._clock,
         )
+
+    async def _open_link(self) -> None:
+        """Create the audio link for this plan and start the paths it asks for.
+
+        Extracted from :meth:`start` so a reconnect can open the same paths on a
+        new session instead of leaving the microphone and speaker dead while the
+        camera comes back.
+        """
+        if self._plan.mic is None and self._plan.speaker is None:
+            return
+        self._speaker_error = ""
+        self._link = AudioLink(
+            self._session,
+            fmt=AudioFormat(),
+            sink_factory=(lambda fmt: self._open_mic(fmt)) if self._plan.mic else None,
+            # The parentheses matter: without them the conditional would sit
+            # *inside* the lambda body and the factory would never be None, so
+            # the link would open a capture device nobody asked for.
+            source_factory=(
+                (lambda fmt: self._open_speaker_source(fmt)) if self._plan.speaker else None
+            ),
+        )
+        if self._plan.mic is not None:
+            await self._link.start_mic()
+        if self._plan.speaker is not None:
+            # The phone's refusal is the whole message: keep it, and never
+            # report a speaker as running that never started.
+            if await self._link.start_playback():
+                # The link is muted by default ("nothing is audible until
+                # asked"), which is right for a library and useless for a
+                # command whose only job is to make the phone play: a muted
+                # stream is silence carrying FLAG_MUTED, and the phone drops
+                # muted frames before they ever reach AudioTrack. The command
+                # asks, once, and `--muted` is how a user says no.
+                await self._link.set_mute(bool(self._plan.speaker.muted))
+            else:
+                detail = self._link.snapshot().detail
+                self._speaker_error = detail or (
+                    "the phone accepted audio.playback.start but never started playing"
+                )
+                log.warning("speaker did not start: %s", self._speaker_error)
+
+    # ------------------------------------------------------------------ #
+    # reconnection
+    # ------------------------------------------------------------------ #
+    def _watch_link(self) -> None:
+        """Start a reconnect as soon as the session closes, once at a time."""
+        task = self._reconnecting
+        if task is not None and not task.done():
+            return
+        if bool(getattr(self._session, "is_open", False)):
+            return
+        if self._reconnect is None:
+            return
+        self._reconnecting = asyncio.get_running_loop().create_task(
+            self._reconnect_and_restart(), name="phonebridge-reconnect"
+        )
+
+    async def _reconnect_and_restart(self) -> None:
+        """Reopen the session and re-issue every stream the plan asked for.
+
+        The phone drops a camera when the session that asked for it closes
+        (``CameraEngine.onSessionClosed``), so a new session starts with no
+        picture at all: reconnecting the socket without calling ``camera.start``
+        again would leave a live link and an idle camera - which is exactly the
+        "camera idle" line the user was left staring at.
+        """
+        assert self._reconnect is not None
+        reason = "the session closed"
+        delay = 0.5
+        while True:
+            self._reconnect_attempts += 1
+            self._detail = (
+                f"link down ({reason}): reconnecting, attempt {self._reconnect_attempts}"
+            )
+            log.warning("link: %s", self._detail)
+            try:
+                session = await self._reconnect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a retry loop, not a crash
+                reason = f"{type(exc).__name__}: {exc}"
+            else:
+                await self._restart_on(session)
+                self._reconnect_attempts = 0
+                self._detail = ""
+                log.info("link: reconnected and every stream re-requested")
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.8, 5.0)
+
+    async def _restart_on(self, session: Any) -> None:
+        """Swap in a freshly opened session and start the streams again."""
+        previous = self._session
+        self._session = session
+        if previous is not None and previous is not session:
+            with contextlib.suppress(Exception):
+                await previous.close("reconnecting")
+
+        if self._link is not None:
+            with contextlib.suppress(Exception):
+                await self._link.close("reconnecting")
+            self._link = None
+            self._mic_sink = None
+        if self._camera is not None:
+            self._camera.adopt(session)
+            if await self._camera.start():
+                self._camera_error = ""
+                self._first_frame_deadline = self._clock() + self._first_frame_s
+                log.info("camera: restarted on the new session")
+            else:
+                # Keep the phone's sentence verbatim: a camera that will not
+                # restart is not a networking problem and the user needs the
+                # refusal, not a silence.
+                self._camera_error = (
+                    self._camera.snapshot().detail or "the phone refused the camera"
+                )
+                log.warning("camera did not restart: %s", self._camera_error)
+        await self._open_link()
 
     def _camera_changed(self, snapshot: Any) -> None:
         """Called by :class:`CameraStream` for every received frame.
@@ -491,13 +596,14 @@ class LiveRunner:
         thinks its frame rate is. It ticks every 50 ms, which no longer limits
         anything — the frames do not come through here.
         """
-        assert self._plan.camera is not None
         while True:
             await asyncio.sleep(SUPERVISOR_INTERVAL_S)
-            self._sample_pump()
-            self._watch_first_frame(self._clock())
-            if self._stats:
-                await self._poll_phone_stats()
+            if self._plan.camera is not None:
+                self._sample_pump()
+                self._watch_first_frame(self._clock())
+                if self._stats:
+                    await self._poll_phone_stats()
+            self._watch_link()
 
     def _sample_pump(self) -> None:
         """Take the pump's counters, and turn its errors into the user's words."""
@@ -600,6 +706,12 @@ class LiveRunner:
             snapshot = self._camera.snapshot()
             status.camera_state = snapshot.state
             status.camera_detail = snapshot.detail
+        reconnecting = self._reconnecting is not None and not self._reconnecting.done()
+        if reconnecting and self._plan.camera is not None:
+            # "camera idle" while the link is being rebuilt reads as "nothing is
+            # wrong and nothing is happening", which is what the user saw for
+            # minutes at a time.
+            status.camera_state = "reconnecting"
         if self._pump is not None:
             # The pump is the only thing that knows what actually reached the
             # device, so its numbers win over the stream's.
@@ -709,6 +821,11 @@ class LiveRunner:
 
     # ------------------------------------------------------------------ #
     async def close(self, reason: str = "stopped") -> None:
+        if self._reconnecting is not None:
+            self._reconnecting.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._reconnecting
+            self._reconnecting = None
         if self._supervisor is not None:
             self._supervisor.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

@@ -365,10 +365,24 @@ def stats_lines(pc: Any = None, phone: Any = None) -> list[str]:
         size_text = ""
         if phone.get("width") and phone.get("height"):
             size_text = f"  {int(phone['width'])}x{int(phone['height'])}"
+        # Which encoder the phone is using. `yuv` is the fast path; `rgba` means
+        # the phone fell back after the fast one produced nothing, and the reason
+        # is in the JSON (`path_reason`) because the line is already long.
+        enc_text = ""
+        encoder = phone.get("path")
+        if isinstance(encoder, str) and encoder:
+            enc_text = f"  {encoder}"
+        # What the phone's camera actually delivered, when that is not what was
+        # asked for: the difference is why frames are 500 KB instead of 40 KB.
+        capture_text = ""
+        captured = (phone.get("capture_width"), phone.get("capture_height"))
+        requested = (phone.get("width"), phone.get("height"))
+        if all(isinstance(value, int) and value > 0 for value in captured) and captured != requested:
+            capture_text = f"  capture {captured[0]}x{captured[1]}"
         lines.append(
             f"  phone {float(phone.get('fps', 0.0)):5.1f} fps  "
             f"encode {float(phone.get('encode_ms', 0.0)):5.1f} ms  "
             f"{float(phone.get('bytes_per_frame', 0)) / 1024:5.0f} KB/frame  "
-            f"{q_text}send {float(phone.get('send_ms', 0.0)):4.1f} ms{size_text}"
+            f"{q_text}send {float(phone.get('send_ms', 0.0)):4.1f} ms{size_text}{enc_text}{capture_text}"
         )
     return lines

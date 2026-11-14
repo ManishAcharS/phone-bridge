@@ -236,12 +236,21 @@ line per second from each end of the link, so the slow stage names itself:
 
       link up | camera active 29.6 fps
       pc   29.6 fps  rx   30  96 KB/frame  decode   6.2 ms  convert  2.1 ms  send  1.4 ms  queue 0  dropped 3
-      phone 29.8 fps  encode  12.4 ms   94 KB/frame  q70  send  1.9 ms  1280x720
+      phone 29.8 fps  encode  12.4 ms   94 KB/frame  q70  send  1.9 ms  1280x720  yuv
+
+The phone's line ends with the encoder actually in use — `yuv` (the fast path) or
+`rgba` (the fallback, docs/20 §5) — and adds `capture 1920x1440` when the phone's
+camera delivered a different size than this command asked for. That pair is the
+answer to "why is a 640x480 frame 500 KB": the encoder was handed a bigger
+picture than the one requested. `camera.status.stats.path_reason` has the reason
+the fallback happened, and `--format json` prints it.
 
 | number | where it comes from | what it tells you |
 | --- | --- | --- |
 | `phone … encode` | the phone's own `camera.status` (`stats`) | YUV→JPEG cost per frame. Over ~25 ms it cannot reach 30 fps, whatever the PC does |
 | `phone … KB/frame` | the same | JPEG size: the link cost, and a sign that `--quality` is too high for the scene |
+| `phone … yuv`/`rgba` | the same (`stats.path`) | which encoder is live; `rgba` means the fast path produced nothing and the phone switched |
+| `phone … capture` | the same (`stats.capture_*`) | the size CameraX really delivered, when it is not the size that was asked for |
 | `phone … send` | the sender thread | time to encrypt and write one frame to the socket |
 | `pc … rx` / `KB/frame` | the pump | frames that actually arrived, and their size |
 | `pc … decode` | the pump | JPEG decode, including `Image.draft` scaling |
@@ -251,7 +260,13 @@ line per second from each end of the link, so the slow stage names itself:
 
 The phone also logs the same numbers once a second, so the two can be compared
 without the PC: `adb logcat -s CameraEngine` shows
-`capture 29.8 fps  yuv->jpeg 12.4 ms  q70  94 KB  send 1.9 ms  target 1280x720@30`.
+`capture 29.8 fps  yuv->jpeg 12.4 ms  q70  94 KB  send 1.9 ms  target 1280x720@30  capture 1280x720`.
+
+When a stream delivers nothing, that same tag answers *where* it stopped, in
+order: `camera.start received`, `camera bound`, `first analyzer frame` (with the
+real frame size, format, rotation, crop and per-plane strides), `first JPEG
+encoded`, `first frame sent`. If the camera dies on the phone, the failure is at
+whichever line is last.
 
 **What the measurements changed.** On a CI-class CPU, one 720p q70 frame costs
 ~9-10 ms of PC work (decode ~8.8 ms, convert ~1 ms) — a third of the 33 ms budget.

@@ -38,7 +38,7 @@ from ..live.config import (
 from ..live.devices import OBS_DOWNLOAD_URL, VB_CABLE_URL, DeviceUnavailable
 from ..live.pump import stats_lines
 from ..live.runner import STATUS_INTERVAL_S, LiveRunner
-from .target import EXIT_ERROR, EXIT_USAGE, CliError, note, open_session
+from .target import EXIT_ERROR, EXIT_USAGE, CliError, note, open_session, reconnect_factory
 
 
 def _print_json(payload: Any) -> None:
@@ -327,10 +327,10 @@ def plan_from_args(args: argparse.Namespace) -> LivePlan:
 #: from the component that failed, verbatim; this is only the advice.
 _ADVICE = {
     "camera": (
-        "the session is still up; microphone and speaker are unaffected. On the phone, "
-        "allow Camera for PhoneBridge, close any app that holds the lens, then Ctrl+C "
-        "and restart this command. For the phone's own reason, run on the phone: "
-        "adb logcat -s CameraEngine"
+        "the command reconnects and restarts the camera on its own when the link "
+        "drops, so this is the phone's answer, not a network problem: allow Camera "
+        "for PhoneBridge and close any app that holds the lens. For the phone's own "
+        "reason, run on the phone: adb logcat -s CameraEngine"
     ),
     "mic": (
         "the session is still up; camera and speaker are unaffected. "
@@ -394,7 +394,16 @@ async def _run(args: argparse.Namespace) -> int:
     plan = plan_from_args(args)
     store = _store(args)
     session, target = await open_session(args, store)
-    runner = LiveRunner(session, plan, stats=bool(getattr(args, "stats", False)))
+    runner = LiveRunner(
+        session,
+        plan,
+        stats=bool(getattr(args, "stats", False)),
+        # A dropped link is not the end of the command: the runner opens a new
+        # session and asks the phone for every stream again. Before this, a
+        # 30-second Wi-Fi hiccup left the picture dead and the status line saying
+        # "camera idle" until the user restarted the command.
+        reconnect=reconnect_factory(args, store, target),
+    )
     stop = asyncio.Event()
     printer: asyncio.Task[None] | None = None
     try:

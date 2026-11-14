@@ -116,4 +116,12 @@ dependencies {
     implementation("androidx.camera:camera-camera2:1.3.4")
     implementation("androidx.camera:camera-lifecycle:1.3.4")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+
+    // === Unit tests =========================================================
+    // JUnit 4 only, and only for code that touches no Android framework class:
+    // `Nv21` (the plane packing) is plain `java.nio`, so `testDebugUnitTest`
+    // runs it on the JVM with no emulator and no Robolectric. Do not add
+    // Android-framework tests here without also adding Robolectric and a
+    // `testOptions { unitTests.isIncludeAndroidResources = true }` block.
+    testImplementation("junit:junit:4.13.2")
 }

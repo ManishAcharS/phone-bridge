@@ -79,13 +79,23 @@ def test_every_lifecycle_call_lives_in_the_main_thread_block() -> None:
     assert "unbindAll()" in bind
 
     text = source()
-    assert text.count("CameraLifecycle()") == 1, "no second, off-thread owner"
-    assert text.count("bindToLifecycle(") == 1
-    # Three places unbind, and each is inside main-thread work: the bind block,
-    # its own failure cleanup, and the stop path reached through onMainThread.
+    # Two owners exist: the first bind, and the encoder fallback's rebind. Both
+    # are created inside main-thread work — the second one inside the task that
+    # `fallBack` posts to `mainHandler` — so neither can repeat the original
+    # `setCurrentState must be called on the main thread` crash.
+    assert text.count("CameraLifecycle()") == 2
+    assert text.count("bindToLifecycle(") == 2
+    fall_back = body("private fun fallBack(")
+    assert "CameraLifecycle()" in fall_back
+    assert "mainHandler.post(task)" in fall_back
+
+    # Four places unbind, and each is inside main-thread work: the bind block,
+    # its own failure cleanup, the stop path reached through onMainThread, and
+    # the fallback's rebind (also posted to the main thread).
     stop_locked = body("private fun stopLocked(")
     assert "unbindAll()" in stop_locked
-    assert text.count("unbindAll()") == 3
+    assert "unbindAll()" in fall_back
+    assert text.count("unbindAll()") == 4
 
 
 def test_stop_also_waits_for_the_main_thread() -> None:

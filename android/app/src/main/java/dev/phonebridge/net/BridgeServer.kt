@@ -7,6 +7,7 @@ import dev.phonebridge.protocol.Crypto
 import dev.phonebridge.protocol.Framing
 import dev.phonebridge.protocol.Json
 import dev.phonebridge.protocol.Messages
+import dev.phonebridge.protocol.SerialSender
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -1260,7 +1261,10 @@ class BridgeServer(
             // The six digits are for the screen the human compares, not for a
             // log file that outlives the pairing.
             addLog("INFO", "handshake with '$peerName' (${r.peerDeviceId}) known=$known")
-            sendRaw(ack)
+            if (!sendHandshake(ack)) {
+                close("send failed")
+                return
+            }
             stage = Stage.AWAIT_AUTH
         }
 
@@ -1476,6 +1480,23 @@ class BridgeServer(
         fun sendControl(payload: ByteArray) =
             sendSecure(Messages.MSG_CONTROL, Messages.STREAM_CONTROL, payload)
 
+        /**
+         * Seal-then-write, one frame at a time.
+         *
+         * The counter is assigned inside `SecureCodec.seal` and the PC rejects a
+         * counter that is not strictly increasing, so a seal that is not
+         * serialised with the write turns two senders into a replay error: that
+         * is how a camera session died 27 seconds in. [SerialSender] owns that
+         * lock (and its JUnit test sends from many threads to pin it).
+         */
+        private val sender = SerialSender(
+            seal = { type, stream, payload -> requireKeys().seal(type, stream, payload) },
+            write = { bytes -> sendRaw(bytes) },
+        )
+
+        private fun requireKeys(): Crypto.SecureCodec =
+            codec ?: throw IllegalStateException("no session keys yet")
+
         fun sendSecure(msgType: Int, streamId: Int, payload: ByteArray) {
             val c = codec
             if (c == null) {
@@ -1485,25 +1506,37 @@ class BridgeServer(
                 addLog("WARN", "dropping msg 0x%02x: no session keys yet".format(msgType))
                 return
             }
-            try {
-                val env = c.seal(msgType, streamId, payload)
-                sendRaw(env)
+            // The session is closed *after* the send lock is released: `close`
+            // takes the stage lock, and the reader thread takes that lock before
+            // it sends, so closing inside the lock would invert the order and
+            // deadlock the first time a send failed.
+            val failure = try {
+                sender.send(msgType, streamId, payload)
+                null
             } catch (e: Exception) {
-                addLog("ERROR", "send failed: ${e.message}")
+                e
+            }
+            if (failure != null) {
+                addLog("ERROR", "send failed: ${failure.message}")
                 close("send failed")
             }
         }
 
+        /** One socket write. Throws on failure; the caller closes the session. */
         private fun sendRaw(bytes: ByteArray) {
-            try {
-                conn.send(bytes)
-                bumpOut(bytes.size)
-            } catch (e: Exception) {
-                // A failed send means the socket is gone; keeping the session
-                // "open" would keep answering RPCs that can never be delivered.
-                addLog("ERROR", "send failed: ${e.javaClass.simpleName}: ${e.message}")
-                close("send failed")
-            }
+            conn.send(bytes)
+            bumpOut(bytes.size)
+        }
+
+        /** The handshake's own frame, which is not sealed and takes no counter. */
+        private fun sendHandshake(bytes: ByteArray): Boolean = try {
+            sender.serialised { sendRaw(bytes) }
+            true
+        } catch (e: Exception) {
+            // A failed send means the socket is gone; keeping the session
+            // "open" would keep answering RPCs that can never be delivered.
+            addLog("ERROR", "send failed: ${e.javaClass.simpleName}: ${e.message}")
+            false
         }
 
         /**
@@ -1522,10 +1555,12 @@ class BridgeServer(
                 stage = Stage.DEAD
             }
             if (bye) {
-                // Best effort: the socket may already be gone.
+                // Best effort: the socket may already be gone. Sealed and written
+                // under the same lock as every other frame, so BYE carries the
+                // next counter rather than racing for it.
                 runCatching {
-                    codec?.let { c ->
-                        sendRaw(c.seal(Messages.MSG_BYE, Messages.STREAM_CONTROL, reason.toByteArray()))
+                    if (codec != null) {
+                        sender.send(Messages.MSG_BYE, Messages.STREAM_CONTROL, reason.toByteArray())
                     }
                 }.onFailure { addLog("WARN", "could not send BYE: ${it.message}") }
             }

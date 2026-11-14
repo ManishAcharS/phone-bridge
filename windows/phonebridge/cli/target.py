@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -221,6 +222,45 @@ def connect_hint(target: Target) -> str:
         "check: bridge switched on in the app, phone and PC on the same network, "
         f"port {target.port} not blocked by Windows Firewall."
     )
+
+
+def reconnect_factory(
+    args: Any,
+    store: DeviceStore,
+    target: Target,
+) -> Callable[[], Any]:
+    """A callable that opens a fresh authenticated session to ``target``.
+
+    Used by the live commands: when the link drops mid-stream the runner calls
+    this, swaps the new session in, and asks the phone for every stream again.
+    Pairing is not repeated - an established peer authenticates with its pinned
+    key - so the only prompt that can still appear is the one for a phone that
+    has lost its pairing, which is a decision, not a retry.
+    """
+
+    auto_pair = bool(getattr(args, "auto_pair", False))
+    confirm = (lambda _sas: True) if auto_pair else pairing_prompt
+    request_timeout = float(getattr(args, "request_timeout", 15.0) or 15.0)
+    connect_timeout = float(getattr(args, "connect_timeout", 6.0) or 6.0)
+
+    async def connect() -> Any:
+        # Everything is read here, not when the factory is built: this callable
+        # is created for every live run, and building it must not touch the
+        # keystore (or a caller that never loses the link never needs it).
+        identity = store.load_or_create_identity()
+        uri = websocket_uri(target.host, target.port)
+        session = BridgeSession(
+            uri,
+            identity,
+            store,
+            confirm_pairing=confirm,
+            request_timeout=request_timeout,
+            link=WebSocketLink(uri, connect_timeout=connect_timeout),
+        )
+        await session.open()
+        return session
+
+    return connect
 
 
 async def open_session(

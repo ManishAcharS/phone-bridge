@@ -106,9 +106,9 @@ jobs:
           fi
           ls -l app/build/outputs/apk/debug/
 
-      # Unit tests, as asked for alongside the build. There is no test source set
-      # yet, so this is currently a no-op that still proves the test task and its
-      # dependencies resolve; a future test drops straight in.
+      # Unit tests. `Nv21Test` pins the YUV_420_888 -> NV21 packing (row strides,
+      # interleaved vs planar chroma, crop rectangles) as bytes: that maths is
+      # what stalls a camera when it is wrong, and it needs no device to check.
       - name: Run the unit tests
         working-directory: android
         shell: bash

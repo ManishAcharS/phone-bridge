@@ -7,9 +7,15 @@ frame, a `Bitmap` allocation, a second `Bitmap` for the stride crop and
 picture that was YCbCr when it arrived. It also decoded every frame it had just
 encoded, 30 times a second, for the self-view thumbnail.
 
-There is no phone or emulator in this environment, so — like
-`test_android_camera_threading.py` — these tests read the Kotlin and pin the
-structure that produces the speed-up.
+The YUV path that replaced it then produced **no frames at all** on one device
+(Android 16 / HyperOS), so the structure now has three parts, and this module
+pins all three: YUV is the default (`buildAnalysis`), the packing lives in a
+pure-JVM object with its own JUnit test (`Nv21.kt`), and the old RGBA path still
+exists — but only as the documented fallback (`test_android_camera_fallback.py`
+pins when and how it takes over).
+
+There is no phone or emulator in this environment, so these tests read the Kotlin
+and pin the structure that produces the speed-up.
 """
 
 from __future__ import annotations
@@ -17,15 +23,26 @@ from __future__ import annotations
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-ENGINE = (
-    REPO / "android" / "app" / "src" / "main" / "java" / "dev" / "phonebridge"
-    / "net" / "CameraEngine.kt"
-)
-CARD = REPO / "android" / "app" / "src" / "main" / "java" / "dev" / "phonebridge" / "CameraCard.kt"
+SRC = REPO / "android" / "app" / "src" / "main" / "java" / "dev" / "phonebridge"
+ENGINE = SRC / "net" / "CameraEngine.kt"
+PACKER = SRC / "net" / "Nv21.kt"
+CARD = SRC / "CameraCard.kt"
+PACKER_TEST = REPO / "android" / "app" / "src" / "test" / "java" / "dev" / "phonebridge" / "net" / "Nv21Test.kt"
 
 
 def source() -> str:
     return ENGINE.read_text(encoding="utf-8")
+
+
+def packer_source() -> str:
+    return PACKER.read_text(encoding="utf-8")
+
+
+def code_only(text: str) -> str:
+    """Drop whole-line comments: they name the things the code no longer does."""
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith(("*", "/**", "//"))
+    )
 
 
 def body(function: str) -> str:
@@ -43,47 +60,136 @@ def body(function: str) -> str:
 # --------------------------------------------------------------------------- #
 # the encoder
 # --------------------------------------------------------------------------- #
-def test_the_analysis_use_case_asks_for_yuv_not_rgba() -> None:
-    text = source()
+def test_yuv_is_the_default_and_rgba_only_the_fallback() -> None:
+    builder = body("private fun buildAnalysis(")
 
-    assert "OUTPUT_IMAGE_FORMAT_YUV_420_888" in text
-    assert "OUTPUT_IMAGE_FORMAT_RGBA_8888" not in text, (
-        "RGBA costs a native conversion plus two Bitmap copies per frame"
+    assert 'private var activePath = Path.YUV' in source(), (
+        "the fast path must be what a stream starts on"
+    )
+    assert "OUTPUT_IMAGE_FORMAT_YUV_420_888" in builder
+    assert "Path.YUV -> ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888" in builder
+    assert "Path.RGBA -> ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888" in builder, (
+        "the fallback asks for RGBA explicitly instead of hoping"
     )
 
 
-def test_the_jpeg_comes_from_yuvimage_without_a_bitmap() -> None:
-    text = source()
-    # Code only: the comments explain what was removed and name it.
-    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith(("*", "//")))
+def test_rgba_appears_only_inside_the_fallback_encoder() -> None:
+    text = code_only(source())
+    start = text.index("private fun rgbaToJpeg(")
+    rgba = text[start:]
 
-    assert "YuvImage(" in code
-    assert "compressToJpeg(" in code
-    assert "ImageFormat.NV21" in code
-    assert "Bitmap.createBitmap" not in code, "no bitmap round trip in the frame path"
-    assert "Bitmap.compress" not in code
-    assert "copyPixelsFromBuffer" not in code
-    assert "BitmapFactory" not in code
+    assert "Bitmap.createBitmap" in rgba
+    assert "copyPixelsFromBuffer" in rgba
+    assert "Bitmap.CompressFormat.JPEG" in rgba
+    # …and nowhere else: the fast path never allocates a bitmap.
+    without_fallback = text.replace(rgba, "")
+    assert "Bitmap.createBitmap" not in without_fallback
+    assert "copyPixelsFromBuffer" not in without_fallback
+
+
+def test_the_fast_path_jpeg_comes_from_yuvimage_without_a_bitmap() -> None:
+    fast = body("private fun yuvToJpeg(")
+
+    assert "YuvImage(" in fast
+    assert "compressToJpeg(" in fast
+    assert "ImageFormat.NV21" in fast
+    # Code only: the doc comment of the *next* function describes the fallback.
+    assert "Bitmap" not in code_only(fast)
+    assert "BitmapFactory" not in code_only(source())
+
+
+def test_the_fast_path_reports_a_silent_encoder_failure() -> None:
+    """`compressToJpeg` returning false used to drop the frame with no trace."""
+    fast = body("private fun yuvToJpeg(")
+
+    assert "if (!image.compressToJpeg(" in fast
+    assert "throw IllegalStateException(" in fast, (
+        "a refused frame must become an exception the caller can act on, "
+        "not a null return that looks like a camera that never opened"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# the packing (Nv21.kt, and its JUnit test)
+# --------------------------------------------------------------------------- #
+def test_the_packing_is_a_pure_jvm_object_with_a_test() -> None:
+    packer = packer_source()
+
+    assert "object Nv21" in packer
+    # No Android types: that is what lets `testDebugUnitTest` run it.
+    assert "import android" not in packer
+    assert "import java.nio.ByteBuffer" in packer
+    assert PACKER_TEST.exists(), "the packing maths needs a test that runs in CI"
+    junit = PACKER_TEST.read_text(encoding="utf-8")
+    assert "rowStride" in junit, "row padding is one of the two real layouts"
+    assert "semiPlanar" in junit, "interleaved chroma is the other"
 
 
 def test_nv21_packing_handles_both_real_plane_layouts() -> None:
     """Semi-planar (stride 2) and planar (stride 1) are the only ones in the wild."""
-    packer = body("private fun ImageProxy.toNv21()")
+    packer = packer_source()
 
-    assert "pixelStride == 2" in packer, "semi-planar devices: copy the VU rows whole"
-    assert "pixelStride == 1" in packer, "planar devices: interleave V and U"
-    assert "rowStride" in packer, "row padding must be honoured or the picture skews"
-    assert "unsupported camera plane layout" in packer, "an unknown stride says so"
-    # Bulk copies, not a per-pixel loop over the Y plane.
-    assert "yBuffer.get(nv21, row * width, width)" in packer
+    assert "u.pixelStride == 2 && v.pixelStride == 2" in packer, (
+        "semi-planar devices: the V plane already holds the VU pairs"
+    )
+    assert "for (row in 0 until chromaHeight)" in packer, "row-by-row, honouring the stride"
+    assert "pixelStride" in packer and "rowStride" in packer
+    # The generic path reads each sample at its own stride, which is what makes a
+    # device that reports something unusual still produce a picture.
+    assert "v.buffer.get(vRow + (left + column) * v.pixelStride)" in packer
+    assert "u.buffer.get(uRow + (left + column) * u.pixelStride)" in packer
 
 
 def test_the_y_plane_is_copied_row_by_row() -> None:
     """A single `get()` of the whole plane would include the row padding."""
-    packer = body("private fun ImageProxy.toNv21()")
+    packer = packer_source()
 
-    assert "for (row in 0 until height)" in packer
-    assert "row * y.rowStride" in packer
+    assert "for (row in 0 until cropHeight)" in packer
+    assert "(cropTop + row) * y.rowStride" in packer
+    assert "view.get(out, write, cropWidth)" in packer
+
+
+def test_the_crop_rectangle_is_honoured() -> None:
+    packer = packer_source()
+
+    assert "cropLeft" in packer and "cropTop" in packer
+    assert "is outside" in packer, "a crop outside the frame is refused, not clipped silently"
+    fast = body("private fun yuvToJpeg(")
+    assert "proxy.cropRect" in fast
+    assert "cropWidth = width" in fast and "cropTop = top" in fast
+
+
+# --------------------------------------------------------------------------- #
+# the size the phone was asked for
+# --------------------------------------------------------------------------- #
+def test_the_resolution_is_requested_with_a_resolution_strategy() -> None:
+    builder = body("private fun buildAnalysis(")
+
+    assert "ResolutionSelector" in builder
+    assert "ResolutionStrategy(" in builder
+    assert "FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER" in builder, (
+        "a device must not answer a 640x480 request with 1920x1440"
+    )
+    assert "setTargetResolution(" not in code_only(source()), (
+        "setTargetResolution is deprecated and treats the size as a hint"
+    )
+
+
+def test_the_rgba_fallback_scales_a_bigger_capture_down() -> None:
+    rgba = body("private fun rgbaToJpeg(")
+
+    assert "createScaledBitmap(" in rgba
+    assert "cfg.width.toFloat() / full.width" in rgba
+
+
+def test_the_frame_header_carries_the_encoded_size() -> None:
+    """The header and the JPEG must agree, or the PC letterboxes against a lie."""
+    analyse = body("private fun analyse(")
+
+    assert "val frame = encode(proxy, cfg)" in analyse
+    assert "width = frame.width" in analyse
+    assert "height = frame.height" in analyse
+    assert "width = proxy.width" not in analyse
 
 
 # --------------------------------------------------------------------------- #
@@ -113,8 +219,24 @@ def test_a_line_a_second_reports_capture_encode_and_send() -> None:
     reporter = body("private fun reportOnceASecond(")
 
     assert "Log.d(" in reporter, "Log.d, tag CameraEngine: adb logcat -s CameraEngine"
-    for expected in ("capture", "yuv->jpeg", "q${cfg.quality}", "KB", "send"):
+    for expected in (
+        "capture",
+        "${activePath.code}->jpeg",
+        "q${cfg.quality}",
+        "KB",
+        "send",
+        # The answer to 'why is a 640x480 frame 500 KB': what the camera delivered.
+        "capture ${captureWidth}x$captureHeight",
+    ):
         assert expected in reporter, f"{expected} belongs in the per-second line"
+
+
+def test_every_frame_logs_its_own_size_and_encode_time() -> None:
+    analyse = body("private fun analyse(")
+
+    assert '"frame: ${frame.jpeg.size} B in' in analyse, (
+        "a per-second average hides which frames were the slow ones"
+    )
 
 
 def test_encode_time_is_measured_around_the_jpeg_call_only() -> None:
@@ -142,13 +264,19 @@ def test_the_numbers_are_on_the_wire_for_the_pcs_stats_flag() -> None:
         '"send_ms"',
         '"bytes_per_frame"',
         '"quality"',
+        # Which encoder is live, and the size the camera really delivered.
+        '"path" to activePath.code',
+        '"capture_width"',
+        '"capture_height"',
     ):
         assert key in status, f"{key} is what `phonebridge camera --stats` prints"
 
 
 def test_the_quality_the_pc_asks_for_is_the_quality_used() -> None:
     """70-80 is the documented range: higher costs time on the phone, not detail."""
-    analyse = body("private fun analyse(")
+    fast = body("private fun yuvToJpeg(")
+    rgba = body("private fun rgbaToJpeg(")
 
-    assert "proxy.toJpeg(cfg.quality)" in analyse
+    assert "cfg.quality, out" in fast
+    assert "cfg.quality, out" in rgba
     assert "quality = 100" not in source()

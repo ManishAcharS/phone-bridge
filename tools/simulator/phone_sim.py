@@ -1034,7 +1034,14 @@ class SimulatedPhone:
             if not 320 <= width <= 3840 or not 240 <= height <= 2160 or not 1 <= fps <= 60:
                 raise RpcError("bad_params", f"unsupported camera configuration {width}x{height}@{fps}")
             self.camera.update(
-                {"streaming": True, "facing": facing, "width": width, "height": height, "fps": fps}
+                {
+                    "streaming": True,
+                    "facing": facing,
+                    "width": width,
+                    "height": height,
+                    "fps": fps,
+                    "quality": int(cfg.get("quality", self.camera.get("quality", 70))),
+                }
             )
             self.camera_seq = 0
             return {
@@ -1069,6 +1076,27 @@ class SimulatedPhone:
                 "fps": self.camera["fps"],
                 "frames_sent": self.camera_frames_sent,
                 "permitted": self.camera_permission,
+                # The phone's own measurement block, same keys as CameraEngine:
+                # `path` is the encoder actually in use, `capture_*` is the size
+                # CameraX really delivered. A simulator that omits them lets the
+                # PC's stats line look right while the phone's is broken.
+                "stats": {
+                    "fps": float(self.camera["fps"]),
+                    "encode_ms": 0.0,
+                    "send_ms": 0.0,
+                    "bytes_per_frame": 0,
+                    "quality": self.camera.get("quality", 70),
+                    "width": self.camera["width"],
+                    "height": self.camera["height"],
+                    "encoded": self.camera_frames_sent,
+                    "sent": self.camera_frames_sent,
+                    "dropped": 0,
+                    "path": "rgba",
+                    "path_reason": "the simulator draws RGB frames",
+                    "capture_width": self.camera["width"],
+                    "capture_height": self.camera["height"],
+                    "capture_layout": "simulated",
+                },
             }
 
         @r.register("audio.status")

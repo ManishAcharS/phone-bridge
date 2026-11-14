@@ -111,24 +111,58 @@ Rules the PC enforces (`decode_frame`, all covered by tests):
 | `camera.switch` | `facing` (`back`/`front`) | `{ok, facing, streaming}` |
 | `camera.status` | — | `{streaming, facing, width, height, fps, frames_sent, dropped, permitted, hardware, last_error, stats}` |
 
+`stats` carries the phone's own measurements: `fps`, `encode_ms`, `send_ms`,
+`bytes_per_frame`, `quality`, `width`, `height`, `encoded`, `sent`, `dropped`, plus
+`path` (`yuv` or `rgba` — the encoder actually in use), `path_reason`,
+`capture_width`/`capture_height` (what CameraX really delivered) and
+`capture_layout` (format, rotation, crop and per-plane strides of the first
+frame). `width`/`height` are the *request*; `capture_*` are the answer, and the two
+disagreeing is the explanation for frames that are far bigger than asked for.
+
 **Error codes** (docs/03 §7): `camera_denied` (permission not granted — the lens is
 never opened to find out), `no_camera` (this phone has no such lens), `camera_busy`
 (another app holds it, or CameraX refused to bind), `bad_config` (outside the
 documented ranges), plus the existing `bad_request`/`internal`.
 
-**Encoding.** The analysis use case asks for `YUV_420_888`, and frames are packed
-into NV21 and handed to `YuvImage.compressToJpeg` — no `Bitmap`, no RGBA
-conversion. Asking for `RGBA_8888` costs a native YUV→RGB pass, a `Bitmap`
-allocation, a stride crop and an RGB→YCbCr conversion inside the encoder, for a
-picture that arrived as YCbCr. The self-view thumbnail is refreshed 4 times a
-second (`PREVIEW_INTERVAL_MS`), not once per frame: decoding every frame the
-phone just encoded was measurable heat for a preview nobody watches at 30 fps.
+**Encoding.** Two paths, and the fast one is the default.
 
-Every second the engine logs its own numbers — `adb logcat -s CameraEngine`:
+*The YUV path.* The analysis use case asks for `YUV_420_888` and a resolution via
+`ResolutionSelector` + `ResolutionStrategy(CLOSEST_LOWER_THEN_HIGHER)` — `setTargetResolution`
+is deprecated and treats the size as an aspect-ratio hint, which lets a 640×480
+request come back as 1920×1440 (that is how a stream reaches 400–590 KB per
+picture). Frames are packed into NV21 by `Nv21` (honouring every plane's
+`rowStride` **and** `pixelStride`, plus the crop rectangle) and handed to
+`YuvImage.compressToJpeg`: no `Bitmap`, no RGBA conversion.
 
-    D CameraEngine: capture 29.8 fps  yuv->jpeg 12.4 ms  q70  94 KB  send 1.9 ms  target 1280x720@30
+*The RGBA fallback.* Asking for `RGBA_8888` costs a native YUV→RGB pass, a
+`Bitmap` allocation, a stride crop and an RGB→YCbCr conversion inside the
+encoder, so it is the fallback rather than the default — but it is also the path
+that predates the YUV one, and a device where the YUV path produces nothing must
+not leave the user with a dead camera. The switch happens automatically, and is
+logged:
 
-and the same values are returned by `camera.status` under `stats`, which is what
+* **the 2 s watchdog** — nothing encoded within 2 s of the bind
+  (`FALLBACK_AFTER_MS`) switches paths and rebinds the same camera;
+* **any encoder failure** — an exception from the packing or from
+  `compressToJpeg` (which used to return `false` and drop the frame silently);
+* **a capture much larger than the request** (more than 5/4 in either axis) —
+  the RGBA path scales the frame down to the size that was asked for.
+
+`camera.status.stats.path` says which path is live and `path_reason` says why it
+changed; both are sticky, so a reconnect does not rediscover a broken encoder.
+The self-view thumbnail is refreshed 4 times a second (`PREVIEW_INTERVAL_MS`),
+not once per frame: decoding every frame the phone just encoded was measurable
+heat for a preview nobody watches at 30 fps.
+
+**Where did it stop?** Five `Log.i` lines under one tag answer that, in order:
+`camera.start received`, `camera bound`, `first analyzer frame` (with the real
+size, format, rotation, crop and per-plane strides), `first JPEG encoded`,
+`first frame sent`. Every frame also logs its own size and encode time at `Log.d`,
+and every second the engine prints its averages — `adb logcat -s CameraEngine`:
+
+    D CameraEngine: capture 29.8 fps  yuv->jpeg 12.4 ms  q70  94 KB  send 1.9 ms  target 1280x720@30  capture 1280x720
+
+The same values are returned by `camera.status` under `stats`, which is what
 `phonebridge camera --stats` prints beside the PC's side (docs/26 §6).
 
 **Threading.** CameraX binds a `LifecycleRegistry`, and `setCurrentState` is
@@ -207,11 +241,21 @@ practice:
 | Hotspot | the phone is usually the AP, so expect ~5–10 Mbps unless the PC is the AP; start at 640×480 |
 
 If the link dips, the bounded queues mean the preview *skips* rather than lags;
-`stats.dropped` and `stats.received` in the GUI tell you which. The connection
-manager's existing reconnect ladder still applies: a dropped session brings the
-camera down (`camera.streaming` false) and the camera is not restarted
-automatically — after reconnecting, press start again. That is intentional: a
-camera that comes back on its own is a camera the user did not ask for.
+`stats.dropped` and `stats.received` in the GUI tell you which.
+
+A dropped session always brings the camera down (`camera.streaming` false) —
+the phone closes the lens when the session that asked for it goes away, so a
+reconnected link is a link with no picture. What happens next depends on who is
+driving:
+
+* **`phonebridge camera` (and `start`)** reconnects on its own: the runner opens
+  a new authenticated session, swaps it in, re-issues `camera.start` and rebuilds
+  any audio paths. The status line says `camera reconnecting …` with the reason
+  and the attempt number while it works, instead of `camera idle` until the user
+  notices.
+* **The GUI** does not: `camera.streaming` goes false and the user presses start
+  again. That is intentional there — a window that reopens the camera by itself
+  is a window the user did not ask for.
 
 ---
 

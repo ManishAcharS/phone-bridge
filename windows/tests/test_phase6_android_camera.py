@@ -31,7 +31,12 @@ def source() -> str:
 
 def test_the_target_rotation_comes_from_the_display() -> None:
     text = source()
-    assert "analysisUseCase.targetRotation = displayRotation()" in text
+    # The use case is built by `buildAnalysis` now (one builder, used by the
+    # first bind and by the encoder fallback's rebind), so the rotation is set
+    # there - still from the display, still on the use case itself.
+    builder = text[text.index("private fun buildAnalysis("):]
+    builder = builder[: builder.index("\n    private fun ")]
+    assert "body.targetRotation = displayRotation()" in builder
     helper = text[text.index("private fun displayRotation("):]
     helper = helper[: helper.index("\n    }")]
     assert "DisplayManager" in helper, "a service context has no display of its own"

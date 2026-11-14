@@ -284,6 +284,52 @@ def test_the_stats_line_names_every_measurement() -> None:
         assert expected in phone, phone
 
 
+def test_the_phone_line_says_which_encoder_and_what_was_captured() -> None:
+    """A 500 KB frame at "640x480" is answered by `capture`, not by guessing."""
+    lines = stats_lines(
+        None,
+        {
+            "fps": 10.2,
+            "encode_ms": 61.5,
+            "bytes_per_frame": 520192,
+            "quality": 70,
+            "width": 640,
+            "height": 480,
+            "path": "rgba",
+            "capture_width": 1920,
+            "capture_height": 1440,
+        },
+    )
+
+    assert len(lines) == 1
+    phone = lines[0]
+    assert "508 KB/frame" in phone, phone
+    assert "rgba" in phone, phone
+    assert "capture 1920x1440" in phone, phone
+
+
+def test_the_phone_line_stays_short_when_nothing_fell_back() -> None:
+    lines = stats_lines(
+        None,
+        {
+            "fps": 29.8,
+            "encode_ms": 8.1,
+            "bytes_per_frame": 40960,
+            "quality": 70,
+            "width": 640,
+            "height": 480,
+            "path": "yuv",
+            "capture_width": 640,
+            "capture_height": 480,
+        },
+    )
+
+    phone = lines[0]
+    assert "yuv" in phone, phone
+    # The capture size matched the request, so it is not repeated.
+    assert "capture" not in phone, phone
+
+
 def test_stats_lines_survive_a_phone_that_has_not_answered() -> None:
     lines = stats_lines({"fps": 30.0}, None)
 

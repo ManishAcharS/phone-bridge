@@ -116,7 +116,7 @@ The build previously emitted a setuptools deprecation warning
 | `discover` | who is on this network right now? | no |
 | `info` | device facts from the phone (JSON by default) | yes |
 | `capabilities` | what the phone can *actually* do today | yes |
-| `camera --virtual` | phone camera → Windows webcam device (OBS Virtual Camera) | yes |
+| `camera --virtual` | phone camera → Windows webcam device (OBS Virtual Camera); reconnects and restarts the camera if the link drops | yes |
 | `mic --to-cable` | phone microphone → VB-CABLE ("CABLE Output") | yes |
 | `speaker` | PC audio → phone → Bluetooth headphones | yes |
 | `start --camera --mic --speaker` | all three on one session, one status line | yes |
