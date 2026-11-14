@@ -75,6 +75,24 @@ namespace phonebridge {
 // kSourceClsid / kSourceClsidString are defined once, in the header, so that the
 // host executable and this DLL cannot disagree about the CLSID.
 
+#if PB_TRACE_QUERY_INTERFACE
+// Diagnostic: record every QueryInterface that reaches one of our two entry-point
+// objects, then return WRL's answer unchanged. A "QI MISS" line here is the exact
+// interface a caller wanted and did not get - which is the information
+// IMFVirtualCamera::Start refuses to give us.
+STDMETHODIMP MediaSourceActivate::QueryInterface(REFIID riid, void** object) noexcept {
+    const HRESULT hr = MediaSourceActivateRuntime::QueryInterface(riid, object);
+    trace::Query(L"MediaSourceActivate", riid, hr);
+    return hr;
+}
+
+STDMETHODIMP ClassFactory::QueryInterface(REFIID riid, void** object) noexcept {
+    const HRESULT hr = ClassFactoryRuntime::QueryInterface(riid, object);
+    trace::Query(L"ClassFactory", riid, hr);
+    return hr;
+}
+#endif
+
 MediaSourceActivate::MediaSourceActivate() {
     // Checked, not dropped: this is the store the frame server writes its
     // configuration into, and every forwarded method below depends on it.

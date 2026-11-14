@@ -31,6 +31,16 @@ void TraceHr(const wchar_t* operation, HRESULT hr) {
 
 }  // namespace
 
+#if PB_TRACE_QUERY_INTERFACE
+// Diagnostic: record every QueryInterface that reaches this object, then hand
+// back WRL's answer untouched. Nothing about interface dispatch changes here -
+// this exists only so a failing QI names itself in the debugger log.
+STDMETHODIMP MediaSource::QueryInterface(REFIID riid, void** object) noexcept {
+    const HRESULT hr = MediaSourceRuntime::QueryInterface(riid, object);
+    trace::Query(L"MediaSource", riid, hr);
+    return hr;
+}
+#endif
 
 MediaSource::MediaSource()
     : m_frameDuration(10'000'000LL / kFps) {

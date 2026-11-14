@@ -225,6 +225,30 @@ moved, and any `0x…` error code. Those four facts decide the next step.
 | Camera exists, app shows a black or frozen frame | Media source is not delivering samples | Report it with the Windows `Event Viewer` entry; this is the case the moving bar is designed to distinguish. |
 | Camera does not appear in an app but appears in Settings | App caches its device list | Restart the app. |
 | Camera appears, then vanishes | Host process ended | Keep the console window open; a session-lifetime camera dies with its process by design. |
+| Host exits `0x80004002` (`E_NOINTERFACE`) from `IMFVirtualCamera::Start` | A caller asked one of our COM objects for an interface it does not expose | Read the `QI MISS` line in DebugView — see *Diagnosing 0x80004002* below. |
+
+### Diagnosing `0x80004002` (E_NOINTERFACE)
+
+`Start` reports `E_NOINTERFACE` without saying which interface, on which object.
+The objects this DLL owns — `MediaSource`, `MediaSourceActivate` and
+`ClassFactory` — therefore log every `QueryInterface` that reaches them:
+
+```
+[PhoneBridge] QI MediaSource: IMFMediaSourceEx -> 0x00000000
+[PhoneBridge] QI MISS MediaSource: { A987FBC9-4BED-3078-CF07-9141BA07C9F3 } -> 0x80004002
+```
+
+The `QI MISS` line names the interface a caller wanted and the object it asked,
+which is the fact `Start`'s return code withholds. Unknown IIDs are printed as
+GUIDs, so a miss on an interface this code has never heard of is still recorded.
+
+This tracing is additive: every call is forwarded to WRL's own implementation and
+that `HRESULT` is returned untouched, so reference counts and interface identity
+are unchanged. It can be compiled out entirely if it ever gets in the way:
+
+```
+cmake -S windows-native/vcam-poc -B build/vcam -A x64 -DPB_TRACE_QUERY_INTERFACE=0
+```
 
 ---
 

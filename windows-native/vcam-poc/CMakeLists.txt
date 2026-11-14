@@ -41,6 +41,12 @@ else()
         "Installer > Individual components > Windows 11 SDK).")
 endif()
 
+# Diagnostic QueryInterface tracing on the DLL's COM objects (see query_trace.h).
+# ON by default: it is how an E_NOINTERFACE from IMFVirtualCamera::Start gets a
+# name instead of a bare 0x80004002. Turning it off restores the untraced objects.
+option(PB_TRACE_QUERY_INTERFACE
+    "Log every QueryInterface that reaches the virtual camera's COM objects" ON)
+
 add_library(PhoneBridgeVcamSource SHARED
     src/media_source.cpp
     src/media_source_activate.cpp
@@ -52,6 +58,7 @@ target_compile_definitions(PhoneBridgeVcamSource PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
     WINVER=0x0A00 _WIN32_WINNT=0x0A00   # Windows 10+ SDK surface
+    PB_TRACE_QUERY_INTERFACE=$<BOOL:${PB_TRACE_QUERY_INTERFACE}>
 )
 target_link_libraries(PhoneBridgeVcamSource PRIVATE
     mfplat.lib
@@ -70,7 +77,10 @@ set_target_properties(PhoneBridgeVcamSource PROPERTIES
 add_executable(vcam_host src/vcam_host.cpp)
 target_include_directories(vcam_host PRIVATE src)
 target_compile_definitions(vcam_host PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
-                                           WINVER=0x0A00 _WIN32_WINNT=0x0A00)
+                                           WINVER=0x0A00 _WIN32_WINNT=0x0A00
+                                           # Same switch as the DLL: vcam_host includes
+                                           # media_source_activate.h, which includes query_trace.h.
+                                           PB_TRACE_QUERY_INTERFACE=$<BOOL:${PB_TRACE_QUERY_INTERFACE}>)
 target_link_libraries(vcam_host PRIVATE
     mfplat.lib
     mfuuid.lib
