@@ -6,6 +6,7 @@
 
 #include "media_source.h"
 
+#include <ksmedia.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
@@ -249,12 +250,39 @@ IFACEMETHODIMP MediaSource::GetSourceAttributes(IMFAttributes** attributes) {
     std::lock_guard<std::mutex> guard(m_lock);
     if (m_shutdown) return MF_E_SHUTDOWN;
 
-    // Built in the constructor. If Media Foundation was not ready then, the store
-    // is null; build it now instead of reporting a source whose attributes cannot
-    // be handed out - that would surface as a different Start failure later.
-    if (!m_sourceAttributes && FAILED(MFCreateAttributes(&m_sourceAttributes, 2))) {
-        return E_OUTOFMEMORY;
+    // The Windows virtual-camera reference sample attaches a sensor-profile
+    // collection to the source attributes. Its Legacy profile is mandatory for
+    // compatibility with applications that do not understand camera profiles.
+    if (!m_sourceAttributes) {
+        HRESULT hr = MFCreateAttributes(&m_sourceAttributes, 2);
+        TraceHr(L"MediaSource::GetSourceAttributes: MFCreateAttributes", hr);
+        if (FAILED(hr)) return hr;
     }
+
+    ComPtr<IMFSensorProfileCollection> profiles;
+    HRESULT hr = MFCreateSensorProfileCollection(&profiles);
+    TraceHr(L"MediaSource::GetSourceAttributes: MFCreateSensorProfileCollection", hr);
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IMFSensorProfile> legacyProfile;
+    hr = MFCreateSensorProfile(KSCAMERAPROFILE_Legacy, 0, nullptr, &legacyProfile);
+    TraceHr(L"MediaSource::GetSourceAttributes: MFCreateSensorProfile(Legacy)", hr);
+    if (FAILED(hr)) return hr;
+
+    hr = legacyProfile->AddProfileFilter(
+        kStreamId, L"((RES==;FRT<=30,1;SUT==))");
+    TraceHr(L"MediaSource::GetSourceAttributes: Legacy AddProfileFilter", hr);
+    if (FAILED(hr)) return hr;
+
+    hr = profiles->AddProfile(legacyProfile.Get());
+    TraceHr(L"MediaSource::GetSourceAttributes: Legacy AddProfile", hr);
+    if (FAILED(hr)) return hr;
+
+    hr = m_sourceAttributes->SetUnknown(
+        MF_DEVICEMFT_SENSORPROFILE_COLLECTION, profiles.Get());
+    TraceHr(L"MediaSource::GetSourceAttributes: Set sensor profile collection", hr);
+    if (FAILED(hr)) return hr;
+
     const HRESULT copied = m_sourceAttributes.CopyTo(attributes);
     TraceHr(L"MediaSource::GetSourceAttributes: CopyTo", copied);
     return copied;
