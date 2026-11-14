@@ -92,11 +92,15 @@ jobs:
         run: |
           set +e
           chmod +x ./gradlew
+          java -version 2>&1 | head -3
           ./gradlew --no-daemon --console=plain --stacktrace assembleDebug 2>&1 | tee /tmp/gradle.log
           code=${PIPESTATUS[0]}
           if [ "$code" -ne 0 ]; then
-            tail=$(tail -n 25 /tmp/gradle.log | tr '\n' '|' | cut -c1-1800)
-            echo "::error::gradlew assembleDebug exited $code: $tail"
+            # A stack trace's last lines are never the cause. Gradle puts the
+            # reason in "* What went wrong:", the compiler in "e: "/"error:".
+            summary=$(awk '/\* What went wrong:/{flag=1;next} flag && NF {print; if(++n>=12) exit}' /tmp/gradle.log | tr '\n' ' ' | cut -c1-1200)
+            causes=$(grep -E '^(Caused by:|e: |error:|FAILURE:|> )' /tmp/gradle.log | head -n 8 | tr '\n' ' ' | cut -c1-1200)
+            echo "::error::gradlew assembleDebug exited $code -- wrong: ${summary:-none} -- causes: ${causes:-none}"
             exit "$code"
           fi
           ls -l app/build/outputs/apk/debug/
