@@ -1,14 +1,21 @@
 name: Windows native virtual camera
 
+# Windows is the only runner where the PC client's device lookup, driver-missing
+# messages and setup script run for real, so the whole client is covered here and
+# not just the native camera.
 on:
   push:
     branches: [main, "work/**"]
     paths:
       - "windows-native/vcam-poc/**"
+      - "windows/**"
+      - "scripts/**"
       - ".github/workflows/windows-native-vcam.yml"
   pull_request:
     paths:
       - "windows-native/vcam-poc/**"
+      - "windows/**"
+      - "scripts/**"
       - ".github/workflows/windows-native-vcam.yml"
   workflow_dispatch:
 
