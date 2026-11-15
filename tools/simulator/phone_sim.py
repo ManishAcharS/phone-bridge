@@ -1284,9 +1284,21 @@ class SimulatedPhone:
         ).encode("utf-8")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        # Bind to the advertised address when the test chose one. Otherwise CI
+        # runners with several interfaces source the datagram from a cloud IP,
+        # and a loopback test that asserts 127.0.0.1 becomes a routing coin toss.
+        try:
+            sock.bind((advertise, 0))
+        except OSError:
+            pass
         try:
             while True:
-                sock.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
+                try:
+                    sock.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
+                except OSError:
+                    # A loopback-bound socket may not broadcast; the unicast
+                    # advertisement below is enough for the reference tests.
+                    pass
                 sock.sendto(payload, (advertise, DISCOVERY_PORT))
                 await asyncio.sleep(2.0)
         finally:
