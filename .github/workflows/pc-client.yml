@@ -48,7 +48,17 @@ jobs:
       - name: Type check
         run: python -m mypy --config-file windows/pyproject.toml windows/phonebridge
       - name: Tests
-        run: python -m pytest -q
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q --tb=short -ra > pytest.log 2>&1
+          code=$?
+          tail -n 120 pytest.log
+          if [ "$code" -ne 0 ]; then
+            summary=$(tail -n 40 pytest.log | tr '\n' ' ' | cut -c1-3500)
+            echo "::error::pytest exited $code -- $summary"
+          fi
+          exit "$code"
 
   powershell-parse:
     name: Parse Windows PowerShell scripts
