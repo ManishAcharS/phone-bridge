@@ -1,0 +1,75 @@
+name: PC client and daily launcher
+
+on:
+  push:
+    paths:
+      - "windows/**"
+      - "scripts/**"
+      - "README.md"
+      - "pytest.ini"
+      - "ruff.toml"
+      - ".github/workflows/pc-client.yml"
+  pull_request:
+    paths:
+      - "windows/**"
+      - "scripts/**"
+      - "README.md"
+      - "pytest.ini"
+      - "ruff.toml"
+      - ".github/workflows/pc-client.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pc-client-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install dev dependencies
+        run: python -m pip install -e "windows[dev]"
+      - name: Lint
+        run: python -m ruff check .
+      - name: Type check
+        run: python -m mypy --config-file windows/pyproject.toml windows/phonebridge
+      - name: Tests
+        run: python -m pytest -q
+
+  powershell-parse:
+    name: Parse Windows PowerShell scripts
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse every .ps1 with the Windows PowerShell parser
+        shell: powershell
+        run: |
+          $failed = $false
+          Get-ChildItem -Path scripts,tools -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              Write-Host "::error::Parse errors in $($_.FullName)"
+              $errors | ForEach-Object { Write-Host $_.Message }
+            } else {
+              Write-Host "OK $($_.FullName)"
+            }
+          }
+          if ($failed) { exit 1 }

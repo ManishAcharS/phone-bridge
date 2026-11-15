@@ -192,56 +192,87 @@ and examples: [`docs/11-pc-client.md`](docs/11-pc-client.md).
 
 ### Daily use: one launcher
 
-Everything below is what `scripts\start-live.bat` does for you. Double-click it
-(or run it from a terminal) and the whole bridge comes up:
+`scripts\start-live.bat` is the daily entry point. With no arguments it prefers a
+usable USB phone, then falls back to Wi-Fi/hotspot discovery and the last address
+that answered an authenticated ping:
 
 ```powershell
-scripts\start-live.bat                       # USB: adb forward + camera + mic + speaker
-scripts\start-live.bat -Profile 720p         # USB, bigger picture
-scripts\start-live.bat -HostName 192.168.43.1   # Wi-Fi or hotspot: the phone's own address
-scripts\start-live.bat -LoopbackDevice CABLE-A  # PC audio the room does not hear
+scripts\start-live.bat                              # auto: USB first, then Wi-Fi/hotspot
+scripts\start-live.bat -Transport usb               # USB only
+scripts\start-live.bat -Transport usb -AdbSerial ABC123
+scripts\start-live.bat -Transport wifi              # beacon + last working address
+scripts\start-live.bat -HostName 192.168.1.20       # manual IP fallback
+scripts\start-live.bat -Profile 720p -Stats
+scripts\start-live.bat -LoopbackDevice "CABLE-B"    # second cable: headphone-only PC audio
 ```
 
-It re-runs `adb forward tcp:8765 tcp:8765` (a forward does not survive an unplug),
-checks that OBS Studio, VB-CABLE, the three Python packages and the phone itself
-are there, then starts `phonebridge start --camera --mic --speaker`. What it does
-**not** do: install anything, change a Windows setting, or need administrator
-rights. A missing piece is printed as the one-line instruction that fixes it.
+Create a desktop shortcut (current user only, no administrator rights):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\create-desktop-shortcut.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\create-desktop-shortcut.ps1 -Name "PhoneBridge Wi-Fi" -Arguments "-Transport wifi"
+```
+
+The shortcut keeps its console open after an error so the fix stays readable.
+The launcher itself installs nothing and changes no Windows default. It checks
+Python, `pyvirtualcam`, `sounddevice`, `PyAudioWPatch`, OBS Studio and the
+VB-CABLE pair, then runs `phonebridge start --camera --mic --speaker --daily`.
+
+Daily mode does the phone-side sequence in order:
+
+1. USB: list `adb devices -l`, refuse ambiguity unless `-AdbSerial` is given,
+   run `adb -s <serial> forward tcp:8765 tcp:8765`, and launch
+   `dev.phonebridge/.MainActivity` with `--ez autostart true`.
+2. Android: the visible, unlocked Activity asks for Camera/Microphone if needed,
+   then starts the typed foreground service. The PC does **not** treat `am start`
+   as success; it waits for an authenticated PING and prints the APK build id.
+3. Wi-Fi/hotspot: listen for the UDP beacon, try the saved working address first,
+   then the beacon source and advertised addresses. `-HostName` is the fallback.
+   Only a phone that passes the pinned handshake and ping is remembered.
+4. Start camera + microphone + speaker on one session and print one consolidated
+   status line. A drop reconnects with backoff; USB re-creates the forward, and
+   Wi-Fi can rediscover a changed address.
+
+**Locked-screen rule:** an already running bridge keeps its foreground service,
+partial wake lock and Wi-Fi lock when the screen locks. A *cold* autostart behind
+a secure lock screen is different: Android 14+/HyperOS can refuse camera/microphone
+foreground-service starts there. PhoneBridge defers that start until the Activity
+is resumed; unlock the phone once and leave PhoneBridge in front until the PC says
+`bridge ready`. The launcher does not bypass the keyguard. HyperOS still needs
+Autostart enabled and battery set to **No restrictions**.
+
+Missing pieces are named with the fix:
+
+| Missing piece | What to do |
+| --- | --- |
+| No USB phone / unauthorized | Plug in, unlock, allow USB debugging, check `adb devices -l`; use `-AdbSerial` if several phones are attached. |
+| Bridge not running / no ping | Open PhoneBridge and tap Start Bridge once; grant Camera/Microphone; check HyperOS Autostart/battery; read `adb -s <serial> logcat -s PhoneBridgeAutostart BridgeService`. |
+| No OBS Virtual Camera | Install OBS Studio from <https://obsproject.com/download>; do not select DroidCam. If needed, open OBS and start its Virtual Camera once. |
+| No VB-CABLE | Install from <https://vb-audio.com/Cable/> and reboot. The phone mic writes to **CABLE Input**; apps select **CABLE Output**. |
+| Wi-Fi not discovered | Same network, no client isolation, allow UDP 47823 and TCP 8765, or pass `-HostName <phone-ip>`. |
 
 In the other application, pick:
 
-* camera → **OBS Virtual Camera** (open OBS once per boot so the device exists);
-* microphone → **CABLE Output** (that is VB-CABLE's *recording* side).
+* camera -> **OBS Virtual Camera**;
+* microphone -> **CABLE Output** (VB-CABLE's recording side).
 
-The connect line names the APK it is talking to — `app 1.0.0 (1) e807c93a` — so
-"that feature does nothing" can be told apart from "that build is old". An APK from
-before the field says `app build not reported` instead.
+PC audio still goes to the phone *and* the default PC speakers unless
+`-LoopbackDevice` names a second virtual cable. `phonebridge speaker
+--list-loopback-devices` lists capture choices; `docs/19-audio.md` section 7b has
+the Windows steps. Muting the default Windows output silences both copies.
 
-PC audio goes to the phone *and* to your speakers, because WASAPI loopback copies
-an output and the default output is the one you are listening to; muting it silences
-the phone too. `phonebridge speaker --list-loopback-devices` lists what can be
-captured, and a second virtual cable (VB-CABLE A+B) gives the phone a private copy —
-`docs/19-audio.md` §7b has the Windows steps.
-
-A dropped link is not the end of the run: the launcher's bridge rebuilds the
-session and asks the phone for the camera, microphone and speaker again, so
-pulling the USB cable out and putting it back keeps working. Screen off and the
-app in the background are fine too — the phone does all of this in a foreground
-service with `connectedDevice|camera|microphone|mediaPlayback` types and a
-partial wake lock (see [`docs/26-windows-live-delivery.md`](docs/26-windows-live-delivery.md)).
-
-The same command line without the launcher:
+The same daily sequence without the wrapper:
 
 ```powershell
-adb forward tcp:8765 tcp:8765
-phonebridge start --camera --mic --speaker --profile low --fps-mode fixed
+phonebridge start --camera --mic --speaker --daily --route auto --profile low --fps-mode fixed
+phonebridge start --camera --mic --speaker --daily --route wifi --host 192.168.1.20
 ```
 
-`--fps-mode fixed` (the default) pins the phone's auto-exposure to the requested
-frame rate: 30 fps means 30 fps, and a dim room looks darker. `--fps-mode variable`
-lets the device drop to ~15 fps for a brighter picture. `--keep-alive` keeps
-sending silence from a silent PC so the phone's audio track and the Bluetooth link
-stay warm.
+`--keep-alive` remains opt-in and is off by default. `--fps-mode fixed` pins the
+phone's auto-exposure to the requested rate; `variable` allows a dimmer-room
+frame-rate drop. Automated tests cover the launcher logic and PowerShell parsing;
+they are not a substitute for the USB/Wi-Fi/locked-screen checks on your handset.
+
 
 ---
 

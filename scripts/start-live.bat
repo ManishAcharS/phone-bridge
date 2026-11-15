@@ -4,8 +4,11 @@ REM
 REM Double-click this, or run it from a terminal. Any PowerShell parameter
 REM passes straight through:
 REM
-REM   start-live.bat -Profile 720p -KeepAlive
-REM   start-live.bat -HostName 192.168.43.1
+REM   start-live.bat
+REM   start-live.bat -Transport usb -AdbSerial ABC123
+REM   start-live.bat -Transport wifi -HostName 192.168.1.20
+REM   start-live.bat -Profile 720p -Stats
+REM   start-live.bat -LoopbackDevice "CABLE-B"
 REM
 REM -ExecutionPolicy Bypass is scoped to this one invocation: no machine-wide
 REM policy is changed, and nothing here needs administrator rights.

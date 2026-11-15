@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tests.ps1_lint import odd_quote_lines
+from ps1_lint import odd_quote_lines
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "setup-windows.ps1"

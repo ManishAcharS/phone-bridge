@@ -80,9 +80,12 @@ class BridgeService : Service() {
         // entered. That applies to the stop and restart paths below too: doing
         // them before startForeground() got the process killed on Android 12+
         // (ForegroundServiceDidNotStartInTimeException) instead of stopped.
-        promoteToForeground(
-            buildNotification(if (server == null) "Starting…" else "Listening…")
-        )
+        if (!promoteToForeground(
+                buildNotification(if (server == null) "Starting…" else "Listening…")
+            )
+        ) {
+            return START_NOT_STICKY
+        }
 
         when (intent?.action) {
             ACTION_STOP -> {
@@ -115,15 +118,27 @@ class BridgeService : Service() {
      * connection-only type, which needs no runtime permission at all: the bridge
      * always comes up.
      */
-    private fun promoteToForeground(notification: Notification) {
+    private fun promoteToForeground(notification: Notification): Boolean {
         val types = foregroundTypes()
         try {
             ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, types)
-            return
+            return true
         } catch (e: RuntimeException) {
             android.util.Log.w("BridgeService", "startForeground(type=$types) refused: ${e.message}")
         }
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, connectionType())
+        return try {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, connectionType())
+            true
+        } catch (e: RuntimeException) {
+            val message =
+                "Android refused the foreground service: ${e.javaClass.simpleName}: ${e.message}. " +
+                    "Unlock the phone, open PhoneBridge and tap Start Bridge; on HyperOS enable " +
+                    "Autostart and battery No restrictions."
+            android.util.Log.w("BridgeService", message, e)
+            BridgeState.note("ERROR", message)
+            stopSelf()
+            false
+        }
     }
 
     /** The types this phone has the runtime permissions for, right now. */

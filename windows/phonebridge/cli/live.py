@@ -45,6 +45,12 @@ from ..live.devices import (
     describe_loopback_choice,
     list_loopback_devices,
 )
+from ..live.launch import (
+    DEFAULT_DISCOVERY_TIMEOUT_S,
+    DEFAULT_STARTUP_TIMEOUT_S,
+    DailyLaunch,
+    LaunchError,
+)
 from ..live.pump import stats_lines
 from ..live.runner import STATUS_INTERVAL_S, LiveRunner
 from .target import EXIT_ERROR, EXIT_USAGE, CliError, note, open_session, reconnect_factory
@@ -330,6 +336,38 @@ def add_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> Non
     start.add_argument("--lipsync", dest="lipsync_ms", type=int, default=0, metavar="MS")
     start.add_argument("--duration", type=float, default=None, metavar="SECONDS")
     start.add_argument("--no-status", action="store_true")
+    start.add_argument(
+        "--daily",
+        action="store_true",
+        help="one-click mode: find/start/ping the phone, then reconnect with the same discovery",
+    )
+    start.add_argument(
+        "--route",
+        choices=("auto", "usb", "wifi", "hotspot"),
+        default="auto",
+        help="daily mode transport: auto prefers USB then Wi-Fi beacon/saved address",
+    )
+    start.add_argument("--adb-serial", default="", metavar="SERIAL", help="USB device serial from adb devices -l")
+    start.add_argument(
+        "--no-autostart",
+        dest="autostart",
+        action="store_false",
+        help="daily USB mode: do not send the autostart intent; the bridge must already be running",
+    )
+    start.add_argument(
+        "--discovery-timeout",
+        type=float,
+        default=DEFAULT_DISCOVERY_TIMEOUT_S,
+        metavar="SECONDS",
+        help="daily Wi-Fi beacon listen time (default 6; 0 skips the listener)",
+    )
+    start.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=DEFAULT_STARTUP_TIMEOUT_S,
+        metavar="SECONDS",
+        help="daily wait for an authenticated ping after launch/discovery (default 45)",
+    )
 
 
 def plan_from_args(args: argparse.Namespace) -> LivePlan:
@@ -679,16 +717,36 @@ async def _run(args: argparse.Namespace) -> int:
     if plan.speaker is not None and plan.speaker.latency_test:
         return await _run_latency_test(args, plan)
     store = _store(args)
-    session, target = await open_session(args, store)
+    daily = bool(getattr(args, "daily", False))
+    launch: DailyLaunch | None = None
+    if daily:
+        launch = DailyLaunch(args, store)
+        try:
+            session, target = await launch.open()
+        except LaunchError as exc:
+            raise CliError(str(exc), hint=exc.hint, code=EXIT_USAGE) from exc
+
+        async def daily_reconnect() -> Any:
+            assert launch is not None
+            fresh, fresh_target = await launch.reconnect()
+            # The runner only needs the session; the launcher keeps the resolved
+            # target so the next Wi-Fi drop can rediscover instead of dialing a
+            # stale DHCP address forever.
+            nonlocal target
+            target = fresh_target
+            return fresh
+
+        reconnect: Any = daily_reconnect
+    else:
+        session, target = await open_session(args, store)
+        # A dropped link is not the end of the command: the runner opens a new
+        # session and asks the phone for every stream again.
+        reconnect = reconnect_factory(args, store, target)
     runner = LiveRunner(
         session,
         plan,
         stats=bool(getattr(args, "stats", False)),
-        # A dropped link is not the end of the command: the runner opens a new
-        # session and asks the phone for every stream again. Before this, a
-        # 30-second Wi-Fi hiccup left the picture dead and the status line saying
-        # "camera idle" until the user restarted the command.
-        reconnect=reconnect_factory(args, store, target),
+        reconnect=reconnect,
     )
     stop = asyncio.Event()
     printer: asyncio.Task[None] | None = None

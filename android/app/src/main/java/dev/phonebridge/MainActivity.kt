@@ -1,8 +1,10 @@
 package dev.phonebridge
 
 import android.content.Context
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
@@ -54,11 +56,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
 import dev.phonebridge.net.AudioProbe
 import dev.phonebridge.net.DeviceFacts
 import dev.phonebridge.net.IdentityStore
 import dev.phonebridge.net.PairingStore
 import dev.phonebridge.protocol.SelfTest
+import dev.phonebridge.service.BridgeAutostart
 import dev.phonebridge.service.BridgeService
 import dev.phonebridge.service.BridgeState
 import kotlinx.coroutines.delay
@@ -73,8 +78,35 @@ import kotlinx.coroutines.delay
  * restating a hard-coded wish list.
  */
 class MainActivity : ComponentActivity() {
+    private var autostartPending = false
+    private var autostartToken = ""
+    private var handledAutostartToken = ""
+    private var permissionRequestInFlight = false
+    private var autostartNotice by mutableStateOf("")
+
+    private val autostartPermissions = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        permissionRequestInFlight = false
+        if (BridgeAutostart.mediaGranted(this)) {
+            maybeAutostart()
+        } else if (autostartPending) {
+            consumeAutostart()
+            showAutostartNotice(BridgeAutostart.deniedMessage())
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        autostartPending = BridgeAutostart.requested(intent)
+        autostartToken = BridgeAutostart.token(intent)
+        // RESUMED, not onCreate: a cold Activity behind the keyguard must not
+        // start a camera/microphone foreground service from the background.
+        lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onResume(owner: LifecycleOwner) {
+                maybeAutostart()
+            }
+        })
         // Android 15+ draws every app edge-to-edge; asking for it explicitly
         // means the layout is identical on 8-14 instead of switching shape at
         // the OS upgrade. Scaffold below consumes the insets, so the content
@@ -83,10 +115,66 @@ class MainActivity : ComponentActivity() {
         setContent {
             PhoneBridgeTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    DashboardScreen()
+                    DashboardScreen(autostartNotice)
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        autostartPending = BridgeAutostart.requested(intent)
+        autostartToken = BridgeAutostart.token(intent)
+        if (autostartPending) {
+            handledAutostartToken = ""
+            maybeAutostart()
+        }
+    }
+
+    private fun maybeAutostart() {
+        if (!autostartPending || autostartToken == handledAutostartToken) return
+        if (BridgeState.running.value) {
+            consumeAutostart()
+            autostartNotice = ""
+            return
+        }
+        if (!BridgeAutostart.visibleAndUnlocked(this)) {
+            autostartNotice = BridgeAutostart.lockedMessage()
+            return
+        }
+        if (!BridgeAutostart.mediaGranted(this)) {
+            if (!permissionRequestInFlight) {
+                val missing = BridgeAutostart.permissionsToRequest()
+                    .filter { !Permissions.granted(this, it) }
+                    .toTypedArray()
+                if (missing.isNotEmpty()) {
+                    missing.forEach { Permissions.markAsked(this, it) }
+                    permissionRequestInFlight = true
+                    autostartPermissions.launch(missing)
+                }
+            }
+            return
+        }
+        val error = BridgeAutostart.startFromVisibleActivity(this)
+        consumeAutostart()
+        if (error != null) {
+            showAutostartNotice(error)
+        } else {
+            autostartNotice = "Autostart requested. Waiting for the PC to authenticate and ping."
+            BridgeState.note("INFO", "daily autostart intent accepted from the visible Activity")
+        }
+    }
+
+    private fun consumeAutostart() {
+        autostartPending = false
+        handledAutostartToken = autostartToken
+    }
+
+    private fun showAutostartNotice(message: String) {
+        autostartNotice = message
+        BridgeState.note("WARN", message)
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 }
 
@@ -112,7 +200,7 @@ private fun isSystemDark(context: Context): Boolean =
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DashboardScreen() {
+private fun DashboardScreen(autostartNotice: String = "") {
     val context = LocalContext.current
     val running by BridgeState.running.collectAsState()
     val peers by BridgeState.peers.collectAsState()
@@ -267,6 +355,17 @@ private fun DashboardScreen() {
                 .padding(horizontal = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            if (autostartNotice.isNotEmpty()) {
+                item {
+                    Section("Autostart") {
+                        Text(
+                            autostartNotice,
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
             if (!onboardingDone && !running && peers.isEmpty() && request == null) {
                 item {
                     OnboardingCard(

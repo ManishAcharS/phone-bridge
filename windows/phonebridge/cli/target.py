@@ -277,13 +277,19 @@ async def open_session(
     store: DeviceStore,
     *,
     quiet: bool = False,
+    target: Target | None = None,
+    remember: bool = True,
 ) -> tuple[BridgeSession, Target]:
     """Resolve the target and open an authenticated session.
 
     Retries (``--retries``) cover transient failures only: a refusal is terminal
     and is reported once instead of hammering a phone that said no.
+
+    ``target`` lets the daily launcher supply an address it discovered itself.
+    ``remember=False`` delays the endpoint cache until the caller has proved the
+    phone answers an authenticated PING; a beacon alone is not proof of reachability.
     """
-    target = resolve_target(store, args)
+    target = target if target is not None else resolve_target(store, args)
     identity = store.load_or_create_identity()
     uri = websocket_uri(target.host, target.port)
 
@@ -330,12 +336,13 @@ async def open_session(
             raise CliError(str(exc), hint=connect_hint(target), code=EXIT_USAGE) from exc
         break
 
-    store.remember_endpoint(
-        target.transport,
-        target.host,
-        target.port,
-        peer_id=session.phone.device_id if session.phone else None,
-    )
+    if remember:
+        store.remember_endpoint(
+            target.transport,
+            target.host,
+            target.port,
+            peer_id=session.phone.device_id if session.phone else None,
+        )
     if not quiet and session.phone is not None:
         state = "paired" if session.phone.paired else "newly paired"
         # The build goes on this line because it is the line people read when

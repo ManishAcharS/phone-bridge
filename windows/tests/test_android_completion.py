@@ -366,19 +366,21 @@ def test_permission_wire_keys_are_the_real_permission_names() -> None:
 def test_permissions_are_requested_at_the_moment_of_use_not_at_launch() -> None:
     """Every request is triggered by a user action, never by composition.
 
-    Four launches exist since Phase 5: notifications from `startBridge()`, the
-    camera from the camera card's Allow button, the Bluetooth scan permission from
-    the Bluetooth card's Grant button, and the two SAF pickers (folder and files)
-    from the file card. Every one is inside a callback, which is the whole point —
-    nothing asks on launch.
+    Six launches exist: notifications from `startBridge()`, the camera from the
+    camera card's Allow button, the Bluetooth scan permission from the Bluetooth
+    card's Grant button, the two SAF pickers (folder and files), and the daily
+    autostart permission request. The autostart request is triggered only by an
+    explicit `--ez autostart true` Activity intent handled at RESUMED, never by
+    composition or a background broadcast.
     """
     activity = read(ACTIVITY)
     launch_sites = re.findall(r"\.launch\(", activity)
-    assert len(launch_sites) == 5, (
-        "MainActivity should launch exactly five things: two permission requests "
-        "(notifications, camera), the Bluetooth scan permission from its card, and "
-        "the two SAF pickers"
+    assert len(launch_sites) == 6, (
+        "MainActivity should launch exactly six things: notifications, camera, "
+        "Bluetooth scan, two SAF pickers, and the explicit daily-autostart request"
     )
+    assert "autostartPermissions.launch(missing)" in activity
+    assert "BridgeAutostart.requested(intent)" in activity
     start = body_after(activity, "fun startBridge()")
     assert "notificationPermission.launch(" in start
     # Each Phase 5 permission is requested from the button that needs it.

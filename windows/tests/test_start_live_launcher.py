@@ -19,7 +19,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from tests.ps1_lint import odd_quote_lines
+from ps1_lint import odd_quote_lines
 
 from phonebridge.live.usb import ensure_forward, is_loopback
 
@@ -134,12 +134,14 @@ def test_the_bat_wrapper_calls_the_ps1_and_passes_arguments_through() -> None:
     assert "%ERRORLEVEL%" in text, "the exit code must survive the wrapper"
 
 
-def test_the_launcher_forwards_the_port_before_starting_anything() -> None:
+def test_the_launcher_delegates_usb_forward_and_autostart_to_daily_mode() -> None:
     text = code_only(ps1())
-    forward = text.index("adb forward")
-    start = text.index("'start',")
-    assert forward < start, "the forward has to exist before the bridge dials it"
-    assert 'tcp:$Port' in text
+    assert "'--daily'" in text
+    assert "'--route', $Transport" in text
+    assert "'--port', \"$Port\"" in text
+    launch = (REPO / "windows" / "phonebridge" / "live" / "launch.py").read_text(encoding="utf-8")
+    assert "add_forward" in launch and "am" in launch and "autostart" in launch
+    assert "ping" in launch, "am start is not proof; the bridge must answer"
 
 
 def test_the_launcher_checks_what_must_be_installed_by_hand() -> None:
@@ -154,7 +156,8 @@ def test_the_launcher_checks_the_python_packages_and_the_phone() -> None:
     text = code_only(ps1())
     assert "pyvirtualcam" in text and "sounddevice" in text and "pyaudiowatch" not in text
     assert "pyaudiowpatch" in text
-    assert "'info'" in text and "'--host'" in text, "the phone must answer before the run"
+    assert "'--daily'" in text, "daily mode waits for an authenticated ping before streaming"
+    assert "'--host', $HostName" in text, "manual fallback must reach the client"
 
 
 def test_the_launcher_starts_all_three_paths_on_one_session() -> None:
@@ -164,19 +167,21 @@ def test_the_launcher_starts_all_three_paths_on_one_session() -> None:
     assert "'--fps-mode', $FpsMode" in text
 
 
-def test_wifi_and_hotspot_use_hostname_instead_of_a_forward() -> None:
+def test_wifi_and_hotspot_use_discovery_with_hostname_fallback() -> None:
     text = ps1()
-    assert "$HostName = '127.0.0.1'" in text, "USB is the default"
+    assert "$HostName = ''" in text, "empty means auto discovery, not a stale hardcoded IP"
+    assert "$Transport = 'auto'" in text
     code = code_only(text)
-    assert "Test-IsLoopback" in code
+    assert "'--route', $Transport" in code
     assert "'--host', $HostName" in code
+    assert "'--discovery-timeout'" in code
 
 
 def test_the_launcher_says_the_bridge_reconnects_by_itself() -> None:
     """A launcher that hides the reconnect story invites a restart it does not need."""
     text = ps1()
     assert "reconnects on its own" in text
-    assert "USB cable" in text
+    assert "USB" in text and "rediscover" in text
 
 
 def test_skip_checks_is_offered_for_the_case_where_the_checks_are_wrong() -> None:
@@ -186,11 +191,14 @@ def test_skip_checks_is_offered_for_the_case_where_the_checks_are_wrong() -> Non
 
 
 def test_the_launcher_never_installs_anything_or_needs_elevation() -> None:
-    text = code_only(ps1()).lower()
-    assert "pip install" not in text or "fix with" in text
-    assert "start-process" not in text
-    assert "runas" not in text
-    assert "set-executionpolicy" not in text
+    text = code_only(ps1())
+    lower = text.lower()
+    for line in text.splitlines():
+        if "pip install" in line.lower():
+            assert "Write-Hint" in line, "install commands are printed fixes, not executed"
+    assert "start-process" not in lower
+    assert "runas" not in lower
+    assert "set-executionpolicy" not in lower
 
 
 def test_the_launcher_documents_its_exit_codes() -> None:

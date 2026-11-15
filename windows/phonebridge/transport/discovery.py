@@ -21,6 +21,7 @@ known endpoint is cached, so discovery is never required.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import re
 import socket
@@ -104,7 +105,17 @@ def parse_advertised_hosts(raw: object) -> tuple[str, ...]:
         candidate = item.strip()
         if len(candidate) > 15 or not _IPV4_RE.match(candidate):
             continue
-        if candidate.startswith(("0.", "127.", "255.")):
+        try:
+            address = ipaddress.IPv4Address(candidate)
+        except ipaddress.AddressValueError:
+            continue
+        if (
+            address.is_loopback
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_unspecified
+            or address.is_reserved
+        ):
             continue
         if candidate not in out:
             out.append(candidate)

@@ -501,6 +501,17 @@ class Adb:
         """
         return [d for d in self.devices() if d.is_usb and d.connection != CONNECTION_EMULATOR]
 
+    def shell(self, serial: str, argv: Sequence[str]) -> AdbResult:
+        """Run one non-interactive shell command on exactly one device.
+
+        The serial is mandatory: with two phones attached, a bare ``adb shell``
+        is a coin toss. The caller checks both the exit code and ``am``'s text,
+        because ``am start`` can print an activity-manager error and still exit 0.
+        """
+        if not serial:
+            raise AdbError("refusing to run adb shell without a device serial")
+        return self._exec(["-s", serial, "shell", *argv])
+
     # ------------------------------------------------------------------ #
     # forwards
     # ------------------------------------------------------------------ #
