@@ -34,13 +34,15 @@
     so the room still hears it. Use a second virtual cable for headphone-only audio.
 
 .PARAMETER SkipChecks
-    Skip the advisory OBS/VB-CABLE/package checks. The bridge still reports a device
+    Skip the OBS/VB-CABLE/package preflight checks. The bridge still reports a device
     it cannot open; this does not force a missing driver to exist.
 
 .NOTES
-    Exit codes: 0 clean stop, 1 missing Windows piece, 2 Python/package/phone launch
-    problem, 130 Ctrl+C. The phone must be unlocked once for a cold autostart on
-    Android 14+/HyperOS; an already running bridge can continue while locked.
+    Exit codes: 0 clean stop, 1 positively missing Windows piece, 2 Python/phone
+    launch problem, 130 Ctrl+C. A check that cannot run is a warning with the child
+    exit code/stderr and does not block the bridge. The phone must be unlocked once
+    for a cold autostart on Android 14+/HyperOS; an already running bridge can
+    continue while locked.
 #>
 [CmdletBinding()]
 param(
@@ -78,6 +80,7 @@ trap {
 function Write-Step { param([string]$Text) Write-Host "==> $Text" -ForegroundColor Cyan }
 function Write-Ok   { param([string]$Text) Write-Host "  [ok]   $Text" -ForegroundColor Green }
 function Write-Bad  { param([string]$Text) Write-Host "  [fail] $Text" -ForegroundColor Red }
+function Write-Warn { param([string]$Text) Write-Host "  [warn] $Text" -ForegroundColor Yellow }
 function Write-Hint { param([string]$Text) Write-Host "         $Text" -ForegroundColor DarkGray }
 
 function Get-ScriptDirectory {
@@ -87,6 +90,11 @@ function Get-ScriptDirectory {
 }
 
 $script:RepoRoot = Split-Path -Parent (Get-ScriptDirectory)
+$script:PythonProbes = Join-Path (Get-ScriptDirectory) 'python-probes.ps1'
+if (-not (Test-Path -LiteralPath $script:PythonProbes)) {
+    throw "Python probe helpers not found: $script:PythonProbes"
+}
+. $script:PythonProbes
 
 function Invoke-PythonCandidate {
     param([string[]]$Command, [string[]]$Arguments)
@@ -163,23 +171,13 @@ function Resolve-Python {
 
 function Invoke-Phonebridge {
     param([string[]]$Arguments)
-    & $script:PythonCommand @('-m', 'phonebridge') @Arguments
-}
-
-function Test-PythonPackages {
-    $probe = @'
-import importlib
-missing = []
-for name in ("pyvirtualcam", "sounddevice", "pyaudiowpatch"):
-    try:
-        importlib.import_module(name)
-    except Exception:
-        missing.append(name)
-print(",".join(missing))
-'@
-    try { $output = & $script:PythonCommand @('-c', $probe) 2>$null } catch { return 'unknown' }
-    if ($LASTEXITCODE -ne 0) { return 'unknown' }
-    return (($output | Select-Object -Last 1) -as [string])
+    $exe = $script:PythonCommand[0]
+    $prefix = @()
+    if ($script:PythonCommand.Count -gt 1) {
+        $prefix = @($script:PythonCommand | Select-Object -Skip 1)
+    }
+    $bridgeArguments = @('-m', 'phonebridge') + $Arguments
+    & $exe @prefix @bridgeArguments
 }
 
 function Test-ObsInstalled {
@@ -192,43 +190,6 @@ function Test-ObsInstalled {
         if (Test-Path $key) { return $key }
     }
     return $null
-}
-
-function Test-CableInstalled {
-    $probe = @'
-try:
-    import sounddevice
-except Exception:
-    print("unknown")
-    raise SystemExit(0)
-devices = list(sounddevice.query_devices())
-out = [str(d["name"]) for d in devices if int(d.get("max_output_channels", 0)) > 0 and "cable input" in str(d["name"]).lower()]
-inp = [str(d["name"]) for d in devices if int(d.get("max_input_channels", 0)) > 0 and "cable output" in str(d["name"]).lower()]
-if out and inp:
-    print("found:" + out[0] + " / " + inp[0])
-elif out or inp:
-    print("partial")
-else:
-    print("missing")
-'@
-    try { $output = & $script:PythonCommand @('-c', $probe) 2>$null } catch { return 'unknown' }
-    if ($LASTEXITCODE -ne 0) { return 'unknown' }
-    return (($output | Select-Object -Last 1) -as [string])
-}
-
-function Test-LoopbackChoice {
-    param([string]$Name)
-    $probe = @'
-import sys
-from phonebridge.live.devices import list_loopback_devices
-name = sys.argv[1].lower()
-devices = list_loopback_devices()
-hit = [d["name"] for d in devices if name in str(d["name"]).lower()]
-print("found:" + str(hit[0]) if hit else "missing")
-'@
-    try { $output = & $script:PythonCommand @('-c', $probe, $Name) 2>$null } catch { return 'unknown' }
-    if ($LASTEXITCODE -ne 0) { return 'unknown' }
-    return (($output | Select-Object -Last 1) -as [string])
 }
 
 Write-Host ''
@@ -257,12 +218,15 @@ $failures = @()
 if (-not $SkipChecks) {
     Write-Step 'Python packages for the live paths'
     $missing = Test-PythonPackages
-    if ($missing -eq 'unknown' -or $missing) {
-        Write-Bad "missing or uncheckable Python packages: $missing"
+    if ($missing -like 'unknown*') {
+        Write-Warn "Python package check could not run: $missing"
+        Write-Hint 'continuing; phonebridge will report its own missing package/device error'
+    } elseif ($missing -eq 'ok') {
+        Write-Ok 'pyvirtualcam, sounddevice and PyAudioWPatch are importable'
+    } else {
+        Write-Bad "missing Python packages: $missing"
         Write-Hint "fix: $($script:PythonCommand -join ' ') -m pip install pyvirtualcam sounddevice PyAudioWPatch"
         $failures += 'python packages'
-    } else {
-        Write-Ok 'pyvirtualcam, sounddevice and PyAudioWPatch are importable'
     }
 
     Write-Step 'OBS Virtual Camera (not DroidCam)'
@@ -280,6 +244,9 @@ if (-not $SkipChecks) {
     $cable = Test-CableInstalled
     if ($cable -like 'found:*') {
         Write-Ok $cable.Substring(6)
+    } elseif ($cable -like 'unknown*') {
+        Write-Warn "VB-CABLE check could not run: $cable"
+        Write-Hint 'continuing; phonebridge mic will report its own VB-CABLE/device error'
     } else {
         Write-Bad "VB-CABLE pair is missing or incomplete ($cable)"
         Write-Hint 'fix: install VB-CABLE from https://vb-audio.com/Cable/ and REBOOT'
@@ -292,6 +259,9 @@ if (-not $SkipChecks) {
         $choice = Test-LoopbackChoice -Name $LoopbackDevice
         if ($choice -like 'found:*') {
             Write-Ok $choice.Substring(6)
+        } elseif ($choice -like 'unknown*') {
+            Write-Warn "speaker capture check could not run: $choice"
+            Write-Hint 'continuing; phonebridge speaker will report its own loopback/device error'
         } else {
             Write-Bad "no loopback-capable output matches $LoopbackDevice ($choice)"
             Write-Hint 'fix: phonebridge speaker --list-loopback-devices, then pass the exact name substring'

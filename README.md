@@ -217,6 +217,9 @@ The shortcut keeps its console open after an error so the fix stays readable.
 The launcher itself installs nothing and changes no Windows default. It checks
 Python, `pyvirtualcam`, `sounddevice`, `PyAudioWPatch`, OBS Studio and the
 VB-CABLE pair, then runs `phonebridge start --camera --mic --speaker --daily`.
+A preflight check that cannot run is a `[warn]` with the Python child's exit code
+and stderr, and it continues into the bridge; only a positively missing piece is
+a `[fail]` that blocks startup. The bridge then reports its own device errors.
 
 Daily mode does the phone-side sequence in order:
 

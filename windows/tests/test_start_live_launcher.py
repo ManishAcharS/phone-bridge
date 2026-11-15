@@ -26,6 +26,7 @@ from phonebridge.live.usb import ensure_forward, is_loopback
 REPO = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO / "scripts"
 PS1 = SCRIPTS / "start-live.ps1"
+PROBES = SCRIPTS / "python-probes.ps1"
 BAT = SCRIPTS / "start-live.bat"
 TARGET = REPO / "windows" / "phonebridge" / "cli" / "target.py"
 README = REPO / "README.md"
@@ -153,7 +154,7 @@ def test_the_launcher_checks_what_must_be_installed_by_hand() -> None:
 
 
 def test_the_launcher_checks_the_python_packages_and_the_phone() -> None:
-    text = code_only(ps1())
+    text = code_only(ps1() + "\n" + PROBES.read_text(encoding="utf-8-sig"))
     assert "pyvirtualcam" in text and "sounddevice" in text and "pyaudiowatch" not in text
     assert "pyaudiowpatch" in text
     assert "'--daily'" in text, "daily mode waits for an authenticated ping before streaming"
