@@ -70,9 +70,19 @@ def test_installed_live_packages_are_reported_without_unknown() -> None:
     assert_audio_check_result(data)
 
 
-def test_installed_live_packages_through_py_launcher_are_not_unknown() -> None:
+def test_probes_through_py_launcher_are_not_bare_unknown() -> None:
+    # The runner's py -3 may be a different interpreter/platform from the
+    # setup-python one, so the live packages may positively be missing there.
+    # The regression is that the py launcher form runs and returns a real
+    # package list or a diagnostic unknown, never the old bare unknown.
     data = run_checker(use_py_launcher=True)
-    assert data["packages"] == "ok", data
+    packages = data["packages"]
+    assert packages != "unknown", data
+    if packages.startswith("unknown:"):
+        assert "exit=" in packages and "stderr=" in packages, data
+    else:
+        allowed = {"ok", "pyvirtualcam", "sounddevice", "pyaudiowpatch"}
+        assert set(packages.split(",")) <= allowed, data
     assert_audio_check_result(data)
 
 

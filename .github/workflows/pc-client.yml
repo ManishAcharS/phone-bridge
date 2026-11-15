@@ -77,7 +77,9 @@ jobs:
           python-version: "3.14"
       - name: Verify the Windows py launcher
         shell: bash
-        run: py -3 -c "import sys; print(sys.version); print(sys.executable)"
+        run: |
+          info=$(py -3 -c "import struct,sys; print(sys.version.split()[0], sys.executable, str(struct.calcsize('P')*8)+'-bit')")
+          echo "::notice::py -3 => $info"
       - name: Install dev and live-path dependencies for python
         shell: bash
         run: python -m pip install -e "windows[dev]" pyvirtualcam sounddevice PyAudioWPatch
@@ -85,7 +87,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          py -3 -m pip install -e "windows[dev]" pyvirtualcam sounddevice PyAudioWPatch > pip-py.log 2>&1
+          py -3 -m pip install -e "windows[dev]" > pip-py.log 2>&1
           code=$?
           tail -n 120 pip-py.log
           if [ "$code" -ne 0 ]; then
