@@ -18,7 +18,8 @@
     Report only. Installs nothing, changes nothing.
 
 .PARAMETER Python
-    Python executable to use. Default: `py -3`, then `python` from PATH.
+    Optional Python executable path. Leave empty for automatic selection; the
+    Windows py launcher is invoked as executable py with separate argument -3.
 
 .PARAMETER Upgrade
     Allow pip to upgrade already-installed packages.
@@ -30,8 +31,10 @@
     powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -Check
 
 .NOTES
-    Exit codes: 0 everything present, 1 a component still needs installing,
-                2 Python itself is missing or too old.
+    Exit codes: 0 everything present (or only inconclusive warnings), 1 a
+                component is positively missing, 2 Python itself is missing or
+                too old. A check that cannot run prints the child exit code and
+                stderr as a warning and does not block the summary.
 #>
 [CmdletBinding()]
 param(
@@ -48,71 +51,63 @@ $ErrorActionPreference = 'Stop'
 if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
     $PSNativeCommandUseErrorActionPreference = $false
 }
+if (-not $PSScriptRoot) { throw 'Run this script from its file path, not from a pasted block.' }
+$script:RepoRoot = Split-Path -Parent $PSScriptRoot
 $script:Missing = @()
+
+$commandHelpers = Join-Path $PSScriptRoot 'python-command.ps1'
+if (-not (Test-Path -LiteralPath $commandHelpers)) { throw "Python command helpers not found: $commandHelpers" }
+. $commandHelpers
+$probeHelpers = Join-Path $PSScriptRoot 'python-probes.ps1'
+if (-not (Test-Path -LiteralPath $probeHelpers)) { throw "Python probe helpers not found: $probeHelpers" }
+. $probeHelpers
 
 function Write-Step { param([string]$Text) Write-Host "==> $Text" -ForegroundColor Cyan }
 function Write-Ok   { param([string]$Text) Write-Host "  [ok]   $Text" -ForegroundColor Green }
 function Write-Need { param([string]$Text) Write-Host "  [todo] $Text" -ForegroundColor Yellow }
+function Write-Warn { param([string]$Text) Write-Host "  [warn] $Text" -ForegroundColor Yellow }
 function Write-Bad  { param([string]$Text) Write-Host "  [fail] $Text" -ForegroundColor Red }
+function Write-Hint { param([string]$Text) Write-Host "         $Text" -ForegroundColor DarkGray }
 
-function Resolve-Python {
-    if ($Python) {
-        if (-not (Get-Command $Python -ErrorAction SilentlyContinue)) {
-            throw "Python executable not found: $Python"
-        }
-        return $Python
-    }
-    foreach ($candidate in @('py', 'python')) {
-        $command = Get-Command $candidate -ErrorAction SilentlyContinue
-        if ($null -eq $command) { continue }
-        try {
-            if ($candidate -eq 'py') {
-                $version = & py -3 -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
-                if ($LASTEXITCODE -eq 0) { return @('py', '-3') }
-                continue
-            }
-            $version = & python -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
-            if ($LASTEXITCODE -eq 0) { return @('python') }
-        } catch {
-            continue
-        }
-    }
-    return $null
-}
-
-function Invoke-Python {
-    param([string[]]$Arguments)
-    # Select-Object -Skip 1, not [$Command[1..($Command.Count - 1)]]: for a
-    # one-element array that slice counts *down* to zero, so `python` was invoked
-    # as `python.exe <path to python>` and every probe failed.
-    if ($script:PythonCommand -is [array]) {
-        $exe = [string]$script:PythonCommand[0]
-        $rest = @($script:PythonCommand | Select-Object -Skip 1)
-        & $exe @rest @Arguments
-    } else {
-        & $script:PythonCommand @Arguments
-    }
-}
-
-function Get-PackageVersion {
+function Get-PackageState {
     param([string]$Name)
-    $probe = "import importlib.metadata as m; print(m.version('$Name'))"
-    try {
-        $output = Invoke-Python @('-c', $probe) 2>$null
-    } catch {
-        return $null  # not installed: the import failed, which is the answer
+    $probe = @"
+import importlib.metadata as m
+try:
+    print(m.version('$Name'))
+except m.PackageNotFoundError:
+    print('missing')
+"@
+    $result = Invoke-PythonProbe -Probe $probe
+    if ($result.ExitCode -ne 0 -or $null -eq $result.Output) {
+        return [pscustomobject]@{ Status = 'unknown'; Version = ''; Detail = (Format-ProbeUnknown -Result $result) }
     }
-    if ($LASTEXITCODE -ne 0) { return $null }
-    return ($output | Select-Object -First 1).Trim()
+    $line = ([string]$result.Output).Trim()
+    if ($line -eq 'missing') {
+        return [pscustomobject]@{ Status = 'missing'; Version = ''; Detail = '' }
+    }
+    if (-not $line) {
+        return [pscustomobject]@{ Status = 'unknown'; Version = ''; Detail = (Format-ProbeUnknown -Result $result) }
+    }
+    return [pscustomobject]@{ Status = 'ok'; Version = $line; Detail = '' }
 }
 
 function Ensure-Package {
     param([string]$Name, [string]$Why)
-    $version = Get-PackageVersion $Name
-    if ($version) {
-        Write-Ok "$Name $version - $Why"
+    $state = Get-PackageState -Name $Name
+    if ($state.Status -eq 'unknown') {
+        Write-Warn "$Name check could not run: $($state.Detail)"
+        Write-Hint 'continuing; the live command will report its own package/device error'
+        return
+    }
+    if ($state.Status -eq 'ok') {
+        Write-Ok "$Name $($state.Version) - $Why"
         if ($Upgrade -and -not $Check) {
-            Invoke-Python @('-m', 'pip', 'install', '--quiet', '--upgrade', $Name) | Out-Null
+            Invoke-PythonCommand -Executable $script:PythonExe -Prefix $script:PythonArgs -Arguments @('-m', 'pip', 'install', '--quiet', '--upgrade', $Name) | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Bad "$Name upgrade failed with exit code $LASTEXITCODE; run: $(Format-PythonCommand -Executable $script:PythonExe -Arguments ($script:PythonArgs + @('-m', 'pip', 'install', '--upgrade', $Name)))"
+                $script:Missing += "$Name upgrade failed (pip install --upgrade $Name)"
+            }
         }
         return
     }
@@ -122,14 +117,21 @@ function Ensure-Package {
         return
     }
     Write-Step "installing $Name"
-    Invoke-Python @('-m', 'pip', 'install', '--quiet', $Name) | Out-Null
+    Invoke-PythonCommand -Executable $script:PythonExe -Prefix $script:PythonArgs -Arguments @('-m', 'pip', 'install', '--quiet', $Name) | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-Bad "$Name could not be installed; run: python -m pip install $Name"
+        Write-Bad "$Name could not be installed (exit $LASTEXITCODE); run: $(Format-PythonCommand -Executable $script:PythonExe -Arguments ($script:PythonArgs + @('-m', 'pip', 'install', $Name)))"
         $script:Missing += "$Name (pip install $Name)"
         return
     }
-    $version = Get-PackageVersion $Name
-    Write-Ok "$Name $version installed - $Why"
+    $state = Get-PackageState -Name $Name
+    if ($state.Status -eq 'ok') {
+        Write-Ok "$Name $($state.Version) installed - $Why"
+    } elseif ($state.Status -eq 'unknown') {
+        Write-Warn "$Name was installed but the version check could not run: $($state.Detail)"
+    } else {
+        Write-Bad "$Name still is not importable after pip install"
+        $script:Missing += "$Name (pip install $Name)"
+    }
 }
 
 function Test-ObsInstalled {
@@ -151,69 +153,50 @@ function Test-ObsInstalled {
     return $null
 }
 
-function Get-LoopbackDevices {
+function Get-LoopbackState {
     # Every endpoint WASAPI loopback can capture, with the same probe the speaker
     # command uses. Two of them is the good case: the microphone writes into one
     # (VB-CABLE's "CABLE Input") and the speaker path captures the *other*, so the
     # phone hears the PC without the PC's speakers having to be audible, and
     # without capturing its own microphone.
     $probe = @'
-import sys
+import pyaudiowpatch as pyaudio
 names = []
+pa = pyaudio.PyAudio()
 try:
-    import pyaudiowpatch as pyaudio
-    pa = pyaudio.PyAudio()
-    try:
-        for info in pa.get_loopback_device_info_generator():
-            if int(info.get("maxInputChannels", 0)) > 0:
-                names.append(str(info.get("name", "")))
-    finally:
-        pa.terminate()
-except Exception:
-    try:
-        import soundcard
-        names = [str(m) for m in soundcard.all_microphones(include_loopback=True)]
-    except Exception:
-        print("unknown")
-        sys.exit(0)
+    for info in pa.get_loopback_device_info_generator():
+        if int(info.get("maxInputChannels", 0)) > 0:
+            names.append(str(info.get("name", "")))
+finally:
+    pa.terminate()
 print("|".join(names))
 '@
-    try {
-        $output = Invoke-Python @('-c', $probe) 2>$null
-    } catch {
-        return $null
+    $result = Invoke-PythonProbe -Probe $probe
+    if ($result.ExitCode -ne 0 -or $null -eq $result.Output) {
+        return [pscustomobject]@{ Status = 'unknown'; Devices = @(); Detail = (Format-ProbeUnknown -Result $result) }
     }
-    if ($LASTEXITCODE -ne 0) { return $null }
-    $line = ($output | Select-Object -Last 1)
-    if ($null -eq $line -or $line -eq 'unknown') { return $null }
-    return @($line -split '\|' | Where-Object { $_ })
+    $line = ([string]$result.Output).Trim()
+    $devices = @($line -split '\|' | Where-Object { $_ })
+    return [pscustomobject]@{ Status = 'ok'; Devices = $devices; Detail = '' }
 }
 
 function Test-CableInstalled {
     # sounddevice just got installed, so ask PortAudio directly: this is the same
     # lookup phonebridge mic --to-cable performs, which makes it the honest check.
     $probe = @'
-import sys
-try:
-    import sounddevice
-except Exception:
-    print("nosounddevice")
-    sys.exit(0)
+import sounddevice
 names = [str(d["name"]) for d in sounddevice.query_devices()]
 hit = [n for n in names if "cable input" in n.lower()]
 print("found:" + hit[0] if hit else "missing")
 '@
-    try {
-        $output = Invoke-Python @('-c', $probe) 2>$null
-    } catch {
-        return 'unknown'
+    $result = Invoke-PythonProbe -Probe $probe
+    if ($result.ExitCode -ne 0 -or $null -eq $result.Output) {
+        return Format-ProbeUnknown -Result $result
     }
-    if ($LASTEXITCODE -ne 0) { return 'unknown' }
-    $line = ($output | Select-Object -Last 1)
-    if ($null -eq $line) { return 'unknown' }
+    $line = ([string]$result.Output).Trim()
     if ($line -like 'found:*') { return $line.Substring(6) }
     if ($line -eq 'missing') { return $null }
-    return 'unknown'
+    return Format-ProbeUnknown -Result $result
 }
 
 # --------------------------------------------------------------------------- #
@@ -224,13 +207,14 @@ if ($Check) { Write-Host 'check only: nothing will be installed' -ForegroundColo
 Write-Host ''
 
 Write-Step 'locating Python'
-$script:PythonCommand = Resolve-Python
-if (-not $script:PythonCommand) {
+$resolved = Resolve-Python -RepoRoot $script:RepoRoot -PythonOverride $Python
+if (-not $resolved) {
     Write-Bad 'Python 3.10+ was not found. Install it from https://www.python.org/downloads/windows/'
     exit 2
 }
-$version = (Invoke-Python @('-c', "import sys; print('%d.%d.%d' % sys.version_info[:3])")).Trim()
-Write-Ok "Python $version ($($script:PythonCommand -join ' '))"
+$script:PythonExe = $resolved.Exe
+$script:PythonArgs = @($resolved.Args)
+Write-Ok "Python $($resolved.Version) ($(Format-PythonCommand -Executable $script:PythonExe -Arguments $script:PythonArgs))"
 Write-Host ''
 
 Write-Step 'Python packages (installed by pip, no administrator rights needed)'
@@ -253,10 +237,11 @@ Write-Host ''
 
 Write-Step 'VB-CABLE (provides "CABLE Input" / "CABLE Output")'
 $cable = Test-CableInstalled
-if ($cable -and $cable -ne 'unknown') {
+if ($cable -like 'unknown*') {
+    Write-Warn "VB-CABLE check could not run: $cable"
+    Write-Hint 'continuing; phonebridge mic will report its own VB-CABLE/device error'
+} elseif ($cable) {
     Write-Ok "audio device found: $cable"
-} elseif ($cable -eq 'unknown') {
-    Write-Need 'could not list audio devices yet (reboot after installing VB-CABLE, then re-run)'
 } else {
     Write-Need 'VB-CABLE is not installed - the microphone path has nowhere to write'
     Write-Host '         install from https://vb-audio.com/Cable/ then REBOOT (the driver only'
@@ -266,12 +251,13 @@ if ($cable -and $cable -ne 'unknown') {
 Write-Host ''
 
 Write-Step 'a second virtual cable (the speaker path must not capture the microphone one)'
-$loopbacks = Get-LoopbackDevices
-if ($null -eq $loopbacks) {
-    Write-Need 'could not list capture devices yet (install PyAudioWPatch, then re-run)'
+$loopbacks = Get-LoopbackState
+if ($loopbacks.Status -eq 'unknown') {
+    Write-Warn "speaker capture check could not run: $($loopbacks.Detail)"
+    Write-Hint 'continuing; phonebridge speaker will report its own loopback/device error'
 } else {
-    $virtuals = @($loopbacks | Where-Object { $_ -match 'cable|voicemeeter|virtual audio' })
-    Write-Host "         capture devices visible: $($loopbacks.Count)" -ForegroundColor DarkGray
+    $virtuals = @($loopbacks.Devices | Where-Object { $_ -match 'cable|voicemeeter|virtual audio' })
+    Write-Host "         capture devices visible: $($loopbacks.Devices.Count)" -ForegroundColor DarkGray
     foreach ($name in $virtuals) { Write-Host "           $name" -ForegroundColor DarkGray }
     if ($virtuals.Count -ge 2) {
         Write-Ok "$($virtuals.Count) virtual cables: keep the microphone on one, capture the other"
@@ -294,7 +280,7 @@ Write-Host ''
 
 Write-Step 'summary'
 if ($script:Missing.Count -eq 0) {
-    Write-Ok 'everything the three live commands need is present'
+    Write-Ok 'everything the three live commands need is present (or only warnings above)'
     Write-Host ''
     Write-Host '  next:  phonebridge camera --virtual' -ForegroundColor DarkGray
     Write-Host '         phonebridge mic --to-cable' -ForegroundColor DarkGray

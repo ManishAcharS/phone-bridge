@@ -26,6 +26,7 @@ from phonebridge.live.usb import ensure_forward, is_loopback
 REPO = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO / "scripts"
 PS1 = SCRIPTS / "start-live.ps1"
+COMMAND = SCRIPTS / "python-command.ps1"
 PROBES = SCRIPTS / "python-probes.ps1"
 BAT = SCRIPTS / "start-live.bat"
 TARGET = REPO / "windows" / "phonebridge" / "cli" / "target.py"
@@ -256,7 +257,7 @@ def test_the_launcher_never_derives_its_own_path_from_a_function() -> None:
 
 def test_every_path_root_is_guarded_before_it_is_used() -> None:
     """A null root must produce "no Python found", not a parameter-binding error."""
-    text = code_only(ps1())
+    text = code_only(ps1() + "\n" + COMMAND.read_text(encoding="utf-8-sig"))
 
     # Join-Path, Test-Path and Get-ChildItem all reject a null -Path.
     for line in text.splitlines():
@@ -275,18 +276,18 @@ def test_a_failure_names_the_step_the_expectation_and_the_fix() -> None:
         "when the launcher itself fails it must print the command that does the work"
     )
     assert "interpreter" in text.lower() and "3.10" in text
-    assert "pip install -e" in text or "-m pip install" in text
+    assert "pip install -e" in text or "-m pip install" in text or "'-m', 'pip', 'install'" in text
 
 
 def test_python_discovery_uses_the_real_interpreter_launchers() -> None:
-    text = code_only(ps1())
+    text = code_only(COMMAND.read_text(encoding="utf-8-sig"))
 
     for candidate in ("'py'", "'python'", "'python3'", ".venv", "LOCALAPPDATA", "ProgramFiles"):
         assert candidate in text, candidate
-    # `-Command[1..($Command.Count - 1)]` counts *down* for one element, so a bare
-    # `python` became `python.exe <path to python>` and every probe failed.
-    assert "Select-Object -Skip 1" in text
+    # The py launcher is an executable plus a separate argument, never one string.
+    assert "Exe = 'py'; Args = @('-3')" in text
     assert not re.search(r"\[\s*1\s*\.\.\s*\(", text)
+    assert ". $script:PythonCommandHelpers" in ps1()
 
 
 def test_the_launcher_can_capture_a_second_cable() -> None:

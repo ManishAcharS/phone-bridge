@@ -214,7 +214,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\create-desktop-shortcut.ps1 -
 ```
 
 The shortcut keeps its console open after an error so the fix stays readable.
-The launcher itself installs nothing and changes no Windows default. It checks
+The launcher itself installs nothing and changes no Windows default. It finds
+Python automatically, including the Windows `py -3` launcher form; `-Python` is
+only an optional executable-path override, not a command line to parse. It checks
 Python, `pyvirtualcam`, `sounddevice`, `PyAudioWPatch`, OBS Studio and the
 VB-CABLE pair, then runs `phonebridge start --camera --mic --speaker --daily`.
 A preflight check that cannot run is a `[warn]` with the Python child's exit code

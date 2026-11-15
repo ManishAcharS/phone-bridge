@@ -8,16 +8,22 @@
 # literals are base64 text and 'utf-8'. They also capture stdout, stderr and the
 # real exit code instead of hiding them.
 #
-# Expected scope: the caller dot-sources this file and sets $script:PythonCommand
-# to a command array, e.g. @('py', '-3') or @('C:\...\python.exe').
+# Expected scope: the caller dot-sources this file and sets $script:PythonExe
+# and $script:PythonArgs separately, e.g. 'py' and @('-3').
+
+$commandHelperPath = Join-Path $PSScriptRoot 'python-command.ps1'
+if (-not (Test-Path -LiteralPath $commandHelperPath)) {
+    throw "Python command helpers not found: $commandHelperPath"
+}
+. $commandHelperPath
 
 function Invoke-PythonProbe {
     param(
         [string]$Probe,
         [string[]]$ProbeArguments = @()
     )
-    if (-not $script:PythonCommand -or $script:PythonCommand.Count -eq 0) {
-        return @{ ExitCode = -1; StdOut = ''; StdErr = 'no Python command selected'; Output = $null }
+    if (-not $script:PythonExe) {
+        return @{ ExitCode = -1; StdOut = ''; StdErr = 'no Python executable selected'; Output = $null }
     }
 
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Probe))
@@ -45,12 +51,7 @@ function Invoke-PythonProbe {
     $env:PYTHONIOENCODING = 'utf-8'
     try {
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-        $exe = $script:PythonCommand[0]
-        $prefix = @()
-        if ($script:PythonCommand.Count -gt 1) {
-            $prefix = @($script:PythonCommand | Select-Object -Skip 1)
-        }
-        $records = & $exe @prefix @arguments 2>&1
+        $records = Invoke-PythonCommand -Executable $script:PythonExe -Prefix $script:PythonArgs -Arguments $arguments 2>&1
         $exit = $LASTEXITCODE
         $stdoutLines = @()
         $stderrLines = @()

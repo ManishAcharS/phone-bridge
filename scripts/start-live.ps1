@@ -33,6 +33,10 @@
     Output device substring for PC audio capture. Empty captures the default output,
     so the room still hears it. Use a second virtual cable for headphone-only audio.
 
+.PARAMETER Python
+    Optional Python executable path. Leave empty for automatic selection; the
+    Windows py launcher is invoked as executable py with separate argument -3.
+
 .PARAMETER SkipChecks
     Skip the OBS/VB-CABLE/package preflight checks. The bridge still reports a device
     it cannot open; this does not force a missing driver to exist.
@@ -90,94 +94,21 @@ function Get-ScriptDirectory {
 }
 
 $script:RepoRoot = Split-Path -Parent (Get-ScriptDirectory)
+$script:PythonCommandHelpers = Join-Path (Get-ScriptDirectory) 'python-command.ps1'
+if (-not (Test-Path -LiteralPath $script:PythonCommandHelpers)) {
+    throw "Python command helpers not found: $script:PythonCommandHelpers"
+}
+. $script:PythonCommandHelpers
 $script:PythonProbes = Join-Path (Get-ScriptDirectory) 'python-probes.ps1'
 if (-not (Test-Path -LiteralPath $script:PythonProbes)) {
     throw "Python probe helpers not found: $script:PythonProbes"
 }
 . $script:PythonProbes
 
-function Invoke-PythonCandidate {
-    param([string[]]$Command, [string[]]$Arguments)
-    $exe = $Command[0]
-    $prefix = @()
-    if ($Command.Count -gt 1) { $prefix = @($Command | Select-Object -Skip 1) }
-    return (& $exe @prefix @Arguments 2>$null)
-}
-
-function Test-Interpreter {
-    param([string[]]$Command)
-    try {
-        $output = Invoke-PythonCandidate -Command $Command -Arguments @(
-            '-c', 'import sys; print(sys.version_info[0], sys.version_info[1])'
-        )
-    } catch { return $null }
-    if ($LASTEXITCODE -ne 0 -or -not $output) { return $null }
-    $parts = ("$output").Trim().Split(' ')
-    if ($parts.Count -lt 2) { return $null }
-    $major = [int]$parts[0]
-    $minor = [int]$parts[1]
-    if ($major -lt 3 -or ($major -eq 3 -and $minor -lt 10)) { return $null }
-    return "$major.$minor"
-}
-
-function Test-PhonebridgeImportable {
-    param([string[]]$Command)
-    try {
-        Invoke-PythonCandidate -Command $Command -Arguments @('-c', 'import phonebridge') | Out-Null
-    } catch { return $false }
-    return ($LASTEXITCODE -eq 0)
-}
-
-function Get-PythonCandidates {
-    $candidates = @()
-    if ($Python) { $candidates += , @($Python) }
-    foreach ($venv in @('.venv', 'venv')) {
-        $exe = Join-Path (Join-Path $script:RepoRoot $venv) 'Scripts\python.exe'
-        if (Test-Path $exe) { $candidates += , @($exe) }
-    }
-    foreach ($name in @(@('py', '-3'), @('py'), @('python'), @('python3'))) {
-        if (Get-Command $name[0] -ErrorAction SilentlyContinue) { $candidates += , $name }
-    }
-    $roots = @()
-    if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA 'Programs\Python') }
-    if ($env:ProgramFiles) { $roots += $env:ProgramFiles }
-    foreach ($root in $roots) {
-        if (-not $root -or -not (Test-Path $root)) { continue }
-        foreach ($pattern in @('Python3*\python.exe', 'Python3*\python3.exe')) {
-            $path = Join-Path $root $pattern
-            foreach ($exe in @(Get-ChildItem -Path $path -ErrorAction SilentlyContinue)) {
-                if ($exe.PSIsContainer) { continue }
-                $candidates += , @($exe.FullName)
-            }
-        }
-    }
-    return $candidates
-}
-
-function Resolve-Python {
-    $fallback = $null
-    foreach ($candidate in (Get-PythonCandidates)) {
-        $version = Test-Interpreter -Command $candidate
-        if (-not $version) { continue }
-        if (Test-PhonebridgeImportable -Command $candidate) {
-            return @{ Command = $candidate; Version = $version; HasPackage = $true }
-        }
-        if (-not $fallback) {
-            $fallback = @{ Command = $candidate; Version = $version; HasPackage = $false }
-        }
-    }
-    return $fallback
-}
-
 function Invoke-Phonebridge {
     param([string[]]$Arguments)
-    $exe = $script:PythonCommand[0]
-    $prefix = @()
-    if ($script:PythonCommand.Count -gt 1) {
-        $prefix = @($script:PythonCommand | Select-Object -Skip 1)
-    }
     $bridgeArguments = @('-m', 'phonebridge') + $Arguments
-    & $exe @prefix @bridgeArguments
+    Invoke-PythonCommand -Executable $script:PythonExe -Prefix $script:PythonArgs -Arguments $bridgeArguments
 }
 
 function Test-ObsInstalled {
@@ -197,22 +128,24 @@ Write-Host 'PhoneBridge - daily use' -ForegroundColor White
 Write-Host '--------------------------------------------------------------'
 Write-Host ''
 Write-Step 'locating Python'
-$resolved = Resolve-Python
+$resolved = Resolve-Python -RepoRoot $script:RepoRoot -PythonOverride $Python
 if (-not $resolved) {
-    Write-Bad 'no usable Python was found (needs Python 3.10 or newer).'
+    Write-Bad 'no usable Python interpreter was found (needs Python 3.10 or newer).'
     Write-Hint 'install from https://www.python.org/downloads/windows/ and tick Add python.exe to PATH'
     Write-Hint 'then run: powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1'
     Write-Hint 'or pass -Python C:\Path\To\python.exe'
     exit 2
 }
-$script:PythonCommand = $resolved.Command
+$script:PythonExe = $resolved.Exe
+$script:PythonArgs = @($resolved.Args)
+$pythonDisplay = Format-PythonCommand -Executable $script:PythonExe -Arguments $script:PythonArgs
 if (-not $resolved.HasPackage) {
-    Write-Bad "Python $($resolved.Version) at $($script:PythonCommand -join ' ') cannot import phonebridge"
-    Write-Hint "fix: $($script:PythonCommand -join ' ') -m pip install -e .\windows"
+    Write-Bad "Python $($resolved.Version) at $pythonDisplay cannot import phonebridge"
+    Write-Hint "fix: $(Format-PythonCommand -Executable $script:PythonExe -Arguments ($script:PythonArgs + @('-m', 'pip', 'install', '-e', '.\windows')))"
     Write-Hint 'or run scripts\setup-windows.ps1'
     exit 2
 }
-Write-Ok "Python $($resolved.Version) ($($script:PythonCommand -join ' ')) - phonebridge importable"
+Write-Ok "Python $($resolved.Version) ($pythonDisplay) - phonebridge importable"
 
 $failures = @()
 if (-not $SkipChecks) {
@@ -225,7 +158,7 @@ if (-not $SkipChecks) {
         Write-Ok 'pyvirtualcam, sounddevice and PyAudioWPatch are importable'
     } else {
         Write-Bad "missing Python packages: $missing"
-        Write-Hint "fix: $($script:PythonCommand -join ' ') -m pip install pyvirtualcam sounddevice PyAudioWPatch"
+        Write-Hint "fix: $(Format-PythonCommand -Executable $script:PythonExe -Arguments ($script:PythonArgs + @('-m', 'pip', 'install', 'pyvirtualcam', 'sounddevice', 'PyAudioWPatch')))"
         $failures += 'python packages'
     }
 

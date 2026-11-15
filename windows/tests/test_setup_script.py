@@ -58,7 +58,7 @@ def test_it_has_a_check_only_mode_that_changes_nothing() -> None:
     assert "[switch]$Check" in text
     assert "check only: nothing will be installed" in text
     # The install call is unreachable in check mode.
-    install_line = "Invoke-Python @('-m', 'pip', 'install', '--quiet', $Name)"
+    install_line = "Invoke-PythonCommand -Executable $script:PythonExe -Prefix $script:PythonArgs -Arguments @('-m', 'pip', 'install', '--quiet', $Name)"
     assert install_line in text
     guarded = text.split("if ($Check) {", 1)[1]
     assert "return" in guarded.split("}", 1)[0]
@@ -118,7 +118,7 @@ def test_it_checks_for_a_second_virtual_cable() -> None:
     """The speaker path needs a cable of its own, or the room hears the PC."""
     text = setup_text()
 
-    assert "Get-LoopbackDevices" in text
+    assert "Get-LoopbackState" in text
     assert "speaker path" in text
     assert "--list-loopback-devices" in text, "point at the command that explains the choice"
     assert "vb-audio.com/Cable/" in text

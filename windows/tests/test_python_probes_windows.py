@@ -4,7 +4,7 @@ The old checker passed multiline Python here-strings through Windows native
 argument quoting and discarded stderr. A child-side quoting/import failure then
 collapsed to the bare string ``unknown`` and blocked the launcher even when the
 packages were installed. This test runs the actual PowerShell checker on a
-Windows runner with the live packages installed.
+Windows runner with the live packages installed, including through ``py -3``.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ REPO = Path(__file__).resolve().parents[2]
 RUNNER = REPO / "windows" / "tests" / "run_python_probes.ps1"
 
 
-def run_checker(python: str | None = None) -> dict[str, str]:
+def run_checker(python: str | None = None, *, use_py_launcher: bool = False) -> dict[str, str]:
     command = [
         "powershell.exe",
         "-NoProfile",
@@ -31,9 +31,11 @@ def run_checker(python: str | None = None) -> dict[str, str]:
         "Bypass",
         "-File",
         str(RUNNER),
-        "-Python",
-        python or sys.executable,
     ]
+    if use_py_launcher:
+        command.append("-UsePyLauncher")
+    else:
+        command.extend(["-Python", python or sys.executable])
     proc = subprocess.run(
         command,
         capture_output=True,
@@ -47,11 +49,7 @@ def run_checker(python: str | None = None) -> dict[str, str]:
     return json.loads(proc.stdout)
 
 
-def test_installed_live_packages_are_reported_without_unknown() -> None:
-    for name in ("pyvirtualcam", "sounddevice", "pyaudiowpatch"):
-        importlib.import_module(name)
-    data = run_checker()
-    assert data["packages"] == "ok", data
+def assert_audio_check_result(data: dict[str, str]) -> None:
     # A runner without VB-CABLE should produce a positive missing/partial result,
     # not the old bare unknown. If the audio backend itself cannot be queried,
     # the new checker must still explain the child exit/stderr.
@@ -62,6 +60,20 @@ def test_installed_live_packages_are_reported_without_unknown() -> None:
             assert "exit=" in value and "stderr=" in value, data
         else:
             assert value.startswith("found:") or value in {"missing", "partial"}, data
+
+
+def test_installed_live_packages_are_reported_without_unknown() -> None:
+    for name in ("pyvirtualcam", "sounddevice", "pyaudiowpatch"):
+        importlib.import_module(name)
+    data = run_checker()
+    assert data["packages"] == "ok", data
+    assert_audio_check_result(data)
+
+
+def test_installed_live_packages_through_py_launcher_are_not_unknown() -> None:
+    data = run_checker(use_py_launcher=True)
+    assert data["packages"] == "ok", data
+    assert_audio_check_result(data)
 
 
 def test_unknown_includes_child_exit_code_and_stderr(tmp_path: Path) -> None:
