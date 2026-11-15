@@ -57,7 +57,8 @@ jobs:
           code=$?
           tail -n 120 pytest.log
           if [ "$code" -ne 0 ]; then
-            summary=$(tail -n 40 pytest.log | tr '\n' ' ' | cut -c1-3500)
+            summary=$(grep -E 'FAILED|ERROR|E   |AssertionError|Exception|Traceback' pytest.log | tail -n 30 | tr '\n' ' ' | cut -c1-3500)
+            if [ -z "$summary" ]; then summary=$(tail -n 60 pytest.log | tr '\n' ' ' | cut -c1-3500); fi
             echo "::error::pytest exited $code -- $summary"
           fi
           exit "$code"
